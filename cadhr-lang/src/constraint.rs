@@ -2,98 +2,193 @@ use std::collections::HashMap;
 
 use crate::parse::{ArithOp, Bound, FixedPoint, Term};
 
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct SolverState {
-    /// 確定値 (変数名 -> 値)
-    exacts: HashMap<String, FixedPoint>,
-    /// 未解決の制約
-    constraints: Vec<ArithConstraint>,
-    /// 矛盾が発生した場合のエラーメッセージ
-    error: Option<String>,
+/// 制約ソルバーの結果
+#[derive(Debug, Clone, PartialEq)]
+pub struct SolveResult {
+    /// 解けた変数束縛
+    pub bindings: HashMap<String, FixedPoint>,
+    /// 全制約が解消されたか（未解決の制約が残っていない）
+    pub fully_resolved: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ArithVar(String);
+/// 算術制約の連立方程式を解く
+/// 成功時は解けた変数束縛を返し、矛盾があればエラーメッセージを返す
+pub fn solve_constraints(eqs: Vec<ArithEq>) -> Result<SolveResult, String> {
+    let mut bindings: HashMap<String, FixedPoint> = HashMap::new();
+    let mut constraints: Vec<ArithEq> = Vec::new();
 
-// とりあえず線形な制約のみ
-#[derive(Debug, Clone, PartialEq)]
-pub enum ArithConstraint {
-    Eq(ArithVar, ArithVar),
-    Plus(ArithVar, ArithVar, FixedPoint),  // X = Y + c
-    Mul(ArithVar, ArithVar, FixedPoint),   // X = Y * c
-    Minus(ArithVar, FixedPoint, ArithVar), // X = c - Y
+    for eq in eqs {
+        process_eq(eq, &mut bindings, &mut constraints)?;
+    }
+
+    // 不動点ループ: 既知の値を代入して再試行
+    loop {
+        if constraints.is_empty() {
+            break;
+        }
+        let old_count = bindings.len();
+        let pending = std::mem::take(&mut constraints);
+        for eq in pending {
+            let left = substitute_in_expr(&eq.left, &bindings);
+            let right = substitute_in_expr(&eq.right, &bindings);
+            process_eq(ArithEq::new(left, right), &mut bindings, &mut constraints)?;
+        }
+        if bindings.len() == old_count {
+            break;
+        }
+    }
+
+    Ok(SolveResult {
+        bindings,
+        fully_resolved: constraints.is_empty(),
+    })
 }
 
-impl SolverState {
-    pub fn new(expr_eqs: Vec<ArithEq>) -> Self {
-        let constraints = expr_eqs
-            .into_iter()
-            .flat_map(|eq| Self::extract_constraints(&eq))
-            .collect();
-        Self {
-            constraints,
-            ..Self::default()
-        }
-    }
-
-    fn extract_constraints(eq: &ArithEq) -> Vec<ArithConstraint> {
-        match eq {
-            ArithEq { left, right } => {
-                todo!()
+fn process_eq(
+    eq: ArithEq,
+    bindings: &mut HashMap<String, FixedPoint>,
+    constraints: &mut Vec<ArithEq>,
+) -> Result<(), String> {
+    let left_val = try_eval(&eq.left);
+    let right_val = try_eval(&eq.right);
+    match (left_val, right_val) {
+        (Some(l), Some(r)) => {
+            if l != r {
+                return Err(format!("{} != {}", l, r));
             }
         }
-    }
-
-    pub fn put_exact(&mut self, var: String, value: FixedPoint) {
-        if let Some(&existing) = self.exacts.get(&var) {
-            if existing != value {
-                self.error = Some(format!(
-                    "contradiction: {} already has value {}, cannot assign {}",
-                    var, existing, value
-                ));
+        (Some(target), None) => {
+            if let Some((var, val)) = try_solve_for_var(&eq.right, target) {
+                put_binding(bindings, var, val)?;
+            } else {
+                constraints.push(eq);
             }
-        } else {
-            self.exacts.insert(var, value);
+        }
+        (None, Some(target)) => {
+            if let Some((var, val)) = try_solve_for_var(&eq.left, target) {
+                put_binding(bindings, var, val)?;
+            } else {
+                constraints.push(eq);
+            }
+        }
+        (None, None) => {
+            constraints.push(eq);
         }
     }
+    Ok(())
+}
 
-    pub fn get_value(&self, var: &str) -> Option<FixedPoint> {
-        if let Some(&v) = self.exacts.get(var) {
-            return Some(v);
+fn put_binding(
+    bindings: &mut HashMap<String, FixedPoint>,
+    var: String,
+    value: FixedPoint,
+) -> Result<(), String> {
+    if let Some(&existing) = bindings.get(&var) {
+        if existing != value {
+            return Err(format!(
+                "contradiction: {} already has value {}, cannot assign {}",
+                var, existing, value
+            ));
         }
-        None
+    } else {
+        bindings.insert(var, value);
     }
+    Ok(())
+}
 
-    pub fn has_error(&self) -> bool {
-        self.error.is_some()
-    }
-
-    pub fn get_error(&self) -> Option<&str> {
-        self.error.as_deref()
-    }
-
-    pub fn exacts(&self) -> &HashMap<String, FixedPoint> {
-        &self.exacts
-    }
-
-    pub fn remaining_constraints(&self) -> &[ArithConstraint] {
-        &self.constraints
-    }
-
-    fn solve_step(&mut self) -> bool {
-        let made_progress = false;
-        let constraints = std::mem::take(&mut self.constraints);
-        let remaining = Vec::new();
-
-        for _constraint in constraints {
-            todo!()
+fn try_eval(expr: &ArithExpr) -> Option<FixedPoint> {
+    match expr {
+        ArithExpr::Num(v) => Some(*v),
+        ArithExpr::BinOp { op, left, right } => {
+            let l = try_eval(left)?;
+            let r = try_eval(right)?;
+            Some(match op {
+                ArithOp::Add => l + r,
+                ArithOp::Sub => l - r,
+                ArithOp::Mul => l * r,
+                ArithOp::Div => l / r,
+            })
         }
-        self.constraints = remaining;
-        made_progress
+        _ => None,
     }
+}
 
-    pub fn repeat_until_fixpoint(&mut self) {
-        while self.solve_step() {}
+/// expr = target の形の方程式を解き、変数が1つなら (変数名, 値) を返す
+fn try_solve_for_var(expr: &ArithExpr, target: FixedPoint) -> Option<(String, FixedPoint)> {
+    match expr {
+        ArithExpr::Var(name) => Some((name.clone(), target)),
+        ArithExpr::BinOp { op, left, right } => {
+            let zero = FixedPoint::from_int(0);
+            match (try_eval(left), try_eval(right)) {
+                // c OP right = target → right を解く
+                (Some(l_val), None) => {
+                    let new_target = match op {
+                        ArithOp::Add => target - l_val,
+                        ArithOp::Sub => l_val - target,
+                        ArithOp::Mul => {
+                            if l_val == zero {
+                                return None;
+                            }
+                            let candidate = target / l_val;
+                            if candidate * l_val != target {
+                                return None;
+                            }
+                            candidate
+                        }
+                        ArithOp::Div => {
+                            if target == zero {
+                                return None;
+                            }
+                            let candidate = l_val / target;
+                            if l_val / candidate != target {
+                                return None;
+                            }
+                            candidate
+                        }
+                    };
+                    try_solve_for_var(right, new_target)
+                }
+                // left OP c = target → left を解く
+                (None, Some(r_val)) => {
+                    let new_target = match op {
+                        ArithOp::Add => target - r_val,
+                        ArithOp::Sub => target + r_val,
+                        ArithOp::Mul => {
+                            if r_val == zero {
+                                return None;
+                            }
+                            let candidate = target / r_val;
+                            if candidate * r_val != target {
+                                return None;
+                            }
+                            candidate
+                        }
+                        ArithOp::Div => target * r_val,
+                    };
+                    try_solve_for_var(left, new_target)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn substitute_in_expr(expr: &ArithExpr, bindings: &HashMap<String, FixedPoint>) -> ArithExpr {
+    match expr {
+        ArithExpr::Var(name) => {
+            if let Some(&value) = bindings.get(name) {
+                ArithExpr::Num(value)
+            } else {
+                expr.clone()
+            }
+        }
+        ArithExpr::BinOp { op, left, right } => ArithExpr::BinOp {
+            op: *op,
+            left: Box::new(substitute_in_expr(left, bindings)),
+            right: Box::new(substitute_in_expr(right, bindings)),
+        },
+        other => other.clone(),
     }
 }
 
@@ -314,28 +409,6 @@ impl ArithExpr {
     }
 }
 
-/// 算術式用の代入（変数名 -> 整数値）
-pub type ArithSubstitution = HashMap<String, FixedPoint>;
-
-// ============================================================
-// ソルバーの結果
-// ============================================================
-
-/// 制約ソルバーの結果
-#[derive(Debug, Clone, PartialEq)]
-pub enum SolveResult {
-    /// 解が見つかった（変数名 -> 値 の代入を返す）
-    Solved(HashMap<String, FixedPoint>),
-    /// 制約が矛盾している（例: 5 = 6）
-    Contradiction,
-    /// 解けない（未束縛変数が複数ある等）- 次のソルバーに委譲
-    Unsolvable,
-}
-
-// ============================================================
-// テスト
-// ============================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,18 +425,14 @@ mod tests {
         var(name.to_string())
     }
 
-    /// SolverStateで制約を解いて結果を検証
-    fn solve(constraint: ArithEq) -> SolverState {
-        let mut state = SolverState::new(vec![constraint]);
-        state.repeat_until_fixpoint();
-        state
+    fn solve(constraint: ArithEq) -> Result<SolveResult, String> {
+        solve_constraints(vec![constraint])
     }
 
     // ===== ArithExpr operator tests =====
 
     #[test]
     fn test_arith_expr_operators() {
-        // X + 1
         assert_eq!(
             x() + 1,
             ArithExpr::BinOp {
@@ -373,7 +442,6 @@ mod tests {
             }
         );
 
-        // X + Y の変数収集
         let vars = (x() + y()).collect_vars();
         assert_eq!(vars, vec!["X".to_string(), "Y".to_string()]);
     }
@@ -385,130 +453,123 @@ mod tests {
         assert_eq!(expr, x() + 1);
     }
 
-    // ===== LinearSolver tests =====
+    // ===== solver tests =====
 
     #[test]
     fn test_linear_simple_addition() {
         // X + 1 = 6 -> X = 5
-        let state = solve(ArithEq::eq(x() + 1, 6));
-        assert_eq!(state.get_value("X"), Some(FixedPoint::from_int(5)));
+        let r = solve(ArithEq::eq(x() + 1, 6)).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(5)));
     }
 
     #[test]
     fn test_linear_simple_subtraction() {
         // X - 3 = 7 -> X = 10
-        let state = solve(ArithEq::eq(x() - 3, 7));
-        assert_eq!(state.get_value("X"), Some(FixedPoint::from_int(10)));
+        let r = solve(ArithEq::eq(x() - 3, 7)).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(10)));
     }
 
     #[test]
     fn test_linear_variable_on_right() {
         // 6 = X + 1 -> X = 5
-        let state = solve(ArithEq::eq(6, x() + 1));
-        assert_eq!(state.get_value("X"), Some(FixedPoint::from_int(5)));
+        let r = solve(ArithEq::eq(6, x() + 1)).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(5)));
     }
 
     #[test]
     fn test_linear_multiplication() {
         // X * 2 = 10 -> X = 5
-        let state = solve(ArithEq::eq(x() * 2, 10));
-        assert_eq!(state.get_value("X"), Some(FixedPoint::from_int(5)));
+        let r = solve(ArithEq::eq(x() * 2, 10)).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(5)));
     }
 
     #[test]
     fn test_linear_complex_expression() {
         // 2 * X + 3 = 11 -> X = 4
-        let state = solve(ArithEq::eq(ArithExpr::num_int(2) * x() + 3, 11));
-        assert_eq!(state.get_value("X"), Some(FixedPoint::from_int(4)));
+        let r = solve(ArithEq::eq(ArithExpr::num_int(2) * x() + 3, 11)).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(4)));
     }
 
     #[test]
     fn test_linear_nested_expression() {
         // (X + 1) * 3 = 12 -> X = 3
-        let state = solve(ArithEq::eq((x() + 1) * 3, 12));
-        assert_eq!(state.get_value("X"), Some(FixedPoint::from_int(3)));
+        let r = solve(ArithEq::eq((x() + 1) * 3, 12)).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(3)));
     }
 
     #[test]
     fn test_linear_negative_result() {
         // X + 10 = 3 -> X = -7
-        let state = solve(ArithEq::eq(x() + 10, 3));
-        assert_eq!(state.get_value("X"), Some(FixedPoint::from_int(-7)));
+        let r = solve(ArithEq::eq(x() + 10, 3)).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(-7)));
     }
 
-    // ===== DivisionSolver tests =====
+    // ===== division tests =====
 
     #[test]
     fn test_division_simple() {
         // X / 2 = 5 -> X = 10
-        let state = solve(ArithEq::eq(x() / 2, 5));
-        assert_eq!(state.get_value("X"), Some(FixedPoint::from_int(10)));
+        let r = solve(ArithEq::eq(x() / 2, 5)).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(10)));
     }
 
     #[test]
     fn test_division_with_offset() {
         // (X + 1) / 3 = 4 -> X = 11
-        let state = solve(ArithEq::eq((x() + 1) / 3, 4));
-        assert_eq!(state.get_value("X"), Some(FixedPoint::from_int(11)));
+        let r = solve(ArithEq::eq((x() + 1) / 3, 4)).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(11)));
     }
 
     #[test]
     fn test_division_negative_divisor() {
         // X / -2 = 5 -> X = -10
-        let state = solve(ArithEq::eq(x() / ArithExpr::num_int(-2), 5));
-        assert_eq!(state.get_value("X"), Some(FixedPoint::from_int(-10)));
+        let r = solve(ArithEq::eq(x() / ArithExpr::num_int(-2), 5)).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(-10)));
     }
 
-    // ===== General tests =====
+    // ===== general tests =====
 
     #[test]
     fn test_contradiction() {
         // 5 = 6 -> error
-        let state = solve(ArithEq::eq(5, 6));
-        assert!(state.has_error());
+        assert!(solve(ArithEq::eq(5, 6)).is_err());
     }
 
     #[test]
     fn test_two_variables_unsolvable() {
         // X + Y = 10 -> unsolvable (残る)
-        let state = solve(ArithEq::eq(x() + y(), 10));
-        assert!(!state.has_error());
-        assert!(!state.remaining_constraints().is_empty());
+        let r = solve(ArithEq::eq(x() + y(), 10)).unwrap();
+        assert!(!r.fully_resolved);
     }
 
     #[test]
-    fn test_no_integer_solution() {
-        // X * 2 = 5 -> unsolvable (残る)
-        let state = solve(ArithEq::eq(x() * 2, 5));
-        assert!(!state.has_error());
-        assert!(!state.remaining_constraints().is_empty());
+    fn test_fractional_solution() {
+        // X * 2 = 5 -> X = 2.50
+        let r = solve(ArithEq::eq(x() * 2, 5)).unwrap();
+        assert_eq!(
+            r.bindings.get("X"),
+            Some(&FixedPoint::from_hundredths(250))
+        );
     }
 
     #[test]
     fn test_both_sides_constant_equal() {
         // 5 = 5 -> ok
-        let state = solve(ArithEq::eq(5, 5));
-        assert!(!state.has_error());
-        assert!(state.remaining_constraints().is_empty());
+        let r = solve(ArithEq::eq(5, 5)).unwrap();
+        assert!(r.fully_resolved);
     }
 
     #[test]
-    fn test_division_by_variable_unsolvable() {
-        // 6 / X = 2 -> unsolvable (残る)
-        let state = solve(ArithEq::eq(ArithExpr::num_int(6) / x(), 2));
-        assert!(!state.has_error());
-        assert!(!state.remaining_constraints().is_empty());
+    fn test_division_by_variable() {
+        // 6 / X = 2 -> X = 3
+        let r = solve(ArithEq::eq(ArithExpr::num_int(6) / x(), 2)).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(3)));
     }
 
     #[test]
-    fn test_solver_state_from_constraints() {
+    fn test_from_multiple_constraints() {
         // X + 1 = 6
-        let constraints = vec![ArithEq::eq(x() + 1, 6)];
-
-        let mut state = SolverState::new(constraints);
-        state.repeat_until_fixpoint();
-
-        assert!(!state.has_error());
-        assert_eq!(state.get_value("X"), Some(FixedPoint::from_int(5)));
+        let r = solve_constraints(vec![ArithEq::eq(x() + 1, 6)]).unwrap();
+        assert_eq!(r.bindings.get("X"), Some(&FixedPoint::from_int(5)));
     }
 }

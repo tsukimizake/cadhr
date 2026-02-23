@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::constraint::{ArithEq, ArithExpr, solve_constraints};
 use crate::manifold_bridge::{BuiltinFunctor, is_builtin_functor};
 use crate::parse::{ArithOp, Bound, Clause, FixedPoint, Term, list, number, range_var, struc, var};
 use strum::IntoEnumIterator;
@@ -686,31 +687,47 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
 }
 
 /// goals 内の Constraint を評価し、解けたものは除去、解けないものは残す
-fn try_resolve_constraints(goals: &mut Vec<Term>) -> Result<(), UnifyError> {
-    let mut i = 0;
-    while i < goals.len() {
-        if let Term::Constraint { ref left, ref right } = goals[i] {
-            let v1 = eval_arith(left);
-            let v2 = eval_arith(right);
-            match (v1, v2) {
-                (Some(n1), Some(n2)) => {
-                    if n1 != n2 {
-                        return Err(UnifyError {
-                            message: format!("constraint mismatch: {} != {}", n1, n2),
-                            term1: left.as_ref().clone(),
-                            term2: right.as_ref().clone(),
-                        });
-                    }
-                    goals.remove(i);
-                    continue;
-                }
-                _ => {
-                    // まだ解けない、残す
-                }
+/// 全 Constraint をまとめて SolverState に渡し、連立方程式として解く
+fn try_resolve_constraints(goals: &mut Vec<Term>) -> Result<(), RewriteError> {
+    // Constraint を ArithEq に変換して SolverState に渡す
+    let mut eqs = Vec::new();
+    let mut constraint_indices = Vec::new();
+    for (i, goal) in goals.iter().enumerate() {
+        if let Term::Constraint { left, right } = goal {
+            let left_expr = ArithExpr::try_from_term(left);
+            let right_expr = ArithExpr::try_from_term(right);
+            if let (Ok(l), Ok(r)) = (left_expr, right_expr) {
+                eqs.push(ArithEq::new(l, r));
+                constraint_indices.push(i);
             }
         }
-        i += 1;
     }
+
+    if eqs.is_empty() {
+        return Ok(());
+    }
+
+    let result = solve_constraints(eqs).map_err(|msg| {
+        let idx = constraint_indices[0];
+        RewriteError {
+            message: format!("constraint contradiction: {}", msg),
+            goal: goals.remove(idx),
+        }
+    })?;
+
+    if !result.bindings.is_empty() || result.fully_resolved {
+        for &idx in constraint_indices.iter().rev() {
+            goals.remove(idx);
+        }
+        for (var_name, value) in &result.bindings {
+            let replacement = number(*value);
+            substitute_in_goals(goals, var_name, &replacement);
+        }
+        for goal in goals.iter_mut() {
+            eval_arith_in_place(goal);
+        }
+    }
+
     Ok(())
 }
 
@@ -828,9 +845,18 @@ fn rewrite_term_recursive(
             return Ok(vec![resolved_term]);
         } else {
             // Ruleにマッチ: bodyの各項を再帰的に解決
-            // bodyの残りを other_goals に追加して、解決時に変数束縛が伝播するようにする
             let mut remaining_body: Vec<Term> = body;
             let mut all_resolved = Vec::new();
+
+            // body 解決前に制約を解き、変数束縛を body と other_goals に伝播
+            {
+                let body_len = remaining_body.len();
+                let mut combined = remaining_body;
+                combined.extend(other_goals.drain(..));
+                try_resolve_constraints(&mut combined)?;
+                remaining_body = combined.drain(0..body_len).collect();
+                *other_goals = combined;
+            }
 
             while let Some(b) = remaining_body.first().cloned() {
                 remaining_body.remove(0);
@@ -848,13 +874,7 @@ fn rewrite_term_recursive(
                 *other_goals = temp_other_goals;
             }
 
-            try_resolve_constraints(other_goals).map_err(|e| RewriteError {
-                message: e.message,
-                goal: Term::Constraint {
-                    left: Box::new(e.term1),
-                    right: Box::new(e.term2),
-                },
-            })?;
+            try_resolve_constraints(other_goals)?;
 
             return Ok(all_resolved);
         }
@@ -872,18 +892,14 @@ fn rewrite_term_recursive(
                     message: "InfixExpr operand resolved to multiple terms".to_string(),
                     goal: Term::InfixExpr {
                         op,
-                        left: Box::new(
-                            new_left_terms
-                                .into_iter()
-                                .next()
-                                .unwrap_or(Term::Number { value: FixedPoint::from_int(0) }),
-                        ),
-                        right: Box::new(
-                            new_right_terms
-                                .into_iter()
-                                .next()
-                                .unwrap_or(Term::Number { value: FixedPoint::from_int(0) }),
-                        ),
+                        left: Box::new(new_left_terms.into_iter().next().unwrap_or(Term::Number {
+                            value: FixedPoint::from_int(0),
+                        })),
+                        right: Box::new(new_right_terms.into_iter().next().unwrap_or(
+                            Term::Number {
+                                value: FixedPoint::from_int(0),
+                            },
+                        )),
                     },
                 });
             }
@@ -994,13 +1010,7 @@ pub fn execute(db: &mut [Clause], query: Vec<Term>) -> Result<Vec<Term>, Rewrite
     }
 
     // 最終的に残った Constraint を検証
-    try_resolve_constraints(&mut results).map_err(|e| RewriteError {
-        message: e.message,
-        goal: Term::Constraint {
-            left: Box::new(e.term1),
-            right: Box::new(e.term2),
-        },
-    })?;
+    try_resolve_constraints(&mut results)?;
 
     // 解決済み Constraint を結果から除去
     results.retain(|t| !matches!(t, Term::Constraint { .. }));
@@ -1011,7 +1021,7 @@ pub fn execute(db: &mut [Clause], query: Vec<Term>) -> Result<Vec<Term>, Rewrite
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::{database, query, struc, var, FixedPoint};
+    use crate::parse::{FixedPoint, database, query, struc, var};
 
     fn run_success(db_src: &str, query_src: &str) -> Vec<String> {
         let mut db = database(db_src).expect("failed to parse db");
@@ -1247,7 +1257,8 @@ mod tests {
     #[test]
     fn test_arith_simple_add() {
         use crate::parse::number_int;
-        let expr = crate::parse::arith_expr(crate::parse::ArithOp::Add, number_int(3), number_int(5));
+        let expr =
+            crate::parse::arith_expr(crate::parse::ArithOp::Add, number_int(3), number_int(5));
         let n = number_int(8);
         assert!(unify(expr, n, &mut vec![]).is_ok());
     }
@@ -1255,7 +1266,8 @@ mod tests {
     #[test]
     fn test_arith_simple_sub() {
         use crate::parse::number_int;
-        let expr = crate::parse::arith_expr(crate::parse::ArithOp::Sub, number_int(10), number_int(3));
+        let expr =
+            crate::parse::arith_expr(crate::parse::ArithOp::Sub, number_int(10), number_int(3));
         let n = number_int(7);
         assert!(unify(expr, n, &mut vec![]).is_ok());
     }
@@ -1263,7 +1275,8 @@ mod tests {
     #[test]
     fn test_arith_simple_mul() {
         use crate::parse::number_int;
-        let expr = crate::parse::arith_expr(crate::parse::ArithOp::Mul, number_int(4), number_int(5));
+        let expr =
+            crate::parse::arith_expr(crate::parse::ArithOp::Mul, number_int(4), number_int(5));
         let n = number_int(20);
         assert!(unify(expr, n, &mut vec![]).is_ok());
     }
@@ -1271,7 +1284,8 @@ mod tests {
     #[test]
     fn test_arith_simple_div() {
         use crate::parse::{number, number_int};
-        let expr = crate::parse::arith_expr(crate::parse::ArithOp::Div, number_int(10), number_int(3));
+        let expr =
+            crate::parse::arith_expr(crate::parse::ArithOp::Div, number_int(10), number_int(3));
         let n = number(FixedPoint::from_hundredths(333)); // 10/3 = 3.33 in fixed point
         assert!(unify(expr, n, &mut vec![]).is_ok());
     }
@@ -1724,12 +1738,7 @@ mod tests {
 
     #[test]
     fn constraint_propagation_across_body() {
-        // f(X+Y, Y) :- g(Y). g(3).
-        // query: f(7, Z). → Z=3, X=4
-        let resolved = run_success(
-            "f(X+Y, Y) :- g(Y). g(3).",
-            "f(7, Z).",
-        );
-        assert_eq!(resolved, vec!["g(3)"]);
+        let resolved = run_success("f(X+Y, Y) :- h(X), g(Y). h(4). g(3).", "f(7, 3).");
+        assert_eq!(resolved, vec!["h(4)", "g(3)"]);
     }
 }
