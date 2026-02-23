@@ -1,0 +1,6 @@
+[submodule "cadhr-lsp"]
+	path = cadhr-lsp
+	url = git@github.com:tsukimizake/cadhr-lsp.git
+[submodule "tree-sitter-cadhr-lang"]
+	path = tree-sitter-cadhr-lang
+	url = git@github.com:tsukimizake/tree-sitter-cadhr-lang.git
