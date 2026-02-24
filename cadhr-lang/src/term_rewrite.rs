@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::fmt;
 
 use crate::constraint::{ArithEq, ArithExpr, solve_constraints};
@@ -40,6 +41,7 @@ fn builtin_functor_arities(functor: BuiltinFunctor) -> &'static [usize] {
         BuiltinFunctor::Circle => &[1, 2],
         BuiltinFunctor::Extrude => &[2],
         BuiltinFunctor::Revolve => &[2, 3],
+        BuiltinFunctor::Polyhedron => &[2],
     }
 }
 
@@ -93,7 +95,19 @@ fn substitute_in_place(term: &mut Term, var_name: &str, replacement: &Term) {
             *term = replacement.clone();
         }
         Term::DefaultVar { name, .. } if name == var_name => {
-            *term = replacement.clone();
+            // DefaultVarを置換する場合、replacementがNumberならspanを保持したままDefaultVarの値だけ更新
+            // (apply_default_var_bindingsが自分自身の値で置換するケース)
+            // replacementが他の構造なら通常通り置換
+            match replacement {
+                Term::Number { value: new_val } => {
+                    if let Term::DefaultVar { value, .. } = term {
+                        *value = *new_val;
+                    }
+                }
+                _ => {
+                    *term = replacement.clone();
+                }
+            }
         }
         Term::RangeVar { name, .. } if name == var_name => {
             *term = replacement.clone();
@@ -140,7 +154,7 @@ fn substitute_in_goals(goals: &mut Vec<Term>, var_name: &str, replacement: &Term
 
 fn collect_default_var_bindings(term: &Term, bindings: &mut Vec<(String, FixedPoint)>) {
     match term {
-        Term::DefaultVar { name, value } if name != "_" => {
+        Term::DefaultVar { name, value, .. } if name != "_" => {
             bindings.push((name.clone(), *value));
         }
         Term::Struct { args, .. } => {
@@ -168,36 +182,6 @@ fn collect_default_var_bindings(term: &Term, bindings: &mut Vec<(String, FixedPo
     }
 }
 
-fn replace_default_vars_with_numbers(term: &mut Term) {
-    match term {
-        Term::DefaultVar { value, .. } => {
-            *term = number(*value);
-        }
-        Term::Struct { args, .. } => {
-            for arg in args {
-                replace_default_vars_with_numbers(arg);
-            }
-        }
-        Term::List { items, tail } => {
-            for item in items {
-                replace_default_vars_with_numbers(item);
-            }
-            if let Some(t) = tail {
-                replace_default_vars_with_numbers(t);
-            }
-        }
-        Term::InfixExpr { left, right, .. } => {
-            replace_default_vars_with_numbers(left);
-            replace_default_vars_with_numbers(right);
-        }
-        Term::Constraint { left, right } => {
-            replace_default_vars_with_numbers(left);
-            replace_default_vars_with_numbers(right);
-        }
-        _ => {}
-    }
-}
-
 fn apply_default_var_bindings(term: &mut Term, goals: &mut Vec<Term>) {
     let mut bindings = Vec::new();
     collect_default_var_bindings(term, &mut bindings);
@@ -206,10 +190,7 @@ fn apply_default_var_bindings(term: &mut Term, goals: &mut Vec<Term>) {
         substitute_in_place(term, &name, &replacement);
         substitute_in_goals(goals, &name, &replacement);
     }
-    replace_default_vars_with_numbers(term);
-    for goal in goals.iter_mut() {
-        replace_default_vars_with_numbers(goal);
-    }
+
     eval_arith_in_place(term);
     for goal in goals.iter_mut() {
         eval_arith_in_place(goal);
@@ -217,6 +198,8 @@ fn apply_default_var_bindings(term: &mut Term, goals: &mut Vec<Term>) {
 }
 
 /// 算術式を評価する。評価できない場合（未束縛変数を含む場合）はNoneを返す
+/// 注: DefaultVar は eval_arith では処理しない。unify の明示的な DefaultVar ハンドラが
+/// 名前ベースの置換を伴って処理するため、ここで Number に変換すると置換が抜け落ちる。
 fn eval_arith(term: &Term) -> Option<FixedPoint> {
     match term {
         Term::Number { value } => Some(*value),
@@ -389,16 +372,8 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
     let mut deferred: Vec<(Term, Term)> = Vec::new();
 
     while let Some((mut t1, mut t2)) = stack.pop() {
-        // 算術式を評価可能なら数値に変換
-        if let Some(val) = eval_arith(&t1) {
-            t1 = number(val);
-        }
-        if let Some(val) = eval_arith(&t2) {
-            t2 = number(val);
-        }
-
         // X@25 のような既定値付き変数は、単一化時に X=25 を伝播する。
-        if let Term::DefaultVar { name, value } = &t1 {
+        if let Term::DefaultVar { name, value, .. } = &t1 {
             let name = name.clone();
             let replacement = number(*value);
             if name != "_" {
@@ -408,7 +383,7 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
             }
             t1 = replacement;
         }
-        if let Term::DefaultVar { name, value } = &t2 {
+        if let Term::DefaultVar { name, value, .. } = &t2 {
             let name = name.clone();
             let replacement = number(*value);
             if name != "_" {
@@ -417,6 +392,13 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                 substitute_in_deferred(&mut deferred, &name, &replacement);
             }
             t2 = replacement;
+        }
+
+        if let Some(val) = eval_arith(&t1) {
+            t1 = number(val);
+        }
+        if let Some(val) = eval_arith(&t2) {
+            t2 = number(val);
         }
 
         // 算術式がまだ評価できない場合は遅延
@@ -583,22 +565,22 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                 }
 
                 match (items1.len().cmp(&items2.len()), tail1, tail2) {
-                    (std::cmp::Ordering::Equal, Some(t1), Some(t2)) => {
+                    (Ordering::Equal, Some(t1), Some(t2)) => {
                         stack.push((t1.as_ref().clone(), t2.as_ref().clone()));
                     }
-                    (std::cmp::Ordering::Equal, None, None) => {}
-                    (std::cmp::Ordering::Equal, Some(t1), None) => {
+                    (Ordering::Equal, None, None) => {}
+                    (Ordering::Equal, Some(t1), None) => {
                         stack.push((t1.as_ref().clone(), list(vec![], None)));
                     }
-                    (std::cmp::Ordering::Equal, None, Some(t2)) => {
+                    (Ordering::Equal, None, Some(t2)) => {
                         stack.push((list(vec![], None), t2.as_ref().clone()));
                     }
-                    (std::cmp::Ordering::Greater, _, Some(t2_tail)) => {
+                    (Ordering::Greater, _, Some(t2_tail)) => {
                         let remaining: Vec<Term> = items1[min_len..].to_vec();
                         let new_list = list(remaining, tail1.as_ref().map(|t| t.as_ref().clone()));
                         stack.push((new_list, t2_tail.as_ref().clone()));
                     }
-                    (std::cmp::Ordering::Greater, _, None) => {
+                    (Ordering::Greater, _, None) => {
                         return Err(UnifyError {
                             message: format!(
                                 "list length mismatch: {} items vs {} items (no tail)",
@@ -609,12 +591,12 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                             term2: t2,
                         });
                     }
-                    (std::cmp::Ordering::Less, Some(t1_tail), _) => {
+                    (Ordering::Less, Some(t1_tail), _) => {
                         let remaining: Vec<Term> = items2[min_len..].to_vec();
                         let new_list = list(remaining, tail2.as_ref().map(|t| t.as_ref().clone()));
                         stack.push((t1_tail.as_ref().clone(), new_list));
                     }
-                    (std::cmp::Ordering::Less, None, _) => {
+                    (Ordering::Less, None, _) => {
                         return Err(UnifyError {
                             message: format!(
                                 "list length mismatch: {} items (no tail) vs {} items",
@@ -1341,7 +1323,7 @@ mod tests {
     #[test]
     fn default_var_matches_annotated_value() {
         let resolved = run_success("f(25).", "f(X@25).");
-        assert_eq!(resolved, vec!["f(25)"]);
+        assert_eq!(resolved, vec!["f(X@25)"]);
     }
 
     #[test]
@@ -1357,7 +1339,7 @@ mod tests {
         );
         assert_eq!(
             resolved,
-            vec!["(cube(25, 50, 300) - translate(cube(5, 50, 260), 7.5, 0, 0))"]
+            vec!["(cube(X_2@25, 50, 300) - translate(cube(5, 50, 260), 7.5, 0, 0))"]
         );
     }
 

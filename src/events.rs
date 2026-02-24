@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use cadhr_lang::manifold_bridge::EvaluatedNode;
 
 // UI -> CadhrLang: request to generate a preview mesh
 #[derive(Message, Clone)]
@@ -14,6 +15,7 @@ pub struct PreviewGenerated {
     pub preview_id: u64,
     pub query: String,
     pub mesh: Mesh,
+    pub evaluated_nodes: Vec<EvaluatedNode>,
 }
 
 // CadhrLang -> UI: error or log message from cadhr-lang execution

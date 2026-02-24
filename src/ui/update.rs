@@ -13,6 +13,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy_egui::{EguiContexts, egui};
 use bevy_file_dialog::prelude::*;
+use cadhr_lang::manifold_bridge::{EvaluatedNode, collect_tracked_spans_from_expr};
+use cadhr_lang::parse::SrcSpan;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -173,6 +175,8 @@ pub(super) fn egui_ui(
                 let mut updates_to_send: Vec<(u64, String)> = Vec::new();
                 let mut exports_to_send: Vec<usize> = Vec::new();
                 let mut closes_to_send: Vec<(Entity, usize)> = Vec::new();
+                // (new_value, span, preview_id, query, preview_target_index)
+                let mut param_edits: Vec<(f64, SrcSpan, u64, String, usize)> = Vec::new();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(right, |ui| {
@@ -193,6 +197,15 @@ pub(super) fn egui_ui(
                                         }
                                         PreviewAction::Close => {
                                             closes_to_send.push((*entity, target.render_layer));
+                                        }
+                                        PreviewAction::ParamEdited(edit) => {
+                                            param_edits.push((
+                                                edit.new_value,
+                                                edit.span,
+                                                target.preview_id,
+                                                target.query.clone(),
+                                                i,
+                                            ));
                                         }
                                         PreviewAction::None => {}
                                     }
@@ -231,6 +244,50 @@ pub(super) fn egui_ui(
                     free_render_layers.push(render_layer);
                     commands.entity(entity).despawn();
                 }
+                // Apply parameter edits to source code (write-back)
+                // Sort by span offset descending to avoid invalidating earlier spans
+                let mut sorted_edits = param_edits;
+                sorted_edits.sort_by(|a, b| b.1.start.cmp(&a.1.start));
+                let mut regenerate_previews: Vec<(u64, String)> = Vec::new();
+                for (new_val, span, preview_id, query, target_idx) in &sorted_edits {
+                    let new_val_str = format!("{}", new_val);
+                    let src = &mut **editor_text;
+                    if span.end <= src.len() {
+                        let old_len = span.end - span.start;
+                        let new_len = new_val_str.len();
+                        src.replace_range(span.start..span.end, &new_val_str);
+
+                        // Update all clicked_params spans for this target
+                        // to account for the length change
+                        let delta = new_len as isize - old_len as isize;
+                        if delta != 0 {
+                            if let Some((_, target)) = preview_targets.get_mut(*target_idx) {
+                                for (_, _, param_span) in target.clicked_params.iter_mut() {
+                                    if let Some(ps) = param_span {
+                                        if ps.start == span.start {
+                                            // This is the span we just edited
+                                            ps.end = span.start + new_len;
+                                        } else if ps.start > span.start {
+                                            // Shift spans that come after the edit
+                                            ps.start = (ps.start as isize + delta) as usize;
+                                            ps.end = (ps.end as isize + delta) as usize;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !regenerate_previews.iter().any(|(id, _)| id == preview_id) {
+                        regenerate_previews.push((*preview_id, query.clone()));
+                    }
+                }
+                for (preview_id, query) in regenerate_previews {
+                    ev_generate.write(GeneratePreviewRequest {
+                        preview_id,
+                        database: (**editor_text).clone(),
+                        query,
+                    });
+                }
             });
         });
     }
@@ -250,11 +307,12 @@ pub(super) fn on_preview_generated(
     for ev in ev_generated.read() {
         // Update existing preview if it is still alive.
         let mut updated_existing = false;
-        for target in preview_query.iter_mut() {
+        for mut target in preview_query.iter_mut() {
             if target.preview_id == ev.preview_id {
                 if let Some(mesh_asset) = meshes.get_mut(&target.mesh_handle) {
                     *mesh_asset = ev.mesh.clone();
                 }
+                target.evaluated_nodes = ev.evaluated_nodes.clone();
                 updated_existing = true;
                 break;
             }
@@ -427,6 +485,8 @@ pub(super) fn on_preview_generated(
                     rotate_x: pending_state.rotate_x,
                     rotate_y: pending_state.rotate_y,
                     query: ev.query.clone(),
+                    evaluated_nodes: ev.evaluated_nodes.clone(),
+                    clicked_params: Vec::new(),
                 }
             });
     }
@@ -434,12 +494,209 @@ pub(super) fn on_preview_generated(
 
 // Pending previews and polling system are no longer needed with bevy-async-ecs
 
+struct ParamEdit {
+    new_value: f64,
+    span: SrcSpan,
+}
+
 /// UI action returned from preview_target_ui
 enum PreviewAction {
     None,
     Update,
     Export3MF,
     Close,
+    ParamEdited(ParamEdit),
+}
+
+// ============================================================
+// Raycast: click-to-source infrastructure
+// ============================================================
+
+/// Ray-triangle intersection using Moller-Trumbore algorithm.
+/// Returns distance t if hit (t > 0).
+fn ray_triangle_intersect(
+    ray_origin: &[f64; 3],
+    ray_dir: &[f64; 3],
+    v0: &[f64; 3],
+    v1: &[f64; 3],
+    v2: &[f64; 3],
+) -> Option<f64> {
+    let edge1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+    let edge2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+    let h = cross(ray_dir, &edge2);
+    let a = dot(&edge1, &h);
+    if a.abs() < 1e-10 {
+        return None;
+    }
+    let f = 1.0 / a;
+    let s = [
+        ray_origin[0] - v0[0],
+        ray_origin[1] - v0[1],
+        ray_origin[2] - v0[2],
+    ];
+    let u = f * dot(&s, &h);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = cross(&s, &edge1);
+    let v = f * dot(ray_dir, &q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = f * dot(&edge2, &q);
+    if t > 1e-10 { Some(t) } else { None }
+}
+
+fn cross(a: &[f64; 3], b: &[f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dot(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Test ray against AABB, returns true if ray intersects the box.
+fn ray_aabb_intersect(
+    ray_origin: &[f64; 3],
+    ray_dir: &[f64; 3],
+    aabb_min: &[f64; 3],
+    aabb_max: &[f64; 3],
+) -> bool {
+    let mut tmin = f64::NEG_INFINITY;
+    let mut tmax = f64::INFINITY;
+    for i in 0..3 {
+        if ray_dir[i].abs() < 1e-12 {
+            if ray_origin[i] < aabb_min[i] || ray_origin[i] > aabb_max[i] {
+                return false;
+            }
+        } else {
+            let inv_d = 1.0 / ray_dir[i];
+            let mut t1 = (aabb_min[i] - ray_origin[i]) * inv_d;
+            let mut t2 = (aabb_max[i] - ray_origin[i]) * inv_d;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            tmin = tmin.max(t1);
+            tmax = tmax.min(t2);
+            if tmin > tmax {
+                return false;
+            }
+        }
+    }
+    tmax >= 0.0
+}
+
+/// Raycast against an EvaluatedNode tree. Returns (distance, node_ref) of closest hit.
+fn raycast_evaluated_nodes<'a>(
+    ray_origin: &[f64; 3],
+    ray_dir: &[f64; 3],
+    nodes: &'a [EvaluatedNode],
+) -> Option<(f64, &'a EvaluatedNode)> {
+    let mut best: Option<(f64, &'a EvaluatedNode)> = None;
+    for node in nodes {
+        if let Some((t, n)) = raycast_node(ray_origin, ray_dir, node) {
+            if best.is_none() || t < best.unwrap().0 {
+                best = Some((t, n));
+            }
+        }
+    }
+    best
+}
+
+fn raycast_node<'a>(
+    ray_origin: &[f64; 3],
+    ray_dir: &[f64; 3],
+    node: &'a EvaluatedNode,
+) -> Option<(f64, &'a EvaluatedNode)> {
+    if !ray_aabb_intersect(ray_origin, ray_dir, &node.aabb_min, &node.aabb_max) {
+        return None;
+    }
+
+    // First try children (more specific nodes)
+    let mut best: Option<(f64, &'a EvaluatedNode)> = None;
+    for child in &node.children {
+        if let Some((t, n)) = raycast_node(ray_origin, ray_dir, child) {
+            if best.is_none() || t < best.unwrap().0 {
+                best = Some((t, n));
+            }
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+
+    // No child hit: test this node's mesh triangles
+    let num_props = 6usize; // xyz + normals after calculate_normals
+    let verts = &node.mesh_verts;
+    let indices = &node.mesh_indices;
+    let mut closest_t = f64::INFINITY;
+    for tri in indices.chunks(3) {
+        if tri.len() < 3 {
+            continue;
+        }
+        let i0 = tri[0] as usize * num_props;
+        let i1 = tri[1] as usize * num_props;
+        let i2 = tri[2] as usize * num_props;
+        if i0 + 2 >= verts.len() || i1 + 2 >= verts.len() || i2 + 2 >= verts.len() {
+            continue;
+        }
+        let v0 = [verts[i0] as f64, verts[i0 + 1] as f64, verts[i0 + 2] as f64];
+        let v1 = [verts[i1] as f64, verts[i1 + 1] as f64, verts[i1 + 2] as f64];
+        let v2 = [verts[i2] as f64, verts[i2 + 1] as f64, verts[i2 + 2] as f64];
+        if let Some(t) = ray_triangle_intersect(ray_origin, ray_dir, &v0, &v1, &v2) {
+            if t < closest_t {
+                closest_t = t;
+            }
+        }
+    }
+    if closest_t < f64::INFINITY {
+        Some((closest_t, node))
+    } else {
+        None
+    }
+}
+
+/// Generate a ray from UV coordinates (0..1) in the preview image, given camera params.
+fn generate_ray_from_uv(
+    u: f32,
+    v: f32,
+    target: &PreviewTarget,
+) -> ([f64; 3], [f64; 3]) {
+    let rx = target.rotate_x.clamp(MIN_CAMERA_PITCH, MAX_CAMERA_PITCH) as f32;
+    let ry = target.rotate_y.clamp(MIN_CAMERA_YAW, MAX_CAMERA_YAW) as f32;
+    let zoom = target.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+    let dist = target.base_camera_distance * (20.0 / zoom);
+
+    let cam_x = dist * ry.sin() * rx.cos();
+    let cam_y = dist * ry.cos() * rx.cos();
+    let cam_z = dist * rx.sin();
+
+    let cam_pos = Vec3::new(cam_x, cam_y, cam_z);
+    let cam_transform = Transform::from_translation(cam_pos).looking_at(Vec3::ZERO, Vec3::Z);
+
+    // Default perspective FOV (Bevy Camera3d default is 45 degrees vertical)
+    let fov_y: f32 = std::f32::consts::FRAC_PI_4;
+    let aspect = target.rt_size.x as f32 / target.rt_size.y as f32;
+    let half_h = (fov_y * 0.5).tan();
+    let half_w = half_h * aspect;
+
+    // Convert UV (0..1, 0..1) to NDC (-1..1, -1..1), with V flipped (egui top-left origin)
+    let ndc_x = u * 2.0 - 1.0;
+    let ndc_y = 1.0 - v * 2.0;
+
+    // Ray direction in camera local space
+    let local_dir = Vec3::new(ndc_x * half_w, ndc_y * half_h, -1.0).normalize();
+
+    // Transform to world space
+    let world_dir = cam_transform.rotation * local_dir;
+
+    let origin = [cam_pos.x as f64, cam_pos.y as f64, cam_pos.z as f64];
+    let dir = [world_dir.x as f64, world_dir.y as f64, world_dir.z as f64];
+    (origin, dir)
 }
 
 /// Returns the action requested by the user
@@ -496,12 +753,59 @@ fn preview_target_ui(
                 );
             });
             ui.add_space(6.0);
-            // Show the offscreen render under controls
+            // Show the offscreen render under controls (with click detection)
             let avail_w = ui.available_width();
             let aspect = size.y as f32 / size.x as f32;
             let w = avail_w;
             let h = w * aspect;
-            ui.add(egui::Image::from_texture((tex_id, egui::vec2(w, h))));
+            let image_response = ui.add(
+                egui::Image::from_texture((tex_id, egui::vec2(w, h)))
+                    .sense(egui::Sense::click()),
+            );
+            if image_response.clicked() {
+                if let Some(pos) = image_response.interact_pointer_pos() {
+                    let rect = image_response.rect;
+                    let u = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                    let v = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+                    let (origin, dir) = generate_ray_from_uv(u, v, target);
+                    if let Some((_t, hit_node)) =
+                        raycast_evaluated_nodes(&origin, &dir, &target.evaluated_nodes)
+                    {
+                        let tracked = collect_tracked_spans_from_expr(&hit_node.expr);
+                        bevy::log::info!("Clicked node: {:?}", hit_node.expr);
+                        for (name, tf) in &tracked {
+                            bevy::log::info!("  param {}: value={}, span={:?}", name, tf.value, tf.source_span);
+                        }
+                        let params: Vec<(String, f64, Option<SrcSpan>)> =
+                            tracked
+                                .into_iter()
+                                .map(|(name, tf)| (name, tf.value, tf.source_span))
+                                .collect();
+                        target.clicked_params = params;
+                    } else {
+                        target.clicked_params.clear();
+                    }
+                }
+            }
+
+            // Show clicked node parameters for editing
+            if !target.clicked_params.is_empty() {
+                ui.add_space(4.0);
+                ui.label("Clicked node parameters:");
+                for (name, value, span) in target.clicked_params.iter_mut() {
+                    let Some(sp) = span else { continue };
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{name}:"));
+                        let drag = ui.add(egui::DragValue::new(value).speed(0.5));
+                        if drag.changed() {
+                            action = PreviewAction::ParamEdited(ParamEdit {
+                                new_value: *value,
+                                span: *sp,
+                            });
+                        }
+                    });
+                }
+            }
         });
     action
 }

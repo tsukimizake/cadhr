@@ -10,6 +10,16 @@ use nom::{
 use std::fmt;
 
 // ============================================================
+// SrcSpan: ソースコード上のバイトオフセット範囲
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SrcSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+// ============================================================
 // FixedPoint: 2桁固定小数点数 (hundredths)
 // ============================================================
 
@@ -125,7 +135,7 @@ pub enum ArithOp {
     Div,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub enum Term {
     Var {
         name: String,
@@ -134,6 +144,7 @@ pub enum Term {
     DefaultVar {
         name: String,
         value: FixedPoint,
+        span: Option<SrcSpan>,
     },
     /// 範囲制約付き変数: min < X < max など
     RangeVar {
@@ -165,6 +176,82 @@ pub enum Term {
     },
 }
 
+impl PartialEq for Term {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Term::Var { name: n1 }, Term::Var { name: n2 }) => n1 == n2,
+            (
+                Term::DefaultVar {
+                    name: n1,
+                    value: v1,
+                    ..
+                },
+                Term::DefaultVar {
+                    name: n2,
+                    value: v2,
+                    ..
+                },
+            ) => n1 == n2 && v1 == v2,
+            (
+                Term::RangeVar {
+                    name: n1,
+                    min: min1,
+                    max: max1,
+                },
+                Term::RangeVar {
+                    name: n2,
+                    min: min2,
+                    max: max2,
+                },
+            ) => n1 == n2 && min1 == min2 && max1 == max2,
+            (Term::Number { value: v1 }, Term::Number { value: v2 }) => v1 == v2,
+            (
+                Term::InfixExpr {
+                    op: o1,
+                    left: l1,
+                    right: r1,
+                },
+                Term::InfixExpr {
+                    op: o2,
+                    left: l2,
+                    right: r2,
+                },
+            ) => o1 == o2 && l1 == l2 && r1 == r2,
+            (
+                Term::Struct {
+                    functor: f1,
+                    args: a1,
+                },
+                Term::Struct {
+                    functor: f2,
+                    args: a2,
+                },
+            ) => f1 == f2 && a1 == a2,
+            (
+                Term::List {
+                    items: i1,
+                    tail: t1,
+                },
+                Term::List {
+                    items: i2,
+                    tail: t2,
+                },
+            ) => i1 == i2 && t1 == t2,
+            (
+                Term::Constraint {
+                    left: l1,
+                    right: r1,
+                },
+                Term::Constraint {
+                    left: l2,
+                    right: r2,
+                },
+            ) => l1 == l2 && r1 == r2,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub enum Clause {
     Fact(Term),
@@ -175,7 +262,7 @@ impl fmt::Debug for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Term::Var { name } => write!(f, "{}", name),
-            Term::DefaultVar { name, value } => write!(f, "{}@{}", name, value),
+            Term::DefaultVar { name, value, .. } => write!(f, "{}@{}", name, value),
             Term::RangeVar { name, min, max } => {
                 if let Some(b) = min {
                     write!(f, "{} {} ", b.value, if b.inclusive { "<=" } else { "<" })?;
@@ -257,7 +344,19 @@ pub fn var(name: String) -> Term {
 }
 
 pub fn default_var(name: String, value: FixedPoint) -> Term {
-    Term::DefaultVar { name, value }
+    Term::DefaultVar {
+        name,
+        value,
+        span: None,
+    }
+}
+
+pub fn default_var_with_span(name: String, value: FixedPoint, span: SrcSpan) -> Term {
+    Term::DefaultVar {
+        name,
+        value,
+        span: Some(span),
+    }
 }
 
 pub fn number(value: FixedPoint) -> Term {
@@ -445,11 +544,24 @@ fn number_term(input: &str) -> PResult<'_, Term> {
 }
 
 fn default_var_term(input: &str) -> PResult<'_, Term> {
-    map(
-        separated_pair(ws(variable), ws(char('@')), ws(fixed_number)),
-        |(name, value)| default_var(name, value),
-    )
-    .parse(input)
+    let (input, name) = ws(variable).parse(input)?;
+    let (input, _) = ws(char('@')).parse(input)?;
+    let (input, _) = space_or_comment0(input)?;
+    let value_start = input.as_ptr() as usize;
+    let (input, value) = fixed_number(input)?;
+    let value_end = input.as_ptr() as usize;
+    // Store raw pointer addresses; database()/query() will convert to byte offsets
+    Ok((
+        input,
+        Term::DefaultVar {
+            name,
+            value,
+            span: Some(SrcSpan {
+                start: value_start,
+                end: value_end,
+            }),
+        },
+    ))
 }
 
 /// 比較演算子 (<, <=, >, >=)
@@ -636,9 +748,60 @@ pub fn program(input: &str) -> PResult<'_, Vec<Clause>> {
     ws(terminated(many0(clause_parser), opt(space_or_comment1))).parse(input)
 }
 
+fn fix_spans_in_term(term: &mut Term, base: usize) {
+    match term {
+        Term::DefaultVar { span, .. } => {
+            if let Some(s) = span {
+                s.start = s.start.wrapping_sub(base);
+                s.end = s.end.wrapping_sub(base);
+            }
+        }
+        Term::Struct { args, .. } => {
+            for arg in args.iter_mut() {
+                fix_spans_in_term(arg, base);
+            }
+        }
+        Term::List { items, tail } => {
+            for item in items.iter_mut() {
+                fix_spans_in_term(item, base);
+            }
+            if let Some(t) = tail {
+                fix_spans_in_term(t, base);
+            }
+        }
+        Term::InfixExpr { left, right, .. } => {
+            fix_spans_in_term(left, base);
+            fix_spans_in_term(right, base);
+        }
+        Term::Constraint { left, right } => {
+            fix_spans_in_term(left, base);
+            fix_spans_in_term(right, base);
+        }
+        _ => {}
+    }
+}
+
+fn fix_spans_in_clause(clause: &mut Clause, base: usize) {
+    match clause {
+        Clause::Fact(term) => fix_spans_in_term(term, base),
+        Clause::Rule { head, body } => {
+            fix_spans_in_term(head, base);
+            for t in body.iter_mut() {
+                fix_spans_in_term(t, base);
+            }
+        }
+    }
+}
+
 pub fn database(input: &str) -> Result<Vec<Clause>, nom::Err<nom::error::Error<&str>>> {
+    let base = input.as_ptr() as usize;
     match program(input) {
-        Ok((rest, clauses)) if rest.is_empty() => Ok(clauses),
+        Ok((rest, mut clauses)) if rest.is_empty() => {
+            for clause in clauses.iter_mut() {
+                fix_spans_in_clause(clause, base);
+            }
+            Ok(clauses)
+        }
         Ok((rest, _)) => Err(nom::Err::Error(nom::error::Error {
             input: rest,
             code: nom::error::ErrorKind::Fail,
@@ -648,7 +811,12 @@ pub fn database(input: &str) -> Result<Vec<Clause>, nom::Err<nom::error::Error<&
 }
 
 pub fn query(input: &str) -> PResult<'_, Vec<Term>> {
-    ws(terminated(goals, cut(ws(char('.'))))).parse(input)
+    let base = input.as_ptr() as usize;
+    let (rest, mut terms) = ws(terminated(goals, cut(ws(char('.'))))).parse(input)?;
+    for term in terms.iter_mut() {
+        fix_spans_in_term(term, base);
+    }
+    Ok((rest, terms))
 }
 
 #[cfg(test)]
@@ -906,7 +1074,7 @@ mod tests {
         match clause {
             Clause::Fact(term) => match &term {
                 Term::Struct { args, .. } => match &args[0] {
-                    Term::DefaultVar { name, value } => {
+                    Term::DefaultVar { name, value, .. } => {
                         assert_eq!(name, "X");
                         assert_eq!(*value, FixedPoint::from_int(25));
                     }
@@ -971,7 +1139,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
             Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
-                Term::DefaultVar { name, value } => {
+                Term::DefaultVar { name, value, .. } => {
                     assert_eq!(name, "X");
                     assert_eq!(*value, FixedPoint::from_hundredths(250));
                 }

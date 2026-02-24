@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use bevy_file_dialog::prelude::*;
+use cadhr_lang::manifold_bridge::EvaluatedNode;
 use derived_deref::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -45,6 +46,9 @@ pub struct PreviewTarget {
     pub rotate_x: f64,
     pub rotate_y: f64,
     pub query: String,
+    pub evaluated_nodes: Vec<EvaluatedNode>,
+    /// Parameters of the currently clicked node (name, current_value, source_span)
+    pub clicked_params: Vec<(String, f64, Option<cadhr_lang::parse::SrcSpan>)>,
 }
 
 impl Plugin for UiPlugin {

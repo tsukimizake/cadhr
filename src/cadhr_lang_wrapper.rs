@@ -5,7 +5,7 @@ use bevy::{mesh::Indices, prelude::*};
 use bevy_async_ecs::AsyncWorld;
 
 use crate::events::{CadhrLangOutput, GeneratePreviewRequest, PreviewGenerated};
-use cadhr_lang::manifold_bridge::generate_mesh_from_terms;
+use cadhr_lang::manifold_bridge::generate_mesh_and_tree_from_terms;
 use cadhr_lang::parse::{database, query as parse_query};
 use cadhr_lang::term_rewrite::execute;
 use manifold_rs::Mesh as RsMesh;
@@ -41,7 +41,7 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
             let query = req.query;
 
             let mut logs: Vec<String> = Vec::new();
-            let result = (|| -> Result<Mesh, String> {
+            let result = (|| -> Result<(Mesh, Vec<cadhr_lang::manifold_bridge::EvaluatedNode>), String> {
                 let (_, query_terms) =
                     parse_query(&query).map_err(|e| format!("Query parse error: {:?}", e))?;
 
@@ -56,10 +56,10 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
 
                 logs.push(format!("Resolved terms: {:?}", resolved));
 
-                let rs_mesh: RsMesh = generate_mesh_from_terms(&resolved)
+                let (rs_mesh, evaluated_nodes) = generate_mesh_and_tree_from_terms(&resolved)
                     .map_err(|e| format!("Mesh error: {}", e))?;
 
-                Ok(rs_mesh_to_bevy_mesh(&rs_mesh))
+                Ok((rs_mesh_to_bevy_mesh(&rs_mesh), evaluated_nodes))
             })();
 
             let log_message = logs.join("\n");
@@ -73,12 +73,13 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
             }
 
             match result {
-                Ok(mesh) => {
+                Ok((mesh, evaluated_nodes)) => {
                     async_world
                         .send_message(PreviewGenerated {
                             preview_id,
                             query,
                             mesh,
+                            evaluated_nodes,
                         })
                         .await;
                 }
