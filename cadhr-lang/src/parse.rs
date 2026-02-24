@@ -140,17 +140,13 @@ pub enum Term {
     Var {
         name: String,
     },
-    /// 既定値付き変数: X@25
-    DefaultVar {
+    /// 既定値・範囲付き変数: X@25, 0<X@20<50, 0<X<50 など
+    AnnotatedVar {
         name: String,
-        value: FixedPoint,
-        span: Option<SrcSpan>,
-    },
-    /// 範囲制約付き変数: min < X < max など
-    RangeVar {
-        name: String,
+        default_value: Option<FixedPoint>,
         min: Option<Bound>,
         max: Option<Bound>,
+        span: Option<SrcSpan>,
     },
     Number {
         value: FixedPoint,
@@ -181,29 +177,21 @@ impl PartialEq for Term {
         match (self, other) {
             (Term::Var { name: n1 }, Term::Var { name: n2 }) => n1 == n2,
             (
-                Term::DefaultVar {
+                Term::AnnotatedVar {
                     name: n1,
-                    value: v1,
-                    ..
-                },
-                Term::DefaultVar {
-                    name: n2,
-                    value: v2,
-                    ..
-                },
-            ) => n1 == n2 && v1 == v2,
-            (
-                Term::RangeVar {
-                    name: n1,
+                    default_value: dv1,
                     min: min1,
                     max: max1,
+                    ..
                 },
-                Term::RangeVar {
+                Term::AnnotatedVar {
                     name: n2,
+                    default_value: dv2,
                     min: min2,
                     max: max2,
+                    ..
                 },
-            ) => n1 == n2 && min1 == min2 && max1 == max2,
+            ) => n1 == n2 && dv1 == dv2 && min1 == min2 && max1 == max2,
             (Term::Number { value: v1 }, Term::Number { value: v2 }) => v1 == v2,
             (
                 Term::InfixExpr {
@@ -262,12 +250,20 @@ impl fmt::Debug for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Term::Var { name } => write!(f, "{}", name),
-            Term::DefaultVar { name, value, .. } => write!(f, "{}@{}", name, value),
-            Term::RangeVar { name, min, max } => {
+            Term::AnnotatedVar {
+                name,
+                default_value,
+                min,
+                max,
+                ..
+            } => {
                 if let Some(b) = min {
                     write!(f, "{} {} ", b.value, if b.inclusive { "<=" } else { "<" })?;
                 }
                 write!(f, "{}", name)?;
+                if let Some(dv) = default_value {
+                    write!(f, "@{}", dv)?;
+                }
                 if let Some(b) = max {
                     write!(f, " {} {}", if b.inclusive { "<=" } else { "<" }, b.value)?;
                 }
@@ -344,18 +340,38 @@ pub fn var(name: String) -> Term {
 }
 
 pub fn default_var(name: String, value: FixedPoint) -> Term {
-    Term::DefaultVar {
+    Term::AnnotatedVar {
         name,
-        value,
+        default_value: Some(value),
+        min: None,
+        max: None,
         span: None,
     }
 }
 
 pub fn default_var_with_span(name: String, value: FixedPoint, span: SrcSpan) -> Term {
-    Term::DefaultVar {
+    Term::AnnotatedVar {
         name,
-        value,
+        default_value: Some(value),
+        min: None,
+        max: None,
         span: Some(span),
+    }
+}
+
+pub fn annotated_var(
+    name: String,
+    default_value: Option<FixedPoint>,
+    min: Option<Bound>,
+    max: Option<Bound>,
+    span: Option<SrcSpan>,
+) -> Term {
+    Term::AnnotatedVar {
+        name,
+        default_value,
+        min,
+        max,
+        span,
     }
 }
 
@@ -381,7 +397,13 @@ pub fn list(items: Vec<Term>, tail: Option<Term>) -> Term {
 }
 
 pub fn range_var(name: String, min: Option<Bound>, max: Option<Bound>) -> Term {
-    Term::RangeVar { name, min, max }
+    Term::AnnotatedVar {
+        name,
+        default_value: None,
+        min,
+        max,
+        span: None,
+    }
 }
 
 pub fn arith_expr(op: ArithOp, left: Term, right: Term) -> Term {
@@ -543,27 +565,6 @@ fn number_term(input: &str) -> PResult<'_, Term> {
     map(ws(fixed_number), number).parse(input)
 }
 
-fn default_var_term(input: &str) -> PResult<'_, Term> {
-    let (input, name) = ws(variable).parse(input)?;
-    let (input, _) = ws(char('@')).parse(input)?;
-    let (input, _) = space_or_comment0(input)?;
-    let value_start = input.as_ptr() as usize;
-    let (input, value) = fixed_number(input)?;
-    let value_end = input.as_ptr() as usize;
-    // Store raw pointer addresses; database()/query() will convert to byte offsets
-    Ok((
-        input,
-        Term::DefaultVar {
-            name,
-            value,
-            span: Some(SrcSpan {
-                start: value_start,
-                end: value_end,
-            }),
-        },
-    ))
-}
-
 /// 比較演算子 (<, <=, >, >=)
 #[derive(Clone, Copy)]
 enum CompOp {
@@ -583,52 +584,81 @@ fn comp_op(input: &str) -> PResult<'_, CompOp> {
     .parse(input)
 }
 
-/// range_var: `0 < X < 10`, `X < 10`, `0 < X`, `X > 0` など
-fn range_var_term(input: &str) -> PResult<'_, Term> {
+fn default_value_suffix(input: &str) -> PResult<'_, (FixedPoint, SrcSpan)> {
+    let (input, _) = ws(char('@')).parse(input)?;
+    let (input, _) = space_or_comment0(input)?;
+    let value_start = input.as_ptr() as usize;
+    let (input, value) = fixed_number(input)?;
+    let value_end = input.as_ptr() as usize;
+    Ok((
+        input,
+        (
+            value,
+            SrcSpan {
+                start: value_start,
+                end: value_end,
+            },
+        ),
+    ))
+}
+
+/// annotated_var: `X@25`, `0<X@20<50`, `0<X<10`, `X<10`, `0<X` など
+/// left_bound? Variable (@default_value)? right_bound?
+fn annotated_var_term(input: &str) -> PResult<'_, Term> {
     // 左側: (num op)?
-    let left_bound = opt((ws(fixed_number), comp_op));
+    let (input, left) = opt((ws(fixed_number), comp_op)).parse(input)?;
     // 変数名
-    let var_name = ws(variable);
+    let (input, name) = ws(variable).parse(input)?;
+    // @default_value (optional)
+    let (input, default_with_span) = opt(default_value_suffix).parse(input)?;
     // 右側: (op num)?
-    let right_bound = opt((comp_op, ws(fixed_number)));
+    let (input, right) = opt((comp_op, ws(fixed_number))).parse(input)?;
 
-    map(
-        (left_bound, var_name, right_bound),
-        |(left, name, right)| {
-            let min = match left {
-                Some((val, CompOp::Lt)) => Some(Bound {
-                    value: val,
-                    inclusive: false,
-                }),
-                Some((val, CompOp::Le)) => Some(Bound {
-                    value: val,
-                    inclusive: true,
-                }),
-                Some((_, CompOp::Gt | CompOp::Ge)) => return var(name),
-                None => None,
-            };
+    let min = match left {
+        Some((val, CompOp::Lt)) => Some(Bound {
+            value: val,
+            inclusive: false,
+        }),
+        Some((val, CompOp::Le)) => Some(Bound {
+            value: val,
+            inclusive: true,
+        }),
+        Some((_, CompOp::Gt | CompOp::Ge)) => return Ok((input, var(name))),
+        None => None,
+    };
 
-            let max = match right {
-                Some((CompOp::Lt, val)) => Some(Bound {
-                    value: val,
-                    inclusive: false,
-                }),
-                Some((CompOp::Le, val)) => Some(Bound {
-                    value: val,
-                    inclusive: true,
-                }),
-                Some((CompOp::Gt | CompOp::Ge, _)) => return var(name),
-                None => None,
-            };
+    let max = match right {
+        Some((CompOp::Lt, val)) => Some(Bound {
+            value: val,
+            inclusive: false,
+        }),
+        Some((CompOp::Le, val)) => Some(Bound {
+            value: val,
+            inclusive: true,
+        }),
+        Some((CompOp::Gt | CompOp::Ge, _)) => return Ok((input, var(name))),
+        None => None,
+    };
 
-            if min.is_none() && max.is_none() {
-                var(name)
-            } else {
-                range_var(name, min, max)
-            }
-        },
-    )
-    .parse(input)
+    let (default_value, span) = match default_with_span {
+        Some((val, sp)) => (Some(val), Some(sp)),
+        None => (None, None),
+    };
+
+    if min.is_none() && max.is_none() && default_value.is_none() {
+        Ok((input, var(name)))
+    } else {
+        Ok((
+            input,
+            Term::AnnotatedVar {
+                name,
+                default_value,
+                min,
+                max,
+                span,
+            },
+        ))
+    }
 }
 
 fn atom_term(input: &str) -> PResult<'_, Term> {
@@ -650,12 +680,11 @@ fn atom_term(input: &str) -> PResult<'_, Term> {
 }
 
 fn primary_term(input: &str) -> PResult<'_, Term> {
-    // range_var_term は number_term より先に試行（0 < X のような形式を正しくパースするため）
+    // annotated_var_term は number_term より先に試行（0 < X のような形式を正しくパースするため）
     alt((
         list_term,
         paren_term,
-        default_var_term,
-        range_var_term,
+        annotated_var_term,
         number_term,
         atom_term,
     ))
@@ -750,7 +779,7 @@ pub fn program(input: &str) -> PResult<'_, Vec<Clause>> {
 
 fn fix_spans_in_term(term: &mut Term, base: usize) {
     match term {
-        Term::DefaultVar { span, .. } => {
+        Term::AnnotatedVar { span, .. } => {
             if let Some(s) = span {
                 s.start = s.start.wrapping_sub(base);
                 s.end = s.end.wrapping_sub(base);
@@ -817,6 +846,76 @@ pub fn query(input: &str) -> PResult<'_, Vec<Term>> {
         fix_spans_in_term(term, base);
     }
     Ok((rest, terms))
+}
+
+/// 編集可能な変数の情報
+#[derive(Clone, Debug)]
+pub struct VarInfo {
+    pub name: String,
+    pub value: FixedPoint,
+    pub min: Option<Bound>,
+    pub max: Option<Bound>,
+    pub span: SrcSpan,
+}
+
+fn collect_editable_vars_from_term(term: &Term, vars: &mut Vec<VarInfo>) {
+    match term {
+        Term::AnnotatedVar {
+            name,
+            default_value: Some(value),
+            min,
+            max,
+            span: Some(span),
+        } => {
+            if !vars.iter().any(|v| v.span.start == span.start) {
+                vars.push(VarInfo {
+                    name: name.clone(),
+                    value: *value,
+                    min: *min,
+                    max: *max,
+                    span: *span,
+                });
+            }
+        }
+        Term::Struct { args, .. } => {
+            for arg in args {
+                collect_editable_vars_from_term(arg, vars);
+            }
+        }
+        Term::List { items, tail } => {
+            for item in items {
+                collect_editable_vars_from_term(item, vars);
+            }
+            if let Some(t) = tail {
+                collect_editable_vars_from_term(t, vars);
+            }
+        }
+        Term::InfixExpr { left, right, .. } => {
+            collect_editable_vars_from_term(left, vars);
+            collect_editable_vars_from_term(right, vars);
+        }
+        Term::Constraint { left, right } => {
+            collect_editable_vars_from_term(left, vars);
+            collect_editable_vars_from_term(right, vars);
+        }
+        _ => {}
+    }
+}
+
+pub fn collect_editable_vars(clauses: &[Clause]) -> Vec<VarInfo> {
+    let mut vars = Vec::new();
+    for clause in clauses {
+        match clause {
+            Clause::Fact(term) => collect_editable_vars_from_term(term, &mut vars),
+            Clause::Rule { head, body } => {
+                collect_editable_vars_from_term(head, &mut vars);
+                for t in body {
+                    collect_editable_vars_from_term(t, &mut vars);
+                }
+            }
+        }
+    }
+    vars
 }
 
 #[cfg(test)]
@@ -933,7 +1032,7 @@ mod tests {
                     assert_eq!(functor, "hoge");
                     assert_eq!(args.len(), 1);
                     match &args[0] {
-                        Term::RangeVar { name, min, max } => {
+                        Term::AnnotatedVar { name, min, max, .. } => {
                             assert_eq!(name, "X");
                             assert_eq!(
                                 *min,
@@ -950,7 +1049,7 @@ mod tests {
                                 })
                             );
                         }
-                        _ => panic!("Expected RangeVar, got {:?}", args[0]),
+                        _ => panic!("Expected AnnotatedVar, got {:?}", args[0]),
                     }
                 }
                 _ => panic!("Expected Struct"),
@@ -967,7 +1066,7 @@ mod tests {
         match clause {
             Clause::Fact(term) => match &term {
                 Term::Struct { args, .. } => match &args[0] {
-                    Term::RangeVar { name, min, max } => {
+                    Term::AnnotatedVar { name, min, max, .. } => {
                         assert_eq!(name, "X");
                         assert_eq!(
                             *min,
@@ -984,7 +1083,7 @@ mod tests {
                             })
                         );
                     }
-                    _ => panic!("Expected RangeVar"),
+                    _ => panic!("Expected AnnotatedVar"),
                 },
                 _ => panic!("Expected Struct"),
             },
@@ -1000,7 +1099,7 @@ mod tests {
         match clause {
             Clause::Fact(term) => match &term {
                 Term::Struct { args, .. } => match &args[0] {
-                    Term::RangeVar { name, min, max } => {
+                    Term::AnnotatedVar { name, min, max, .. } => {
                         assert_eq!(name, "X");
                         assert_eq!(
                             *min,
@@ -1011,7 +1110,7 @@ mod tests {
                         );
                         assert_eq!(*max, None);
                     }
-                    _ => panic!("Expected RangeVar"),
+                    _ => panic!("Expected AnnotatedVar"),
                 },
                 _ => panic!("Expected Struct"),
             },
@@ -1027,7 +1126,7 @@ mod tests {
         match clause {
             Clause::Fact(term) => match &term {
                 Term::Struct { args, .. } => match &args[0] {
-                    Term::RangeVar { name, min, max } => {
+                    Term::AnnotatedVar { name, min, max, .. } => {
                         assert_eq!(name, "X");
                         assert_eq!(*min, None);
                         assert_eq!(
@@ -1038,7 +1137,7 @@ mod tests {
                             })
                         );
                     }
-                    _ => panic!("Expected RangeVar"),
+                    _ => panic!("Expected AnnotatedVar"),
                 },
                 _ => panic!("Expected Struct"),
             },
@@ -1056,7 +1155,7 @@ mod tests {
                 match &head {
                     Term::Struct { functor, args } => {
                         assert_eq!(functor, "hoge");
-                        assert!(matches!(&args[0], Term::RangeVar { .. }));
+                        assert!(matches!(&args[0], Term::AnnotatedVar { .. }));
                     }
                     _ => panic!("Expected Struct"),
                 }
@@ -1074,11 +1173,11 @@ mod tests {
         match clause {
             Clause::Fact(term) => match &term {
                 Term::Struct { args, .. } => match &args[0] {
-                    Term::DefaultVar { name, value, .. } => {
+                    Term::AnnotatedVar { name, default_value, .. } => {
                         assert_eq!(name, "X");
-                        assert_eq!(*value, FixedPoint::from_int(25));
+                        assert_eq!(*default_value, Some(FixedPoint::from_int(25)));
                     }
-                    _ => panic!("Expected DefaultVar"),
+                    _ => panic!("Expected AnnotatedVar"),
                 },
                 _ => panic!("Expected Struct"),
             },
@@ -1139,11 +1238,11 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
             Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
-                Term::DefaultVar { name, value, .. } => {
+                Term::AnnotatedVar { name, default_value, .. } => {
                     assert_eq!(name, "X");
-                    assert_eq!(*value, FixedPoint::from_hundredths(250));
+                    assert_eq!(*default_value, Some(FixedPoint::from_hundredths(250)));
                 }
-                _ => panic!("Expected DefaultVar"),
+                _ => panic!("Expected AnnotatedVar"),
             },
             _ => panic!("Expected Fact"),
         }
@@ -1244,5 +1343,95 @@ mod tests {
             }
             _ => panic!("Expected Fact"),
         }
+    }
+
+    #[test]
+    fn parse_annotated_var_with_default_and_range() {
+        let src = "hoge(0<X@20<50).";
+        let (_, clause) = clause_parser(src).unwrap();
+
+        match clause {
+            Clause::Fact(term) => match &term {
+                Term::Struct { functor, args } => {
+                    assert_eq!(functor, "hoge");
+                    assert_eq!(args.len(), 1);
+                    match &args[0] {
+                        Term::AnnotatedVar {
+                            name,
+                            default_value,
+                            min,
+                            max,
+                            span,
+                        } => {
+                            assert_eq!(name, "X");
+                            assert_eq!(*default_value, Some(FixedPoint::from_int(20)));
+                            assert_eq!(
+                                *min,
+                                Some(Bound {
+                                    value: FixedPoint::from_int(0),
+                                    inclusive: false
+                                })
+                            );
+                            assert_eq!(
+                                *max,
+                                Some(Bound {
+                                    value: FixedPoint::from_int(50),
+                                    inclusive: false
+                                })
+                            );
+                            assert!(span.is_some());
+                        }
+                        _ => panic!("Expected AnnotatedVar, got {:?}", args[0]),
+                    }
+                }
+                _ => panic!("Expected Struct"),
+            },
+            _ => panic!("Expected Fact"),
+        }
+    }
+
+    #[test]
+    fn parse_annotated_var_inclusive_range_with_default() {
+        let src = "hoge(0<=X@20<=50).";
+        let (_, clause) = clause_parser(src).unwrap();
+
+        match clause {
+            Clause::Fact(term) => match &term {
+                Term::Struct { args, .. } => match &args[0] {
+                    Term::AnnotatedVar {
+                        name,
+                        default_value,
+                        min,
+                        max,
+                        ..
+                    } => {
+                        assert_eq!(name, "X");
+                        assert_eq!(*default_value, Some(FixedPoint::from_int(20)));
+                        assert!(min.unwrap().inclusive);
+                        assert!(max.unwrap().inclusive);
+                    }
+                    _ => panic!("Expected AnnotatedVar"),
+                },
+                _ => panic!("Expected Struct"),
+            },
+            _ => panic!("Expected Fact"),
+        }
+    }
+
+    #[test]
+    fn test_collect_editable_vars() {
+        let src = "main :- cube(X@10, 0<Y@20<50, Z@30).";
+        let clauses = database(src).unwrap();
+        let vars = collect_editable_vars(&clauses);
+        assert_eq!(vars.len(), 3);
+        assert_eq!(vars[0].name, "X");
+        assert_eq!(vars[0].value, FixedPoint::from_int(10));
+        assert!(vars[0].min.is_none());
+        assert_eq!(vars[1].name, "Y");
+        assert_eq!(vars[1].value, FixedPoint::from_int(20));
+        assert!(vars[1].min.is_some());
+        assert!(vars[1].max.is_some());
+        assert_eq!(vars[2].name, "Z");
+        assert_eq!(vars[2].value, FixedPoint::from_int(30));
     }
 }

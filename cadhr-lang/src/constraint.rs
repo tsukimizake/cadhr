@@ -337,12 +337,23 @@ impl ArithExpr {
     pub fn try_from_term(term: &Term) -> Result<Self, ConversionError> {
         match term {
             Term::Var { name } => Ok(ArithExpr::Var(name.clone())),
-            Term::DefaultVar { value, .. } => Ok(ArithExpr::Num(*value)),
-            Term::RangeVar { name, min, max } => Ok(ArithExpr::RangeVar {
-                name: name.clone(),
-                min: *min,
-                max: *max,
-            }),
+            Term::AnnotatedVar {
+                name,
+                default_value,
+                min,
+                max,
+                ..
+            } => {
+                if let Some(value) = default_value {
+                    Ok(ArithExpr::Num(*value))
+                } else {
+                    Ok(ArithExpr::RangeVar {
+                        name: name.clone(),
+                        min: *min,
+                        max: *max,
+                    })
+                }
+            }
             Term::Number { value } => Ok(ArithExpr::Num(*value)),
             Term::InfixExpr { op, left, right } => {
                 let left = ArithExpr::try_from_term(left)?;

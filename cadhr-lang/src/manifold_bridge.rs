@@ -146,11 +146,15 @@ impl<'a> Args<'a> {
     fn tracked_f64(&self, i: usize) -> Result<TrackedF64, ConversionError> {
         match &self.args[i] {
             Term::Number { value } => Ok(TrackedF64::plain(value.to_f64())),
-            Term::DefaultVar { value, span, .. } => Ok(TrackedF64 {
+            Term::AnnotatedVar {
+                default_value: Some(value),
+                span,
+                ..
+            } => Ok(TrackedF64 {
                 value: value.to_f64(),
                 source_span: *span,
             }),
-            Term::Var { name } | Term::RangeVar { name, .. } => {
+            Term::Var { name } | Term::AnnotatedVar { name, .. } => {
                 Err(ConversionError::UnboundVariable(name.clone()))
             }
             _ => Err(ConversionError::TypeMismatch {
@@ -171,7 +175,10 @@ impl<'a> Args<'a> {
                     expected: "non-negative integer",
                 }),
             },
-            Term::DefaultVar { value, .. } => match value.to_i64_checked() {
+            Term::AnnotatedVar {
+                default_value: Some(value),
+                ..
+            } => match value.to_i64_checked() {
                 Some(v) if v >= 0 => Ok(v as u32),
                 _ => Err(ConversionError::TypeMismatch {
                     functor: self.functor.to_string(),
@@ -179,7 +186,7 @@ impl<'a> Args<'a> {
                     expected: "non-negative integer",
                 }),
             },
-            Term::Var { name } | Term::RangeVar { name, .. } => {
+            Term::Var { name } | Term::AnnotatedVar { name, .. } => {
                 Err(ConversionError::UnboundVariable(name.clone()))
             }
             _ => Err(ConversionError::TypeMismatch {
@@ -334,7 +341,10 @@ fn extract_polyhedron_points(list_term: &Term, functor: &str) -> Result<Vec<f64>
                         for arg in args.iter() {
                             match arg {
                                 Term::Number { value } => points.push(value.to_f64()),
-                                Term::DefaultVar { value, .. } => points.push(value.to_f64()),
+                                Term::AnnotatedVar {
+                                    default_value: Some(value),
+                                    ..
+                                } => points.push(value.to_f64()),
                                 _ => {
                                     return Err(ConversionError::TypeMismatch {
                                         functor: functor.to_string(),
@@ -444,7 +454,7 @@ impl ManifoldExpr {
             Term::Struct { functor, args } => Self::from_struct(functor, args),
             Term::InfixExpr { op, left, right } => Self::from_infix_expr(*op, left, right),
             Term::Var { name } => Err(ConversionError::UnboundVariable(name.clone())),
-            Term::RangeVar { name, .. } => Err(ConversionError::UnboundVariable(name.clone())),
+            Term::AnnotatedVar { name, .. } => Err(ConversionError::UnboundVariable(name.clone())),
             Term::Constraint { .. } => Err(ConversionError::UnknownPrimitive(
                 "constraint should not reach mesh generation".to_string(),
             )),

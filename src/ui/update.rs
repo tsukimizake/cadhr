@@ -1,6 +1,6 @@
 use crate::events::{CadhrLangOutput, GeneratePreviewRequest, PreviewGenerated};
 use crate::ui::{
-    CurrentFilePath, EditorText, ErrorMessage, FreeRenderLayers, NextPreviewId,
+    CurrentFilePath, EditableVars, EditorText, ErrorMessage, FreeRenderLayers, NextPreviewId,
     PendingPreviewStates, PreviewState, PreviewTarget, SessionLoadContents, SessionPreviews,
     SessionSaveContents, ThreeMfFileContents,
 };
@@ -13,6 +13,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy_egui::{EguiContexts, egui};
 use bevy_file_dialog::prelude::*;
+#[allow(unused_imports)]
 use cadhr_lang::manifold_bridge::{EvaluatedNode, collect_tracked_spans_from_expr};
 use cadhr_lang::parse::SrcSpan;
 use std::io::Cursor;
@@ -39,6 +40,7 @@ pub(super) fn egui_ui(
     mut pending_states: ResMut<PendingPreviewStates>,
     mut free_render_layers: ResMut<FreeRenderLayers>,
     mut ev_generate: MessageWriter<GeneratePreviewRequest>,
+    mut editable_vars: ResMut<EditableVars>,
     error_message: Res<ErrorMessage>,
     current_file_path: Res<CurrentFilePath>,
     meshes: Res<Assets<Mesh>>,
@@ -160,14 +162,60 @@ pub(super) fn egui_ui(
     if let Ok(ctx) = contexts.ctx_mut() {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.columns(2, |columns| {
-                // Left half: big multiline text area
+                // Left half: text area + editable vars panel
                 let left = &mut columns[0];
+
+                // Editable vars sliders at the top of left panel
+                let mut global_var_edits: Vec<(f64, SrcSpan)> = Vec::new();
+                if !editable_vars.vars.is_empty() {
+                    // Separate borrows: take a snapshot of var metadata, mutably access values
+                    let var_infos: Vec<_> = editable_vars.vars.clone();
+                    egui::Frame::default()
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(80)))
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .show(left, |ui| {
+                            ui.label("Parameters");
+                            for (i, var_info) in var_infos.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{}:", var_info.name));
+                                    let min_f =
+                                        var_info.min.map(|b| b.value.to_f64()).unwrap_or(-10000.0);
+                                    let max_f =
+                                        var_info.max.map(|b| b.value.to_f64()).unwrap_or(10000.0);
+                                    let changed = ui
+                                        .add(
+                                            egui::DragValue::new(&mut editable_vars.values[i])
+                                                .speed(0.5)
+                                                .range(min_f..=max_f),
+                                        )
+                                        .changed();
+                                    if changed {
+                                        global_var_edits
+                                            .push((editable_vars.values[i], var_info.span));
+                                    }
+                                });
+                            }
+                        });
+                    left.add_space(4.0);
+                }
+
+                // Text editor
                 let size_left = left.available_size();
-                left.add_sized(
+                let text_response = left.add_sized(
                     size_left,
                     egui::TextEdit::multiline(&mut **editor_text)
                         .hint_text("ここにテキストを入力してください"),
                 );
+
+                // Refresh editable vars when text changes
+                if text_response.changed() {
+                    if let Ok(clauses) = cadhr_lang::parse::database(&editor_text) {
+                        let new_vars = cadhr_lang::parse::collect_editable_vars(&clauses);
+                        editable_vars.values = new_vars.iter().map(|v| v.value.to_f64()).collect();
+                        editable_vars.vars = new_vars;
+                    }
+                }
 
                 // Right half: show and edit previews
                 let right = &mut columns[1];
@@ -175,8 +223,6 @@ pub(super) fn egui_ui(
                 let mut updates_to_send: Vec<(u64, String)> = Vec::new();
                 let mut exports_to_send: Vec<usize> = Vec::new();
                 let mut closes_to_send: Vec<(Entity, usize)> = Vec::new();
-                // (new_value, span, preview_id, query, preview_target_index)
-                let mut param_edits: Vec<(f64, SrcSpan, u64, String, usize)> = Vec::new();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(right, |ui| {
@@ -197,15 +243,6 @@ pub(super) fn egui_ui(
                                         }
                                         PreviewAction::Close => {
                                             closes_to_send.push((*entity, target.render_layer));
-                                        }
-                                        PreviewAction::ParamEdited(edit) => {
-                                            param_edits.push((
-                                                edit.new_value,
-                                                edit.span,
-                                                target.preview_id,
-                                                target.query.clone(),
-                                                i,
-                                            ));
                                         }
                                         PreviewAction::None => {}
                                     }
@@ -244,49 +281,31 @@ pub(super) fn egui_ui(
                     free_render_layers.push(render_layer);
                     commands.entity(entity).despawn();
                 }
-                // Apply parameter edits to source code (write-back)
-                // Sort by span offset descending to avoid invalidating earlier spans
-                let mut sorted_edits = param_edits;
-                sorted_edits.sort_by(|a, b| b.1.start.cmp(&a.1.start));
-                let mut regenerate_previews: Vec<(u64, String)> = Vec::new();
-                for (new_val, span, preview_id, query, target_idx) in &sorted_edits {
-                    let new_val_str = format!("{}", new_val);
-                    let src = &mut **editor_text;
-                    if span.end <= src.len() {
-                        let old_len = span.end - span.start;
-                        let new_len = new_val_str.len();
-                        src.replace_range(span.start..span.end, &new_val_str);
-
-                        // Update all clicked_params spans for this target
-                        // to account for the length change
-                        let delta = new_len as isize - old_len as isize;
-                        if delta != 0 {
-                            if let Some((_, target)) = preview_targets.get_mut(*target_idx) {
-                                for (_, _, param_span) in target.clicked_params.iter_mut() {
-                                    if let Some(ps) = param_span {
-                                        if ps.start == span.start {
-                                            // This is the span we just edited
-                                            ps.end = span.start + new_len;
-                                        } else if ps.start > span.start {
-                                            // Shift spans that come after the edit
-                                            ps.start = (ps.start as isize + delta) as usize;
-                                            ps.end = (ps.end as isize + delta) as usize;
-                                        }
-                                    }
-                                }
-                            }
+                // Apply global var edits from the parameters panel
+                if !global_var_edits.is_empty() {
+                    // Sort by span offset descending
+                    global_var_edits.sort_by(|a, b| b.1.start.cmp(&a.1.start));
+                    for (new_val, span) in &global_var_edits {
+                        let new_val_str = format!("{}", new_val);
+                        let src = &mut **editor_text;
+                        if span.end <= src.len() {
+                            src.replace_range(span.start..span.end, &new_val_str);
                         }
                     }
-                    if !regenerate_previews.iter().any(|(id, _)| id == preview_id) {
-                        regenerate_previews.push((*preview_id, query.clone()));
+                    // Re-parse to update editable vars with new spans
+                    if let Ok(clauses) = cadhr_lang::parse::database(&editor_text) {
+                        let new_vars = cadhr_lang::parse::collect_editable_vars(&clauses);
+                        editable_vars.values = new_vars.iter().map(|v| v.value.to_f64()).collect();
+                        editable_vars.vars = new_vars;
                     }
-                }
-                for (preview_id, query) in regenerate_previews {
-                    ev_generate.write(GeneratePreviewRequest {
-                        preview_id,
-                        database: (**editor_text).clone(),
-                        query,
-                    });
+                    // Regenerate all previews
+                    for (_, target) in preview_targets.iter() {
+                        ev_generate.write(GeneratePreviewRequest {
+                            preview_id: target.preview_id,
+                            database: (**editor_text).clone(),
+                            query: target.query.clone(),
+                        });
+                    }
                 }
             });
         });
@@ -486,7 +505,6 @@ pub(super) fn on_preview_generated(
                     rotate_y: pending_state.rotate_y,
                     query: ev.query.clone(),
                     evaluated_nodes: ev.evaluated_nodes.clone(),
-                    clicked_params: Vec::new(),
                 }
             });
     }
@@ -494,18 +512,12 @@ pub(super) fn on_preview_generated(
 
 // Pending previews and polling system are no longer needed with bevy-async-ecs
 
-struct ParamEdit {
-    new_value: f64,
-    span: SrcSpan,
-}
-
 /// UI action returned from preview_target_ui
 enum PreviewAction {
     None,
     Update,
     Export3MF,
     Close,
-    ParamEdited(ParamEdit),
 }
 
 // ============================================================
@@ -514,6 +526,7 @@ enum PreviewAction {
 
 /// Ray-triangle intersection using Moller-Trumbore algorithm.
 /// Returns distance t if hit (t > 0).
+#[allow(unused)]
 fn ray_triangle_intersect(
     ray_origin: &[f64; 3],
     ray_dir: &[f64; 3],
@@ -547,6 +560,7 @@ fn ray_triangle_intersect(
     if t > 1e-10 { Some(t) } else { None }
 }
 
+#[allow(unused)]
 fn cross(a: &[f64; 3], b: &[f64; 3]) -> [f64; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
@@ -555,11 +569,13 @@ fn cross(a: &[f64; 3], b: &[f64; 3]) -> [f64; 3] {
     ]
 }
 
+#[allow(unused)]
 fn dot(a: &[f64; 3], b: &[f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 /// Test ray against AABB, returns true if ray intersects the box.
+#[allow(unused)]
 fn ray_aabb_intersect(
     ray_origin: &[f64; 3],
     ray_dir: &[f64; 3],
@@ -591,6 +607,7 @@ fn ray_aabb_intersect(
 }
 
 /// Raycast against an EvaluatedNode tree. Returns (distance, node_ref) of closest hit.
+#[allow(unused)]
 fn raycast_evaluated_nodes<'a>(
     ray_origin: &[f64; 3],
     ray_dir: &[f64; 3],
@@ -607,6 +624,7 @@ fn raycast_evaluated_nodes<'a>(
     best
 }
 
+#[allow(unused)]
 fn raycast_node<'a>(
     ray_origin: &[f64; 3],
     ray_dir: &[f64; 3],
@@ -661,11 +679,8 @@ fn raycast_node<'a>(
 }
 
 /// Generate a ray from UV coordinates (0..1) in the preview image, given camera params.
-fn generate_ray_from_uv(
-    u: f32,
-    v: f32,
-    target: &PreviewTarget,
-) -> ([f64; 3], [f64; 3]) {
+#[allow(unused)]
+fn generate_ray_from_uv(u: f32, v: f32, target: &PreviewTarget) -> ([f64; 3], [f64; 3]) {
     let rx = target.rotate_x.clamp(MIN_CAMERA_PITCH, MAX_CAMERA_PITCH) as f32;
     let ry = target.rotate_y.clamp(MIN_CAMERA_YAW, MAX_CAMERA_YAW) as f32;
     let zoom = target.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
@@ -758,54 +773,7 @@ fn preview_target_ui(
             let aspect = size.y as f32 / size.x as f32;
             let w = avail_w;
             let h = w * aspect;
-            let image_response = ui.add(
-                egui::Image::from_texture((tex_id, egui::vec2(w, h)))
-                    .sense(egui::Sense::click()),
-            );
-            if image_response.clicked() {
-                if let Some(pos) = image_response.interact_pointer_pos() {
-                    let rect = image_response.rect;
-                    let u = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                    let v = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-                    let (origin, dir) = generate_ray_from_uv(u, v, target);
-                    if let Some((_t, hit_node)) =
-                        raycast_evaluated_nodes(&origin, &dir, &target.evaluated_nodes)
-                    {
-                        let tracked = collect_tracked_spans_from_expr(&hit_node.expr);
-                        bevy::log::info!("Clicked node: {:?}", hit_node.expr);
-                        for (name, tf) in &tracked {
-                            bevy::log::info!("  param {}: value={}, span={:?}", name, tf.value, tf.source_span);
-                        }
-                        let params: Vec<(String, f64, Option<SrcSpan>)> =
-                            tracked
-                                .into_iter()
-                                .map(|(name, tf)| (name, tf.value, tf.source_span))
-                                .collect();
-                        target.clicked_params = params;
-                    } else {
-                        target.clicked_params.clear();
-                    }
-                }
-            }
-
-            // Show clicked node parameters for editing
-            if !target.clicked_params.is_empty() {
-                ui.add_space(4.0);
-                ui.label("Clicked node parameters:");
-                for (name, value, span) in target.clicked_params.iter_mut() {
-                    let Some(sp) = span else { continue };
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{name}:"));
-                        let drag = ui.add(egui::DragValue::new(value).speed(0.5));
-                        if drag.changed() {
-                            action = PreviewAction::ParamEdited(ParamEdit {
-                                new_value: *value,
-                                span: *sp,
-                            });
-                        }
-                    });
-                }
-            }
+            ui.add(egui::Image::from_texture((tex_id, egui::vec2(w, h))));
         });
     action
 }

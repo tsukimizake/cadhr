@@ -3,7 +3,7 @@ use std::fmt;
 
 use crate::constraint::{ArithEq, ArithExpr, solve_constraints};
 use crate::manifold_bridge::{BuiltinFunctor, is_builtin_functor};
-use crate::parse::{ArithOp, Bound, Clause, FixedPoint, Term, list, number, range_var, struc, var};
+use crate::parse::{ArithOp, Bound, Clause, FixedPoint, Term, annotated_var, list, number, struc, var};
 use strum::IntoEnumIterator;
 
 /// Check if a term is a built-in primitive that should not be rewritten
@@ -94,23 +94,19 @@ fn substitute_in_place(term: &mut Term, var_name: &str, replacement: &Term) {
         Term::Var { name } if name == var_name => {
             *term = replacement.clone();
         }
-        Term::DefaultVar { name, .. } if name == var_name => {
-            // DefaultVarを置換する場合、replacementがNumberならspanを保持したままDefaultVarの値だけ更新
-            // (apply_default_var_bindingsが自分自身の値で置換するケース)
+        Term::AnnotatedVar { name, .. } if name == var_name => {
+            // AnnotatedVarを置換する場合、replacementがNumberならspanを保持したままdefault_valueだけ更新
             // replacementが他の構造なら通常通り置換
             match replacement {
                 Term::Number { value: new_val } => {
-                    if let Term::DefaultVar { value, .. } = term {
-                        *value = *new_val;
+                    if let Term::AnnotatedVar { default_value, .. } = term {
+                        *default_value = Some(*new_val);
                     }
                 }
                 _ => {
                     *term = replacement.clone();
                 }
             }
-        }
-        Term::RangeVar { name, .. } if name == var_name => {
-            *term = replacement.clone();
         }
         Term::Struct { args, .. } => {
             for arg in args.iter_mut() {
@@ -154,7 +150,11 @@ fn substitute_in_goals(goals: &mut Vec<Term>, var_name: &str, replacement: &Term
 
 fn collect_default_var_bindings(term: &Term, bindings: &mut Vec<(String, FixedPoint)>) {
     match term {
-        Term::DefaultVar { name, value, .. } if name != "_" => {
+        Term::AnnotatedVar {
+            name,
+            default_value: Some(value),
+            ..
+        } if name != "_" => {
             bindings.push((name.clone(), *value));
         }
         Term::Struct { args, .. } => {
@@ -198,7 +198,7 @@ fn apply_default_var_bindings(term: &mut Term, goals: &mut Vec<Term>) {
 }
 
 /// 算術式を評価する。評価できない場合（未束縛変数を含む場合）はNoneを返す
-/// 注: DefaultVar は eval_arith では処理しない。unify の明示的な DefaultVar ハンドラが
+/// 注: AnnotatedVar は eval_arith では処理しない。unify の明示的な AnnotatedVar ハンドラが
 /// 名前ベースの置換を伴って処理するため、ここで Number に変換すると置換が抜け落ちる。
 fn eval_arith(term: &Term) -> Option<FixedPoint> {
     match term {
@@ -254,8 +254,7 @@ fn eval_arith_in_place(term: &mut Term) {
 fn occurs_check(var_name: &str, term: &Term) -> bool {
     match term {
         Term::Var { name } => name == var_name,
-        Term::DefaultVar { name, .. } => name == var_name,
-        Term::RangeVar { name, .. } => name == var_name,
+        Term::AnnotatedVar { name, .. } => name == var_name,
         Term::Struct { args, .. } => args.iter().any(|arg| occurs_check(var_name, arg)),
         Term::List { items, tail } => {
             items.iter().any(|item| occurs_check(var_name, item))
@@ -357,7 +356,7 @@ fn substitute_in_deferred(deferred: &mut Vec<(Term, Term)>, var_name: &str, repl
 fn is_potentially_arithmetic(term: &Term) -> bool {
     match term {
         Term::Number { .. } => true,
-        Term::Var { .. } | Term::DefaultVar { .. } | Term::RangeVar { .. } => true,
+        Term::Var { .. } | Term::AnnotatedVar { .. } => true,
         Term::InfixExpr { left, right, .. } => {
             is_potentially_arithmetic(left) && is_potentially_arithmetic(right)
         }
@@ -373,7 +372,13 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
 
     while let Some((mut t1, mut t2)) = stack.pop() {
         // X@25 のような既定値付き変数は、単一化時に X=25 を伝播する。
-        if let Term::DefaultVar { name, value, .. } = &t1 {
+        // AnnotatedVarでdefault_valueありの場合のみ（rangeのみの場合はRangeVar的に扱う）
+        if let Term::AnnotatedVar {
+            name,
+            default_value: Some(value),
+            ..
+        } = &t1
+        {
             let name = name.clone();
             let replacement = number(*value);
             if name != "_" {
@@ -383,7 +388,12 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
             }
             t1 = replacement;
         }
-        if let Term::DefaultVar { name, value, .. } = &t2 {
+        if let Term::AnnotatedVar {
+            name,
+            default_value: Some(value),
+            ..
+        } = &t2
+        {
             let name = name.clone();
             let replacement = number(*value);
             if name != "_" {
@@ -412,17 +422,19 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
         match (&t1, &t2) {
             // 同じ変数
             (Term::Var { name: n1 }, Term::Var { name: n2 }) if n1 == n2 => {}
-            // RangeVar同士: 範囲の交差を計算
+            // AnnotatedVar(rangeのみ)同士: 範囲の交差を計算
             (
-                Term::RangeVar {
+                Term::AnnotatedVar {
                     name: n1,
                     min: min1,
                     max: max1,
+                    ..
                 },
-                Term::RangeVar {
+                Term::AnnotatedVar {
                     name: n2,
                     min: min2,
                     max: max2,
+                    ..
                 },
             ) => {
                 let new_min = intersect_min(*min1, *min2);
@@ -436,7 +448,7 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                     });
                 }
 
-                let intersected = range_var(n1.clone(), new_min, new_max);
+                let intersected = annotated_var(n1.clone(), None, new_min, new_max, None);
                 if n1 != "_" {
                     substitute_in_stack(&mut stack, n1, &intersected);
                     substitute_in_goals(goals, n1, &intersected);
@@ -448,8 +460,8 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                     substitute_in_deferred(&mut deferred, n2, &intersected);
                 }
             }
-            // RangeVarとNumber: 範囲内かチェック
-            (Term::RangeVar { name, min, max }, Term::Number { value }) => {
+            // AnnotatedVar(rangeあり)とNumber: 範囲内かチェック
+            (Term::AnnotatedVar { name, min, max, .. }, Term::Number { value }) => {
                 if !value_in_range(*value, *min, *max) {
                     return Err(UnifyError {
                         message: format!("value {} is out of range {:?}", value, t1),
@@ -464,11 +476,11 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                 }
             }
             // swap して再処理
-            (Term::Number { .. }, Term::RangeVar { .. }) => {
+            (Term::Number { .. }, Term::AnnotatedVar { .. }) => {
                 stack.push((t2, t1));
             }
-            // RangeVarと他 (Varと同様に扱う)
-            (Term::RangeVar { name, .. }, _) if name != "_" => {
+            // AnnotatedVarと他 (Varと同様に扱う)
+            (Term::AnnotatedVar { name, .. }, _) if name != "_" => {
                 if occurs_check(name, &t2) {
                     return Err(UnifyError {
                         message: format!("occurs check failed: {} occurs in {:?}", name, t2),
@@ -480,7 +492,7 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                 substitute_in_goals(goals, name, &t2);
                 substitute_in_deferred(&mut deferred, name, &t2);
             }
-            (_, Term::RangeVar { name, .. }) if name != "_" => {
+            (_, Term::AnnotatedVar { name, .. }) if name != "_" => {
                 stack.push((t2, t1));
             }
             // 変数と何か（anonymous変数 "_" は束縛しない）
@@ -500,8 +512,8 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                 stack.push((t2, t1));
             }
             // anonymous変数はどんな項とも単一化成功（束縛なし）
-            (Term::Var { name }, _) | (Term::RangeVar { name, .. }, _) if name == "_" => {}
-            (_, Term::Var { name }) | (_, Term::RangeVar { name, .. }) if name == "_" => {}
+            (Term::Var { name }, _) | (Term::AnnotatedVar { name, .. }, _) if name == "_" => {}
+            (_, Term::Var { name }) | (_, Term::AnnotatedVar { name, .. }) if name == "_" => {}
             // 数値
             (Term::Number { value: v1 }, Term::Number { value: v2 }) => {
                 if v1 != v2 {
@@ -733,12 +745,7 @@ fn rename_term_vars(term: &mut Term, suffix: &str) {
                 *name = format!("{}_{}", name, suffix);
             }
         }
-        Term::DefaultVar { name, .. } => {
-            if name != "_" {
-                *name = format!("{}_{}", name, suffix);
-            }
-        }
-        Term::RangeVar { name, .. } => {
+        Term::AnnotatedVar { name, .. } => {
             if name != "_" {
                 *name = format!("{}_{}", name, suffix);
             }
@@ -946,8 +953,7 @@ fn resolve_builtin_fact_args(
             // リテラル/未束縛変数はそのまま。節参照っぽい項のみ再解決する。
             Term::Number { .. }
             | Term::Var { .. }
-            | Term::DefaultVar { .. }
-            | Term::RangeVar { .. } => {
+            | Term::AnnotatedVar { .. } => {
                 resolved_args.push(arg);
             }
             arg_term => {
@@ -1158,7 +1164,7 @@ mod tests {
         let mut goals = vec![var("X".to_string())];
         unify(rv1, rv2, &mut goals).unwrap();
         match &goals[0] {
-            Term::RangeVar { min, max, .. } => {
+            Term::AnnotatedVar { min, max, .. } => {
                 assert_eq!(
                     *min,
                     Some(Bound {
@@ -1174,7 +1180,7 @@ mod tests {
                     })
                 );
             }
-            _ => panic!("Expected RangeVar"),
+            _ => panic!("Expected AnnotatedVar"),
         }
     }
 

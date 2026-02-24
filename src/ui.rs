@@ -47,8 +47,6 @@ pub struct PreviewTarget {
     pub rotate_y: f64,
     pub query: String,
     pub evaluated_nodes: Vec<EvaluatedNode>,
-    /// Parameters of the currently clicked node (name, current_value, source_span)
-    pub clicked_params: Vec<(String, f64, Option<cadhr_lang::parse::SrcSpan>)>,
 }
 
 impl Plugin for UiPlugin {
@@ -84,12 +82,19 @@ impl Plugin for UiPlugin {
             .insert_resource(FreeRenderLayers::default())
             .insert_resource(ErrorMessage::default())
             .insert_resource(CurrentFilePath::default())
-            .insert_resource(PendingPreviewStates::default());
+            .insert_resource(PendingPreviewStates::default())
+            .insert_resource(EditableVars::default());
     }
 }
 
 #[derive(Resource, Default, Clone, Deref, DerefMut)]
 struct EditorText(pub String);
+
+#[derive(Resource, Default, Clone)]
+pub struct EditableVars {
+    pub vars: Vec<cadhr_lang::parse::VarInfo>,
+    pub values: Vec<f64>,
+}
 
 #[derive(Resource, Default, Deref, DerefMut)]
 pub struct NextPreviewId(u64);
