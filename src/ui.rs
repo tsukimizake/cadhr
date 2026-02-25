@@ -90,11 +90,8 @@ impl Plugin for UiPlugin {
 #[derive(Resource, Default, Clone, Deref, DerefMut)]
 struct EditorText(pub String);
 
-#[derive(Resource, Default, Clone)]
-pub struct EditableVars {
-    pub vars: Vec<cadhr_lang::parse::VarInfo>,
-    pub values: Vec<f64>,
-}
+#[derive(Resource, Default, Clone, Deref, DerefMut)]
+pub struct EditableVars(pub Vec<cadhr_lang::parse::VarInfo>);
 
 #[derive(Resource, Default, Deref, DerefMut)]
 pub struct NextPreviewId(u64);

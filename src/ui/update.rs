@@ -28,6 +28,12 @@ const AUTO_ZOOM_SENTINEL: f32 = 0.0;
 const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 100.0;
 const CAMERA_DISTANCE_FACTOR: f32 = 2.4 * 1.5;
+
+fn refresh_editable_vars(editor_text: &str, editable_vars: &mut EditableVars) {
+    if let Ok(clauses) = cadhr_lang::parse::database(editor_text) {
+        **editable_vars = cadhr_lang::parse::collect_editable_vars(&clauses);
+    }
+}
 const MIN_CAMERA_DISTANCE: f32 = 5.0;
 
 // egui UI: add previews dynamically and render all existing previews
@@ -45,6 +51,11 @@ pub(super) fn egui_ui(
     current_file_path: Res<CurrentFilePath>,
     meshes: Res<Assets<Mesh>>,
 ) {
+    // Parse editable vars if not yet populated (e.g. initial load, session load)
+    if editable_vars.is_empty() && !editor_text.is_empty() {
+        refresh_editable_vars(&editor_text, &mut editable_vars);
+    }
+
     // Collect preview targets into a Vec for indexed access
     let mut preview_targets: Vec<(Entity, Mut<PreviewTarget>)> = preview_query.iter_mut().collect();
     // Toolbar: add a new preview or reload existing
@@ -122,6 +133,7 @@ pub(super) fn egui_ui(
                             **editor_text = content;
                         }
                     }
+                    refresh_editable_vars(&editor_text, &mut editable_vars);
                     for (_, target) in preview_targets.iter() {
                         ev_generate.write(GeneratePreviewRequest {
                             preview_id: target.preview_id,
@@ -167,32 +179,30 @@ pub(super) fn egui_ui(
 
                 // Editable vars sliders at the top of left panel
                 let mut global_var_edits: Vec<(f64, SrcSpan)> = Vec::new();
-                if !editable_vars.vars.is_empty() {
-                    // Separate borrows: take a snapshot of var metadata, mutably access values
-                    let var_infos: Vec<_> = editable_vars.vars.clone();
+                if !editable_vars.is_empty() {
                     egui::Frame::default()
                         .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(80)))
                         .corner_radius(egui::CornerRadius::same(4))
                         .inner_margin(egui::Margin::symmetric(6, 4))
                         .show(left, |ui| {
                             ui.label("Parameters");
-                            for (i, var_info) in var_infos.iter().enumerate() {
+                            for var_info in editable_vars.iter_mut() {
                                 ui.horizontal(|ui| {
                                     ui.label(format!("{}:", var_info.name));
                                     let min_f =
                                         var_info.min.map(|b| b.value.to_f64()).unwrap_or(-10000.0);
                                     let max_f =
                                         var_info.max.map(|b| b.value.to_f64()).unwrap_or(10000.0);
+                                    let mut val = var_info.value.to_f64();
                                     let changed = ui
                                         .add(
-                                            egui::DragValue::new(&mut editable_vars.values[i])
+                                            egui::DragValue::new(&mut val)
                                                 .speed(0.5)
                                                 .range(min_f..=max_f),
                                         )
                                         .changed();
                                     if changed {
-                                        global_var_edits
-                                            .push((editable_vars.values[i], var_info.span));
+                                        global_var_edits.push((val, var_info.span));
                                     }
                                 });
                             }
@@ -210,11 +220,7 @@ pub(super) fn egui_ui(
 
                 // Refresh editable vars when text changes
                 if text_response.changed() {
-                    if let Ok(clauses) = cadhr_lang::parse::database(&editor_text) {
-                        let new_vars = cadhr_lang::parse::collect_editable_vars(&clauses);
-                        editable_vars.values = new_vars.iter().map(|v| v.value.to_f64()).collect();
-                        editable_vars.vars = new_vars;
-                    }
+                    refresh_editable_vars(&editor_text, &mut editable_vars);
                 }
 
                 // Right half: show and edit previews
@@ -293,11 +299,7 @@ pub(super) fn egui_ui(
                         }
                     }
                     // Re-parse to update editable vars with new spans
-                    if let Ok(clauses) = cadhr_lang::parse::database(&editor_text) {
-                        let new_vars = cadhr_lang::parse::collect_editable_vars(&clauses);
-                        editable_vars.values = new_vars.iter().map(|v| v.value.to_f64()).collect();
-                        editable_vars.vars = new_vars;
-                    }
+                    refresh_editable_vars(&editor_text, &mut editable_vars);
                     // Regenerate all previews
                     for (_, target) in preview_targets.iter() {
                         ev_generate.write(GeneratePreviewRequest {
@@ -919,11 +921,14 @@ pub(super) fn session_loaded(
     mut next_preview_id: ResMut<NextPreviewId>,
     mut pending_states: ResMut<PendingPreviewStates>,
     mut free_render_layers: ResMut<FreeRenderLayers>,
+    mut editable_vars: ResMut<EditableVars>,
 ) {
     for ev in ev_picked.read() {
         if let Some((db_content, previews)) = load_session(&ev.path) {
             **editor_text = db_content;
             **current_file_path = Some(ev.path.clone());
+
+            refresh_editable_vars(&editor_text, &mut editable_vars);
 
             // Despawn all preview root entities (children are automatically removed)
             for (entity, target) in preview_query.iter() {
