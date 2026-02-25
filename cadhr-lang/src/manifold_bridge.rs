@@ -56,6 +56,8 @@ pub enum BuiltinFunctor {
     Scale,
     Rotate,
     // 2Dプロファイル
+    #[strum(serialize = "p")]
+    Point,
     Polygon,
     Circle,
     // 押し出し・回転体
@@ -563,6 +565,11 @@ impl ManifoldExpr {
             BuiltinFunctor::Rotate => Err(a.arity_error("4")),
 
             // 2Dプロファイル
+            BuiltinFunctor::Point => {
+                return Err(ConversionError::UnknownPrimitive(
+                    "p is a data constructor, not a shape primitive".to_string(),
+                ));
+            }
             BuiltinFunctor::Polygon if a.len() == 1 => {
                 let points = extract_polygon_points(&a.args[0], a.functor)?;
                 Ok(ManifoldExpr::Polygon { points })

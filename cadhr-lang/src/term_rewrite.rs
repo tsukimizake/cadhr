@@ -37,6 +37,7 @@ fn builtin_functor_arities(functor: BuiltinFunctor) -> &'static [usize] {
         BuiltinFunctor::Translate => &[4],
         BuiltinFunctor::Scale => &[4],
         BuiltinFunctor::Rotate => &[4],
+        BuiltinFunctor::Point => &[2],
         BuiltinFunctor::Polygon => &[1],
         BuiltinFunctor::Circle => &[1, 2],
         BuiltinFunctor::Extrude => &[2],
@@ -936,6 +937,52 @@ fn rewrite_term_recursive(
     }
 }
 
+/// ビルトインファンクタの引数内にある項を1つに解決する。
+/// リテラル/変数はそのまま、リストは中身を再帰的に解決、それ以外は書き換えて1つに解決する。
+fn resolve_builtin_arg(
+    db: &[Clause],
+    clause_counter: &mut usize,
+    term: Term,
+    other_goals: &mut Vec<Term>,
+) -> Result<Term, RewriteError> {
+    match term {
+        Term::Number { .. } | Term::Var { .. } | Term::AnnotatedVar { .. } => Ok(term),
+        Term::List { items, tail } => {
+            let resolved_items = items
+                .into_iter()
+                .map(|item| resolve_builtin_arg(db, clause_counter, item, other_goals))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Term::List {
+                items: resolved_items,
+                tail,
+            })
+        }
+        Term::Struct { functor, args } if is_builtin_functor(&functor) => {
+            let resolved_args = args
+                .into_iter()
+                .map(|arg| resolve_builtin_arg(db, clause_counter, arg, other_goals))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Term::Struct {
+                functor,
+                args: resolved_args,
+            })
+        }
+        other => {
+            let mut resolved =
+                rewrite_term_recursive(db, clause_counter, other, other_goals)?;
+            if resolved.len() != 1 {
+                return Err(RewriteError {
+                    message: "builtin argument resolved to multiple terms".to_string(),
+                    goal: resolved.into_iter().next().unwrap_or(Term::Number {
+                        value: FixedPoint::from_int(0),
+                    }),
+                });
+            }
+            Ok(resolved.remove(0))
+        }
+    }
+}
+
 fn resolve_builtin_fact_args(
     db: &[Clause],
     clause_counter: &mut usize,
@@ -947,31 +994,10 @@ fn resolve_builtin_fact_args(
         other => return Ok(other),
     };
 
-    let mut resolved_args = Vec::with_capacity(args.len());
-    for arg in args {
-        match arg {
-            // リテラル/未束縛変数はそのまま。節参照っぽい項のみ再解決する。
-            Term::Number { .. }
-            | Term::Var { .. }
-            | Term::AnnotatedVar { .. } => {
-                resolved_args.push(arg);
-            }
-            arg_term => {
-                let mut resolved =
-                    rewrite_term_recursive(db, clause_counter, arg_term, other_goals)?;
-                if resolved.len() != 1 {
-                    return Err(RewriteError {
-                        message: "builtin argument resolved to multiple terms".to_string(),
-                        goal: Term::Struct {
-                            functor,
-                            args: resolved_args,
-                        },
-                    });
-                }
-                resolved_args.push(resolved.remove(0));
-            }
-        }
-    }
+    let resolved_args = args
+        .into_iter()
+        .map(|arg| resolve_builtin_arg(db, clause_counter, arg, other_goals))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Term::Struct {
         functor,
