@@ -36,6 +36,23 @@ fn refresh_editable_vars(editor_text: &str, editable_vars: &mut EditableVars) {
 }
 const MIN_CAMERA_DISTANCE: f32 = 5.0;
 
+fn camera_distance_and_zoom_from_mesh(mesh: &Mesh) -> (f32, f32) {
+    if let Some(aabb) = mesh.compute_aabb() {
+        let half_extents = aabb.half_extents;
+        let max_extent = half_extents.x.max(half_extents.y).max(half_extents.z);
+        let natural_distance = max_extent * CAMERA_DISTANCE_FACTOR;
+        let camera_distance = natural_distance.max(MIN_CAMERA_DISTANCE);
+        let auto_zoom = if natural_distance > f32::EPSILON {
+            (DEFAULT_ZOOM * camera_distance / natural_distance).clamp(MIN_ZOOM, MAX_ZOOM)
+        } else {
+            DEFAULT_ZOOM
+        };
+        (camera_distance, auto_zoom)
+    } else {
+        (MIN_CAMERA_DISTANCE, DEFAULT_ZOOM)
+    }
+}
+
 // egui UI: add previews dynamically and render all existing previews
 pub(super) fn egui_ui(
     mut commands: Commands,
@@ -334,6 +351,10 @@ pub(super) fn on_preview_generated(
                     *mesh_asset = ev.mesh.clone();
                 }
                 target.evaluated_nodes = ev.evaluated_nodes.clone();
+                let (camera_distance, auto_zoom) =
+                    camera_distance_and_zoom_from_mesh(&ev.mesh);
+                target.base_camera_distance = camera_distance;
+                target.zoom = auto_zoom;
                 updated_existing = true;
                 break;
             }
@@ -385,21 +406,7 @@ pub(super) fn on_preview_generated(
         };
         let layer_only = RenderLayers::layer(render_layer);
 
-        let mesh_aabb = ev.mesh.compute_aabb();
-        let (camera_distance, auto_zoom) = if let Some(aabb) = mesh_aabb {
-            let half_extents = aabb.half_extents;
-            let max_extent = half_extents.x.max(half_extents.y).max(half_extents.z);
-            let natural_distance = max_extent * CAMERA_DISTANCE_FACTOR;
-            let camera_distance = natural_distance.max(MIN_CAMERA_DISTANCE);
-            let auto_zoom = if natural_distance > f32::EPSILON {
-                (DEFAULT_ZOOM * camera_distance / natural_distance).clamp(MIN_ZOOM, MAX_ZOOM)
-            } else {
-                DEFAULT_ZOOM
-            };
-            (camera_distance, auto_zoom)
-        } else {
-            (MIN_CAMERA_DISTANCE, DEFAULT_ZOOM)
-        };
+        let (camera_distance, auto_zoom) = camera_distance_and_zoom_from_mesh(&ev.mesh);
         let initial_zoom = if pending_state.zoom > AUTO_ZOOM_SENTINEL {
             pending_state.zoom
         } else {
