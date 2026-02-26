@@ -54,8 +54,8 @@ impl Plugin for UiPlugin {
         use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
         use setup::*;
         use update::{
-            egui_ui, handle_cadhr_lang_output, on_preview_generated, session_loaded, session_saved,
-            threemf_saved, update_preview_transforms,
+            egui_ui, handle_cadhr_lang_output, on_preview_generated, restore_last_session,
+            session_loaded, session_saved, threemf_saved, update_preview_transforms,
         };
 
         app.add_plugins(EguiPlugin::default())
@@ -65,7 +65,7 @@ impl Plugin for UiPlugin {
                     .with_pick_directory::<SessionLoadContents>()
                     .with_save_file::<ThreeMfFileContents>(),
             )
-            .add_systems(Startup, setup)
+            .add_systems(Startup, (setup, restore_last_session))
             .add_systems(EguiPrimaryContextPass, setup_fonts.run_if(run_once))
             .add_systems(EguiPrimaryContextPass, egui_ui)
             .add_systems(

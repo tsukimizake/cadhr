@@ -172,6 +172,20 @@ pub enum Term {
     },
 }
 
+/// Number または AnnotatedVar(default_value付き) から FixedPoint と SrcSpan を取り出す。
+/// manifold_bridge 等で数値を期待する箇所はこの関数を使うことで、AnnotatedVar の処理漏れを防ぐ。
+pub fn term_as_fixed_point(term: &Term) -> Option<(FixedPoint, Option<SrcSpan>)> {
+    match term {
+        Term::Number { value } => Some((*value, None)),
+        Term::AnnotatedVar {
+            default_value: Some(value),
+            span,
+            ..
+        } => Some((*value, *span)),
+        _ => None,
+    }
+}
+
 impl PartialEq for Term {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {

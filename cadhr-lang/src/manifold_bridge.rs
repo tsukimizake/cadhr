@@ -3,7 +3,7 @@
 //! Term（書き換え後の項）を ManifoldExpr 中間表現に変換し、
 //! それを manifold-rs の Manifold オブジェクトに評価する。
 
-use crate::parse::{ArithOp, SrcSpan, Term};
+use crate::parse::{term_as_fixed_point, ArithOp, SrcSpan, Term};
 use manifold_rs::{Manifold, Mesh};
 use std::fmt;
 use std::str::FromStr;
@@ -146,16 +146,13 @@ impl<'a> Args<'a> {
     }
 
     fn tracked_f64(&self, i: usize) -> Result<TrackedF64, ConversionError> {
+        if let Some((fp, span)) = term_as_fixed_point(&self.args[i]) {
+            return Ok(TrackedF64 {
+                value: fp.to_f64(),
+                source_span: span,
+            });
+        }
         match &self.args[i] {
-            Term::Number { value } => Ok(TrackedF64::plain(value.to_f64())),
-            Term::AnnotatedVar {
-                default_value: Some(value),
-                span,
-                ..
-            } => Ok(TrackedF64 {
-                value: value.to_f64(),
-                source_span: *span,
-            }),
             Term::Var { name } | Term::AnnotatedVar { name, .. } => {
                 Err(ConversionError::UnboundVariable(name.clone()))
             }
@@ -168,26 +165,17 @@ impl<'a> Args<'a> {
     }
 
     fn u32(&self, i: usize) -> Result<u32, ConversionError> {
+        if let Some((fp, _)) = term_as_fixed_point(&self.args[i]) {
+            return match fp.to_i64_checked() {
+                Some(v) if v >= 0 => Ok(v as u32),
+                _ => Err(ConversionError::TypeMismatch {
+                    functor: self.functor.to_string(),
+                    arg_index: i,
+                    expected: "non-negative integer",
+                }),
+            };
+        }
         match &self.args[i] {
-            Term::Number { value } => match value.to_i64_checked() {
-                Some(v) if v >= 0 => Ok(v as u32),
-                _ => Err(ConversionError::TypeMismatch {
-                    functor: self.functor.to_string(),
-                    arg_index: i,
-                    expected: "non-negative integer",
-                }),
-            },
-            Term::AnnotatedVar {
-                default_value: Some(value),
-                ..
-            } => match value.to_i64_checked() {
-                Some(v) if v >= 0 => Ok(v as u32),
-                _ => Err(ConversionError::TypeMismatch {
-                    functor: self.functor.to_string(),
-                    arg_index: i,
-                    expected: "non-negative integer",
-                }),
-            },
             Term::Var { name } | Term::AnnotatedVar { name, .. } => {
                 Err(ConversionError::UnboundVariable(name.clone()))
             }
@@ -291,28 +279,18 @@ fn extract_polygon_points(list_term: &Term, functor: &str) -> Result<Vec<f64>, C
             for (i, item) in items.iter().enumerate() {
                 match item {
                     Term::Struct { functor: f, args } if f == "p" && args.len() == 2 => {
-                        let x = match &args[0] {
-                            Term::Number { value } => value.to_f64(),
-                            _ => {
-                                return Err(ConversionError::TypeMismatch {
-                                    functor: functor.to_string(),
-                                    arg_index: i,
-                                    expected: "p(number, number)",
-                                });
+                        for arg in args.iter() {
+                            match term_as_fixed_point(arg) {
+                                Some((fp, _)) => points.push(fp.to_f64()),
+                                None => {
+                                    return Err(ConversionError::TypeMismatch {
+                                        functor: functor.to_string(),
+                                        arg_index: i,
+                                        expected: "p(number, number)",
+                                    });
+                                }
                             }
-                        };
-                        let y = match &args[1] {
-                            Term::Number { value } => value.to_f64(),
-                            _ => {
-                                return Err(ConversionError::TypeMismatch {
-                                    functor: functor.to_string(),
-                                    arg_index: i,
-                                    expected: "p(number, number)",
-                                });
-                            }
-                        };
-                        points.push(x);
-                        points.push(y);
+                        }
                     }
                     _ => {
                         return Err(ConversionError::TypeMismatch {
@@ -341,13 +319,9 @@ fn extract_polyhedron_points(list_term: &Term, functor: &str) -> Result<Vec<f64>
                 match item {
                     Term::Struct { functor: f, args } if f == "p" && args.len() == 3 => {
                         for arg in args.iter() {
-                            match arg {
-                                Term::Number { value } => points.push(value.to_f64()),
-                                Term::AnnotatedVar {
-                                    default_value: Some(value),
-                                    ..
-                                } => points.push(value.to_f64()),
-                                _ => {
+                            match term_as_fixed_point(arg) {
+                                Some((fp, _)) => points.push(fp.to_f64()),
+                                None => {
                                     return Err(ConversionError::TypeMismatch {
                                         functor: functor.to_string(),
                                         arg_index: i,
@@ -391,8 +365,8 @@ fn extract_polyhedron_faces(
                     } => {
                         let mut face = Vec::with_capacity(indices.len());
                         for idx_term in indices.iter() {
-                            match idx_term {
-                                Term::Number { value } => match value.to_i64_checked() {
+                            match term_as_fixed_point(idx_term) {
+                                Some((fp, _)) => match fp.to_i64_checked() {
                                     Some(v) if v >= 0 => face.push(v as u32),
                                     _ => {
                                         return Err(ConversionError::TypeMismatch {
@@ -402,7 +376,7 @@ fn extract_polyhedron_faces(
                                         });
                                     }
                                 },
-                                _ => {
+                                None => {
                                     return Err(ConversionError::TypeMismatch {
                                         functor: functor.to_string(),
                                         arg_index: i,
