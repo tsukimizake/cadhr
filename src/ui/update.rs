@@ -27,7 +27,7 @@ const DEFAULT_ZOOM: f32 = 10.0;
 const AUTO_ZOOM_SENTINEL: f32 = 0.0;
 const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 100.0;
-const CAMERA_DISTANCE_FACTOR: f32 = 2.4 * 1.5;
+const CAMERA_DISTANCE_FACTOR: f32 = 2.4 * 3.0;
 
 fn refresh_editable_vars(editor_text: &str, editable_vars: &mut EditableVars) {
     if let Ok(clauses) = cadhr_lang::parse::database(editor_text) {
