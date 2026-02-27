@@ -2,9 +2,8 @@ use std::cmp::Ordering;
 use std::fmt;
 
 use crate::constraint::{ArithEq, ArithExpr, solve_constraints};
-use crate::manifold_bridge::{BuiltinFunctor, is_builtin_functor};
+use crate::manifold_bridge::{BUILTIN_FUNCTORS, is_builtin_functor};
 use crate::parse::{ArithOp, Bound, Clause, FixedPoint, Term, annotated_var, list, number, struc, var};
-use strum::IntoEnumIterator;
 
 /// Check if a term is a built-in primitive that should not be rewritten
 fn is_builtin_primitive(term: &Term) -> bool {
@@ -25,36 +24,14 @@ fn builtin_fact(functor: &str, arity: usize) -> Clause {
     Clause::Fact(struc(functor.to_string(), args))
 }
 
-fn builtin_functor_arities(functor: BuiltinFunctor) -> &'static [usize] {
-    match functor {
-        BuiltinFunctor::Cube => &[3],
-        BuiltinFunctor::Sphere => &[1, 2],
-        BuiltinFunctor::Cylinder => &[2, 3],
-        BuiltinFunctor::Tetrahedron => &[0],
-        BuiltinFunctor::Union => &[2],
-        BuiltinFunctor::Difference => &[2],
-        BuiltinFunctor::Intersection => &[2],
-        BuiltinFunctor::Translate => &[4],
-        BuiltinFunctor::Scale => &[4],
-        BuiltinFunctor::Rotate => &[4],
-        BuiltinFunctor::Point => &[2],
-        BuiltinFunctor::Polygon => &[1],
-        BuiltinFunctor::Circle => &[1, 2],
-        BuiltinFunctor::Extrude => &[2],
-        BuiltinFunctor::Revolve => &[2, 3],
-        BuiltinFunctor::Polyhedron => &[2],
-        BuiltinFunctor::Stl => &[1],
-    }
-}
-
 fn builtin_cad_facts() -> Vec<Clause> {
-    BuiltinFunctor::iter()
-        .flat_map(|functor| {
-            let functor_name: &'static str = functor.into();
-            builtin_functor_arities(functor)
+    BUILTIN_FUNCTORS
+        .iter()
+        .flat_map(|(name, arities)| {
+            arities
                 .iter()
                 .copied()
-                .map(move |arity| builtin_fact(functor_name, arity))
+                .map(move |arity| builtin_fact(name, arity))
         })
         .collect()
 }

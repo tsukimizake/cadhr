@@ -27,5 +27,4 @@ manifold = ["dep:manifold-rs", "dep:stl_io"]
 nom = "8.0.0"
 manifold-rs = { version = "0.6.4", optional = true }
 stl_io = { version = "0.8", optional = true }
-strum = "0.27"
-strum_macros = "0.27"
+cadhr-lang-macros = { path = "../cadhr-lang-macros" }

@@ -3,11 +3,12 @@
 //! Term（書き換え後の項）を ManifoldExpr 中間表現に変換し、
 //! それを manifold-rs の Manifold オブジェクトに評価する。
 
-use crate::parse::{term_as_fixed_point, ArithOp, SrcSpan, Term};
+use crate::parse::{ArithOp, SrcSpan, Term, term_as_fixed_point};
 use cadhr_lang_macros::define_manifold_expr;
 use manifold_rs::{Manifold, Mesh};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 // ============================================================
 // TrackedF64: ソーススパン付きf64値
@@ -37,6 +38,12 @@ impl TrackedF64 {
 
 const DEFAULT_SEGMENTS: u32 = 32;
 
+// 以下を生成:
+// - pub enum ManifoldExpr { Cube{..}, Sphere{..}, ... }  (@no_variant付きは除外)
+// - pub enum ManifoldTag { Cube, Sphere, ..., Point, ... } (全エントリ)
+// - impl FromStr for ManifoldTag  (functor文字列 → タグ。@nameがあればその名前を使用)
+// - pub const BUILTIN_FUNCTORS: &[(&str, &[usize])]  (functor名 → 許容arity一覧)
+// - pub fn is_builtin_functor(functor: &str) -> bool
 define_manifold_expr! {
     Cube { x: TrackedF64, y: TrackedF64, z: TrackedF64 };
     @also_arity(1)
@@ -82,10 +89,7 @@ pub enum ConversionError {
     /// 未束縛変数
     UnboundVariable(String),
     /// I/Oエラー（ファイル読み込み失敗など）
-    IoError {
-        functor: String,
-        message: String,
-    },
+    IoError { functor: String, message: String },
 }
 
 impl fmt::Display for ConversionError {
@@ -393,143 +397,134 @@ impl ManifoldExpr {
 
     fn from_struct(functor: &str, args: &[Term]) -> Result<Self, ConversionError> {
         let a = Args::new(functor, args);
-
-        let builtin = BuiltinFunctor::from_str(functor)
+        let tag = ManifoldTag::from_str(functor)
             .map_err(|_| ConversionError::UnknownPrimitive(functor.to_string()))?;
 
-        match builtin {
-            // プリミティブ
-            BuiltinFunctor::Cube if a.len() == 3 => Ok(ManifoldExpr::Cube {
+        match tag {
+            ManifoldTag::Cube if a.len() == 3 => Ok(ManifoldExpr::Cube {
                 x: a.tracked_f64(0)?,
                 y: a.tracked_f64(1)?,
                 z: a.tracked_f64(2)?,
             }),
-            BuiltinFunctor::Cube => Err(a.arity_error("3")),
+            ManifoldTag::Cube => Err(a.arity_error("3")),
 
-            BuiltinFunctor::Sphere if a.len() == 1 => Ok(ManifoldExpr::Sphere {
+            ManifoldTag::Sphere if a.len() == 1 => Ok(ManifoldExpr::Sphere {
                 radius: a.tracked_f64(0)?,
                 segments: DEFAULT_SEGMENTS,
             }),
-            BuiltinFunctor::Sphere if a.len() == 2 => Ok(ManifoldExpr::Sphere {
+            ManifoldTag::Sphere if a.len() == 2 => Ok(ManifoldExpr::Sphere {
                 radius: a.tracked_f64(0)?,
                 segments: a.u32(1)?,
             }),
-            BuiltinFunctor::Sphere => Err(a.arity_error("1 or 2")),
+            ManifoldTag::Sphere => Err(a.arity_error("1 or 2")),
 
-            BuiltinFunctor::Cylinder if a.len() == 2 => Ok(ManifoldExpr::Cylinder {
+            ManifoldTag::Cylinder if a.len() == 2 => Ok(ManifoldExpr::Cylinder {
                 radius: a.tracked_f64(0)?,
                 height: a.tracked_f64(1)?,
                 segments: DEFAULT_SEGMENTS,
             }),
-            BuiltinFunctor::Cylinder if a.len() == 3 => Ok(ManifoldExpr::Cylinder {
+            ManifoldTag::Cylinder if a.len() == 3 => Ok(ManifoldExpr::Cylinder {
                 radius: a.tracked_f64(0)?,
                 height: a.tracked_f64(1)?,
                 segments: a.u32(2)?,
             }),
-            BuiltinFunctor::Cylinder => Err(a.arity_error("2 or 3")),
+            ManifoldTag::Cylinder => Err(a.arity_error("2 or 3")),
 
-            BuiltinFunctor::Tetrahedron if a.len() == 0 => Ok(ManifoldExpr::Tetrahedron),
-            BuiltinFunctor::Tetrahedron => Err(a.arity_error("0")),
+            ManifoldTag::Tetrahedron if a.len() == 0 => Ok(ManifoldExpr::Tetrahedron),
+            ManifoldTag::Tetrahedron => Err(a.arity_error("0")),
 
-            // CSG演算
-            BuiltinFunctor::Union if a.len() == 2 => Ok(ManifoldExpr::Union(
+            ManifoldTag::Union if a.len() == 2 => Ok(ManifoldExpr::Union(
                 Box::new(a.term(0)?),
                 Box::new(a.term(1)?),
             )),
-            BuiltinFunctor::Union => Err(a.arity_error("2")),
+            ManifoldTag::Union => Err(a.arity_error("2")),
 
-            BuiltinFunctor::Difference if a.len() == 2 => Ok(ManifoldExpr::Difference(
+            ManifoldTag::Difference if a.len() == 2 => Ok(ManifoldExpr::Difference(
                 Box::new(a.term(0)?),
                 Box::new(a.term(1)?),
             )),
-            BuiltinFunctor::Difference => Err(a.arity_error("2")),
+            ManifoldTag::Difference => Err(a.arity_error("2")),
 
-            BuiltinFunctor::Intersection if a.len() == 2 => Ok(ManifoldExpr::Intersection(
+            ManifoldTag::Intersection if a.len() == 2 => Ok(ManifoldExpr::Intersection(
                 Box::new(a.term(0)?),
                 Box::new(a.term(1)?),
             )),
-            BuiltinFunctor::Intersection => Err(a.arity_error("2")),
+            ManifoldTag::Intersection => Err(a.arity_error("2")),
 
-            // 変形
-            BuiltinFunctor::Translate if a.len() == 4 => Ok(ManifoldExpr::Translate {
+            ManifoldTag::Translate if a.len() == 4 => Ok(ManifoldExpr::Translate {
                 expr: Box::new(a.term(0)?),
                 x: a.tracked_f64(1)?,
                 y: a.tracked_f64(2)?,
                 z: a.tracked_f64(3)?,
             }),
-            BuiltinFunctor::Translate => Err(a.arity_error("4")),
+            ManifoldTag::Translate => Err(a.arity_error("4")),
 
-            BuiltinFunctor::Scale if a.len() == 4 => Ok(ManifoldExpr::Scale {
+            ManifoldTag::Scale if a.len() == 4 => Ok(ManifoldExpr::Scale {
                 expr: Box::new(a.term(0)?),
                 x: a.tracked_f64(1)?,
                 y: a.tracked_f64(2)?,
                 z: a.tracked_f64(3)?,
             }),
-            BuiltinFunctor::Scale => Err(a.arity_error("4")),
+            ManifoldTag::Scale => Err(a.arity_error("4")),
 
-            BuiltinFunctor::Rotate if a.len() == 4 => Ok(ManifoldExpr::Rotate {
+            ManifoldTag::Rotate if a.len() == 4 => Ok(ManifoldExpr::Rotate {
                 expr: Box::new(a.term(0)?),
                 x: a.tracked_f64(1)?,
                 y: a.tracked_f64(2)?,
                 z: a.tracked_f64(3)?,
             }),
-            BuiltinFunctor::Rotate => Err(a.arity_error("4")),
+            ManifoldTag::Rotate => Err(a.arity_error("4")),
 
-            // 2Dプロファイル
-            BuiltinFunctor::Point => {
-                return Err(ConversionError::UnknownPrimitive(
-                    "p is a data constructor, not a shape primitive".to_string(),
-                ));
-            }
-            BuiltinFunctor::Polygon if a.len() == 1 => {
+            ManifoldTag::Point => Err(ConversionError::UnknownPrimitive(
+                "p is a data constructor, not a shape primitive".to_string(),
+            )),
+
+            ManifoldTag::Polygon if a.len() == 1 => {
                 let points = extract_polygon_points(&a.args[0], a.functor)?;
                 Ok(ManifoldExpr::Polygon { points })
             }
-            BuiltinFunctor::Polygon => Err(a.arity_error("1")),
+            ManifoldTag::Polygon => Err(a.arity_error("1")),
 
-            BuiltinFunctor::Circle if a.len() == 1 => Ok(ManifoldExpr::Circle {
+            ManifoldTag::Circle if a.len() == 1 => Ok(ManifoldExpr::Circle {
                 radius: a.tracked_f64(0)?,
                 segments: DEFAULT_SEGMENTS,
             }),
-            BuiltinFunctor::Circle if a.len() == 2 => Ok(ManifoldExpr::Circle {
+            ManifoldTag::Circle if a.len() == 2 => Ok(ManifoldExpr::Circle {
                 radius: a.tracked_f64(0)?,
                 segments: a.u32(1)?,
             }),
-            BuiltinFunctor::Circle => Err(a.arity_error("1 or 2")),
+            ManifoldTag::Circle => Err(a.arity_error("1 or 2")),
 
-            // 押し出し・回転体
-            BuiltinFunctor::Extrude if a.len() == 2 => Ok(ManifoldExpr::Extrude {
+            ManifoldTag::Extrude if a.len() == 2 => Ok(ManifoldExpr::Extrude {
                 profile: Box::new(a.term(0)?),
                 height: a.tracked_f64(1)?,
             }),
-            BuiltinFunctor::Extrude => Err(a.arity_error("2")),
+            ManifoldTag::Extrude => Err(a.arity_error("2")),
 
-            BuiltinFunctor::Revolve if a.len() == 2 => Ok(ManifoldExpr::Revolve {
+            ManifoldTag::Revolve if a.len() == 2 => Ok(ManifoldExpr::Revolve {
                 profile: Box::new(a.term(0)?),
                 degrees: a.tracked_f64(1)?,
                 segments: DEFAULT_SEGMENTS,
             }),
-            BuiltinFunctor::Revolve if a.len() == 3 => Ok(ManifoldExpr::Revolve {
+            ManifoldTag::Revolve if a.len() == 3 => Ok(ManifoldExpr::Revolve {
                 profile: Box::new(a.term(0)?),
                 degrees: a.tracked_f64(1)?,
                 segments: a.u32(2)?,
             }),
-            BuiltinFunctor::Revolve => Err(a.arity_error("2 or 3")),
+            ManifoldTag::Revolve => Err(a.arity_error("2 or 3")),
 
-            // ポリヘドロン
-            BuiltinFunctor::Polyhedron if a.len() == 2 => {
+            ManifoldTag::Polyhedron if a.len() == 2 => {
                 let points = extract_polyhedron_points(&a.args[0], a.functor)?;
                 let faces = extract_polyhedron_faces(&a.args[1], a.functor)?;
                 Ok(ManifoldExpr::Polyhedron { points, faces })
             }
-            BuiltinFunctor::Polyhedron => Err(a.arity_error("2")),
+            ManifoldTag::Polyhedron => Err(a.arity_error("2")),
 
-            // STL
-            BuiltinFunctor::Stl if a.len() == 1 => {
+            ManifoldTag::Stl if a.len() == 1 => {
                 let path = a.string(0)?;
                 Ok(ManifoldExpr::Stl { path })
             }
-            BuiltinFunctor::Stl => Err(a.arity_error("1")),
+            ManifoldTag::Stl => Err(a.arity_error("1")),
         }
     }
 
@@ -538,50 +533,68 @@ impl ManifoldExpr {
         match self {
             // プリミティブ
             ManifoldExpr::Cube { x, y, z } => Ok(Manifold::cube(x.value, y.value, z.value)),
-            ManifoldExpr::Sphere { radius, segments } => Ok(Manifold::sphere(radius.value, *segments)),
+            ManifoldExpr::Sphere { radius, segments } => {
+                Ok(Manifold::sphere(radius.value, *segments))
+            }
             ManifoldExpr::Cylinder {
                 radius,
                 height,
                 segments,
-            } => Ok(Manifold::cylinder(radius.value, radius.value, height.value, *segments)),
+            } => Ok(Manifold::cylinder(
+                radius.value,
+                radius.value,
+                height.value,
+                *segments,
+            )),
             ManifoldExpr::Tetrahedron => Ok(Manifold::tetrahedron()),
 
             // CSG
-            ManifoldExpr::Union(a, b) => Ok(a.evaluate(include_paths)?.union(&b.evaluate(include_paths)?)),
-            ManifoldExpr::Difference(a, b) => Ok(a.evaluate(include_paths)?.difference(&b.evaluate(include_paths)?)),
-            ManifoldExpr::Intersection(a, b) => Ok(a.evaluate(include_paths)?.intersection(&b.evaluate(include_paths)?)),
+            ManifoldExpr::Union(a, b) => Ok(a
+                .evaluate(include_paths)?
+                .union(&b.evaluate(include_paths)?)),
+            ManifoldExpr::Difference(a, b) => Ok(a
+                .evaluate(include_paths)?
+                .difference(&b.evaluate(include_paths)?)),
+            ManifoldExpr::Intersection(a, b) => Ok(a
+                .evaluate(include_paths)?
+                .intersection(&b.evaluate(include_paths)?)),
 
             // 変形
-            ManifoldExpr::Translate { expr, x, y, z } => {
-                Ok(expr.evaluate(include_paths)?.translate(x.value, y.value, z.value))
-            }
-            ManifoldExpr::Scale { expr, x, y, z } => {
-                Ok(expr.evaluate(include_paths)?.scale(x.value, y.value, z.value))
-            }
-            ManifoldExpr::Rotate { expr, x, y, z } => {
-                Ok(expr.evaluate(include_paths)?.rotate(x.value, y.value, z.value))
-            }
+            ManifoldExpr::Translate { expr, x, y, z } => Ok(expr
+                .evaluate(include_paths)?
+                .translate(x.value, y.value, z.value)),
+            ManifoldExpr::Scale { expr, x, y, z } => Ok(expr
+                .evaluate(include_paths)?
+                .scale(x.value, y.value, z.value)),
+            ManifoldExpr::Rotate { expr, x, y, z } => Ok(expr
+                .evaluate(include_paths)?
+                .rotate(x.value, y.value, z.value)),
 
             // 2Dプロファイル (単体プレビュー時は薄いextrudeで3D化)
             ManifoldExpr::Polygon { points } => {
                 Ok(Manifold::extrude(&[points], 0.001, 0, 0.0, 1.0, 1.0))
             }
             ManifoldExpr::Circle { .. } => {
-                let data = self.to_polygon_data().ok_or_else(|| ConversionError::TypeMismatch {
-                    functor: "circle".to_string(),
-                    arg_index: 0,
-                    expected: "polygon data",
-                })?;
+                let data = self
+                    .to_polygon_data()
+                    .ok_or_else(|| ConversionError::TypeMismatch {
+                        functor: "circle".to_string(),
+                        arg_index: 0,
+                        expected: "polygon data",
+                    })?;
                 Ok(Manifold::extrude(&[&data], 0.001, 0, 0.0, 1.0, 1.0))
             }
 
             // 押し出し・回転体
             ManifoldExpr::Extrude { profile, height } => {
-                let data = profile.to_polygon_data().ok_or_else(|| ConversionError::TypeMismatch {
-                    functor: "extrude".to_string(),
-                    arg_index: 0,
-                    expected: "polygon data",
-                })?;
+                let data =
+                    profile
+                        .to_polygon_data()
+                        .ok_or_else(|| ConversionError::TypeMismatch {
+                            functor: "extrude".to_string(),
+                            arg_index: 0,
+                            expected: "polygon data",
+                        })?;
                 Ok(Manifold::extrude(&[&data], height.value, 0, 0.0, 1.0, 1.0))
             }
             ManifoldExpr::Revolve {
@@ -589,11 +602,14 @@ impl ManifoldExpr {
                 degrees,
                 segments,
             } => {
-                let data = profile.to_polygon_data().ok_or_else(|| ConversionError::TypeMismatch {
-                    functor: "revolve".to_string(),
-                    arg_index: 0,
-                    expected: "polygon data",
-                })?;
+                let data =
+                    profile
+                        .to_polygon_data()
+                        .ok_or_else(|| ConversionError::TypeMismatch {
+                            functor: "revolve".to_string(),
+                            arg_index: 0,
+                            expected: "polygon data",
+                        })?;
                 Ok(Manifold::revolve(&[&data], *segments, degrees.value))
             }
 
@@ -703,7 +719,10 @@ pub fn collect_tracked_spans_from_expr(expr: &ManifoldExpr) -> Vec<(String, Trac
     }
 }
 
-fn build_evaluated_node(expr: &ManifoldExpr, include_paths: &[PathBuf]) -> Result<EvaluatedNode, ConversionError> {
+fn build_evaluated_node(
+    expr: &ManifoldExpr,
+    include_paths: &[PathBuf],
+) -> Result<EvaluatedNode, ConversionError> {
     let manifold = expr.evaluate(include_paths)?;
     let mesh = manifold.calculate_normals(0, 30.0).to_mesh();
     let mesh_verts = mesh.vertices();
@@ -732,7 +751,10 @@ fn build_evaluated_node(expr: &ManifoldExpr, include_paths: &[PathBuf]) -> Resul
         ManifoldExpr::Union(a, b)
         | ManifoldExpr::Difference(a, b)
         | ManifoldExpr::Intersection(a, b) => {
-            vec![build_evaluated_node(a, include_paths)?, build_evaluated_node(b, include_paths)?]
+            vec![
+                build_evaluated_node(a, include_paths)?,
+                build_evaluated_node(b, include_paths)?,
+            ]
         }
         ManifoldExpr::Translate { expr: e, .. }
         | ManifoldExpr::Scale { expr: e, .. }
@@ -786,7 +808,10 @@ pub fn generate_mesh_and_tree_from_terms(
 }
 
 /// 複数のTermからMeshを生成する（全てをunionする）
-pub fn generate_mesh_from_terms(terms: &[Term], include_paths: &[PathBuf]) -> Result<Mesh, ConversionError> {
+pub fn generate_mesh_from_terms(
+    terms: &[Term],
+    include_paths: &[PathBuf],
+) -> Result<Mesh, ConversionError> {
     if terms.is_empty() {
         return Err(ConversionError::UnknownPrimitive(
             "empty term list".to_string(),
