@@ -531,7 +531,6 @@ impl ManifoldExpr {
     /// ManifoldExpr を manifold-rs の Manifold に評価
     pub fn evaluate(&self, include_paths: &[PathBuf]) -> Result<Manifold, ConversionError> {
         match self {
-            // プリミティブ
             ManifoldExpr::Cube { x, y, z } => Ok(Manifold::cube(x.value, y.value, z.value)),
             ManifoldExpr::Sphere { radius, segments } => {
                 Ok(Manifold::sphere(radius.value, *segments))
@@ -548,7 +547,6 @@ impl ManifoldExpr {
             )),
             ManifoldExpr::Tetrahedron => Ok(Manifold::tetrahedron()),
 
-            // CSG
             ManifoldExpr::Union(a, b) => Ok(a
                 .evaluate(include_paths)?
                 .union(&b.evaluate(include_paths)?)),
@@ -559,7 +557,6 @@ impl ManifoldExpr {
                 .evaluate(include_paths)?
                 .intersection(&b.evaluate(include_paths)?)),
 
-            // 変形
             ManifoldExpr::Translate { expr, x, y, z } => Ok(expr
                 .evaluate(include_paths)?
                 .translate(x.value, y.value, z.value)),
@@ -570,7 +567,6 @@ impl ManifoldExpr {
                 .evaluate(include_paths)?
                 .rotate(x.value, y.value, z.value)),
 
-            // 2Dプロファイル (単体プレビュー時は薄いextrudeで3D化)
             ManifoldExpr::Polygon { points } => {
                 Ok(Manifold::extrude(&[points], 0.001, 0, 0.0, 1.0, 1.0))
             }
@@ -585,7 +581,6 @@ impl ManifoldExpr {
                 Ok(Manifold::extrude(&[&data], 0.001, 0, 0.0, 1.0, 1.0))
             }
 
-            // 押し出し・回転体
             ManifoldExpr::Extrude { profile, height } => {
                 let data =
                     profile
@@ -613,7 +608,6 @@ impl ManifoldExpr {
                 Ok(Manifold::revolve(&[&data], *segments, degrees.value))
             }
 
-            // ポリヘドロン
             ManifoldExpr::Polyhedron { points, faces } => {
                 let verts: Vec<f32> = points.iter().map(|&v| v as f32).collect();
                 let tri_indices: Vec<u32> = faces
@@ -628,7 +622,6 @@ impl ManifoldExpr {
                 Ok(Manifold::from_mesh(mesh))
             }
 
-            // STL
             ManifoldExpr::Stl { path } => {
                 let raw = Path::new(path);
                 let resolved = if raw.is_absolute() {

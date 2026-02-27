@@ -3,7 +3,9 @@ use std::fmt;
 
 use crate::constraint::{ArithEq, ArithExpr, solve_constraints};
 use crate::manifold_bridge::{BUILTIN_FUNCTORS, is_builtin_functor};
-use crate::parse::{ArithOp, Bound, Clause, FixedPoint, Term, annotated_var, list, number, struc, var};
+use crate::parse::{
+    ArithOp, Bound, Clause, FixedPoint, Term, annotated_var, list, number, struc, var,
+};
 
 /// Check if a term is a built-in primitive that should not be rewritten
 fn is_builtin_primitive(term: &Term) -> bool {
@@ -201,7 +203,6 @@ fn eval_arith_in_place(term: &mut Term) {
     if let Some(val) = eval_arith(term) {
         *term = number(val);
     } else {
-        // 再帰的に子要素も評価
         match term {
             Term::InfixExpr { left, right, .. } => {
                 eval_arith_in_place(left.as_mut());
@@ -493,7 +494,6 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
             // anonymous変数はどんな項とも単一化成功（束縛なし）
             (Term::Var { name }, _) | (Term::AnnotatedVar { name, .. }, _) if name == "_" => {}
             (_, Term::Var { name }) | (_, Term::AnnotatedVar { name, .. }) if name == "_" => {}
-            // 数値
             (Term::Number { value: v1 }, Term::Number { value: v2 }) => {
                 if v1 != v2 {
                     return Err(UnifyError {
@@ -503,7 +503,6 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                     });
                 }
             }
-            // 文字列リテラル
             (Term::StringLit { value: v1 }, Term::StringLit { value: v2 }) => {
                 if v1 != v2 {
                     return Err(UnifyError {
@@ -513,7 +512,6 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                     });
                 }
             }
-            // 構造体
             (
                 Term::Struct {
                     functor: f1,
@@ -548,7 +546,6 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                     stack.push((a1.clone(), a2.clone()));
                 }
             }
-            // リスト
             (
                 Term::List {
                     items: items1,
@@ -934,7 +931,10 @@ fn resolve_builtin_arg(
     other_goals: &mut Vec<Term>,
 ) -> Result<Term, RewriteError> {
     match term {
-        Term::Number { .. } | Term::Var { .. } | Term::AnnotatedVar { .. } | Term::StringLit { .. } => Ok(term),
+        Term::Number { .. }
+        | Term::Var { .. }
+        | Term::AnnotatedVar { .. }
+        | Term::StringLit { .. } => Ok(term),
         Term::List { items, tail } => {
             let resolved_items = items
                 .into_iter()
@@ -956,8 +956,7 @@ fn resolve_builtin_arg(
             })
         }
         other => {
-            let mut resolved =
-                rewrite_term_recursive(db, clause_counter, other, other_goals)?;
+            let mut resolved = rewrite_term_recursive(db, clause_counter, other, other_goals)?;
             if resolved.len() != 1 {
                 return Err(RewriteError {
                     message: "builtin argument resolved to multiple terms".to_string(),
