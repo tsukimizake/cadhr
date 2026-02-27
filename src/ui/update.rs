@@ -132,6 +132,7 @@ pub(super) fn egui_ui(
                         preview_id,
                         database: (**editor_text).clone(),
                         query: query_text,
+                        include_paths: (**current_file_path).iter().cloned().collect(),
                     });
                 }
                 if ui.button("Update Previews").clicked() {
@@ -140,6 +141,7 @@ pub(super) fn egui_ui(
                             preview_id: target.preview_id,
                             database: (**editor_text).clone(),
                             query: target.query.clone(),
+                            include_paths: (**current_file_path).iter().cloned().collect(),
                         });
                     }
                 }
@@ -156,6 +158,7 @@ pub(super) fn egui_ui(
                             preview_id: target.preview_id,
                             database: (**editor_text).clone(),
                             query: target.query.clone(),
+                            include_paths: (**current_file_path).iter().cloned().collect(),
                         });
                     }
                 }
@@ -280,6 +283,7 @@ pub(super) fn egui_ui(
                         preview_id,
                         database: (**editor_text).clone(),
                         query,
+                        include_paths: (**current_file_path).iter().cloned().collect(),
                     });
                 }
                 // Handle export requests
@@ -323,6 +327,7 @@ pub(super) fn egui_ui(
                             preview_id: target.preview_id,
                             database: (**editor_text).clone(),
                             query: target.query.clone(),
+                            include_paths: (**current_file_path).iter().cloned().collect(),
                         });
                     }
                 }
@@ -850,6 +855,14 @@ pub(super) fn handle_cadhr_lang_output(
     }
 }
 
+const LAST_SESSION_PATH_FILE: &str = "/tmp/cadhr_last_session_path";
+
+fn save_last_session_path(path: &Path) {
+    if let Err(e) = std::fs::write(LAST_SESSION_PATH_FILE, path.to_string_lossy().as_bytes()) {
+        bevy::log::warn!("Failed to save last session path: {:?}", e);
+    }
+}
+
 fn save_session<'a>(
     dir: &std::path::Path,
     editor_text: &EditorText,
@@ -914,6 +927,7 @@ pub(super) fn session_saved(
         if ev.result.is_ok() {
             save_session(&ev.path, &editor_text, preview_query.iter());
             **current_file_path = Some(ev.path.clone());
+            save_last_session_path(&ev.path);
         }
     }
 }
@@ -934,6 +948,7 @@ pub(super) fn session_loaded(
         if let Some((db_content, previews)) = load_session(&ev.path) {
             **editor_text = db_content;
             **current_file_path = Some(ev.path.clone());
+            save_last_session_path(&ev.path);
 
             refresh_editable_vars(&editor_text, &mut editable_vars);
 
@@ -965,6 +980,7 @@ pub(super) fn session_loaded(
                     preview_id,
                     database: (**editor_text).clone(),
                     query,
+                    include_paths: (**current_file_path).iter().cloned().collect(),
                 });
             }
         } else {
@@ -979,6 +995,54 @@ pub(super) fn threemf_saved(mut ev_saved: MessageReader<DialogFileSaved<ThreeMfF
             bevy::log::info!("3MF file saved to: {:?}", ev.path);
         } else {
             bevy::log::error!("Failed to save 3MF file: {:?}", ev.result);
+        }
+    }
+}
+
+pub(super) fn restore_last_session(
+    mut editor_text: ResMut<EditorText>,
+    mut current_file_path: ResMut<CurrentFilePath>,
+    mut ev_generate: MessageWriter<GeneratePreviewRequest>,
+    mut next_preview_id: ResMut<NextPreviewId>,
+    mut pending_states: ResMut<PendingPreviewStates>,
+    mut editable_vars: ResMut<EditableVars>,
+) {
+    let path_str = match std::fs::read_to_string(LAST_SESSION_PATH_FILE) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let path = std::path::PathBuf::from(path_str.trim());
+    if !path.is_dir() {
+        return;
+    }
+    if let Some((db_content, previews)) = load_session(&path) {
+        **editor_text = db_content;
+        **current_file_path = Some(path);
+
+        refresh_editable_vars(&editor_text, &mut editable_vars);
+
+        for mut preview_state in previews.previews {
+            let preview_id = if let Some(saved_id) = preview_state.preview_id {
+                if saved_id >= **next_preview_id {
+                    **next_preview_id = saved_id.saturating_add(1);
+                }
+                saved_id
+            } else {
+                let generated_id = **next_preview_id;
+                **next_preview_id += 1;
+                generated_id
+            };
+
+            preview_state.preview_id = Some(preview_id);
+            let query = preview_state.query.clone();
+            pending_states.insert(preview_id, preview_state);
+
+            ev_generate.write(GeneratePreviewRequest {
+                preview_id,
+                database: (**editor_text).clone(),
+                query,
+                include_paths: (**current_file_path).iter().cloned().collect(),
+            });
         }
     }
 }

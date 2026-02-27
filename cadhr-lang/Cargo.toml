@@ -21,10 +21,11 @@ opt-level = 3
 
 [features]
 default = ["manifold"]
-manifold = ["dep:manifold-rs"]
+manifold = ["dep:manifold-rs", "dep:stl_io"]
 
 [dependencies]
 nom = "8.0.0"
 manifold-rs = { version = "0.6.4", optional = true }
+stl_io = { version = "0.8", optional = true }
 strum = "0.27"
 strum_macros = "0.27"

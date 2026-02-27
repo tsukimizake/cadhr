@@ -4,10 +4,10 @@
 //! それを manifold-rs の Manifold オブジェクトに評価する。
 
 use crate::parse::{term_as_fixed_point, ArithOp, SrcSpan, Term};
+use cadhr_lang_macros::define_manifold_expr;
 use manifold_rs::{Manifold, Mesh};
 use std::fmt;
-use std::str::FromStr;
-use strum_macros::{EnumIter, EnumString, IntoStaticStr};
+use std::path::{Path, PathBuf};
 
 // ============================================================
 // TrackedF64: ソーススパン付きf64値
@@ -37,39 +37,29 @@ impl TrackedF64 {
 
 const DEFAULT_SEGMENTS: u32 = 32;
 
-/// ビルトインプリミティブのfunctor名を表すenum
-/// strumによりfunctor文字列との相互変換が可能
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, IntoStaticStr, EnumIter)]
-#[strum(serialize_all = "lowercase")]
-pub enum BuiltinFunctor {
-    // プリミティブ
-    Cube,
-    Sphere,
-    Cylinder,
-    Tetrahedron,
-    // CSG演算
-    Union,
-    Difference,
-    Intersection,
-    // 変形
-    Translate,
-    Scale,
-    Rotate,
-    // 2Dプロファイル
-    #[strum(serialize = "p")]
-    Point,
-    Polygon,
-    Circle,
-    // 押し出し・回転体
-    Extrude,
-    Revolve,
-    // ポリヘドロン
-    Polyhedron,
-}
-
-/// functor名がビルトインプリミティブかどうかを判定
-pub fn is_builtin_functor(functor: &str) -> bool {
-    BuiltinFunctor::from_str(functor).is_ok()
+define_manifold_expr! {
+    Cube { x: TrackedF64, y: TrackedF64, z: TrackedF64 };
+    @also_arity(1)
+    Sphere { radius: TrackedF64, segments: u32 };
+    @also_arity(2)
+    Cylinder { radius: TrackedF64, height: TrackedF64, segments: u32 };
+    Tetrahedron;
+    Union(Box<ManifoldExpr>, Box<ManifoldExpr>);
+    Difference(Box<ManifoldExpr>, Box<ManifoldExpr>);
+    Intersection(Box<ManifoldExpr>, Box<ManifoldExpr>);
+    Translate { expr: Box<ManifoldExpr>, x: TrackedF64, y: TrackedF64, z: TrackedF64 };
+    Scale { expr: Box<ManifoldExpr>, x: TrackedF64, y: TrackedF64, z: TrackedF64 };
+    Rotate { expr: Box<ManifoldExpr>, x: TrackedF64, y: TrackedF64, z: TrackedF64 };
+    @name("p") @no_variant
+    Point { _x: TrackedF64, _y: TrackedF64 };
+    Polygon { points: Vec<f64> };
+    @also_arity(1)
+    Circle { radius: TrackedF64, segments: u32 };
+    Extrude { profile: Box<ManifoldExpr>, height: TrackedF64 };
+    @also_arity(2)
+    Revolve { profile: Box<ManifoldExpr>, degrees: TrackedF64, segments: u32 };
+    Polyhedron { points: Vec<f64>, faces: Vec<Vec<u32>> };
+    Stl { path: String };
 }
 
 /// 変換エラー
@@ -91,6 +81,11 @@ pub enum ConversionError {
     },
     /// 未束縛変数
     UnboundVariable(String),
+    /// I/Oエラー（ファイル読み込み失敗など）
+    IoError {
+        functor: String,
+        message: String,
+    },
 }
 
 impl fmt::Display for ConversionError {
@@ -123,6 +118,9 @@ impl fmt::Display for ConversionError {
             }
             ConversionError::UnboundVariable(name) => {
                 write!(f, "Unbound variable: {}", name)
+            }
+            ConversionError::IoError { functor, message } => {
+                write!(f, "I/O error in {}: {}", functor, message)
             }
         }
     }
@@ -187,6 +185,17 @@ impl<'a> Args<'a> {
         }
     }
 
+    fn string(&self, i: usize) -> Result<String, ConversionError> {
+        match &self.args[i] {
+            Term::StringLit { value } => Ok(value.clone()),
+            _ => Err(ConversionError::TypeMismatch {
+                functor: self.functor.to_string(),
+                arg_index: i,
+                expected: "string",
+            }),
+        }
+    }
+
     fn term(&self, i: usize) -> Result<ManifoldExpr, ConversionError> {
         ManifoldExpr::from_term(&self.args[i])
     }
@@ -198,78 +207,6 @@ impl<'a> Args<'a> {
             got: self.len(),
         }
     }
-}
-
-/// manifold-rs APIへの中間表現
-#[derive(Debug, Clone)]
-pub enum ManifoldExpr {
-    // プリミティブ
-    Cube {
-        x: TrackedF64,
-        y: TrackedF64,
-        z: TrackedF64,
-    },
-    Sphere {
-        radius: TrackedF64,
-        segments: u32,
-    },
-    Cylinder {
-        radius: TrackedF64,
-        height: TrackedF64,
-        segments: u32,
-    },
-    Tetrahedron,
-
-    // CSG演算
-    Union(Box<ManifoldExpr>, Box<ManifoldExpr>),
-    Difference(Box<ManifoldExpr>, Box<ManifoldExpr>),
-    Intersection(Box<ManifoldExpr>, Box<ManifoldExpr>),
-
-    // 変形
-    Translate {
-        expr: Box<ManifoldExpr>,
-        x: TrackedF64,
-        y: TrackedF64,
-        z: TrackedF64,
-    },
-    Scale {
-        expr: Box<ManifoldExpr>,
-        x: TrackedF64,
-        y: TrackedF64,
-        z: TrackedF64,
-    },
-    Rotate {
-        expr: Box<ManifoldExpr>,
-        x: TrackedF64,
-        y: TrackedF64,
-        z: TrackedF64,
-    },
-
-    // 2Dプロファイル
-    Polygon {
-        points: Vec<f64>,
-    },
-    Circle {
-        radius: TrackedF64,
-        segments: u32,
-    },
-
-    // 押し出し・回転体
-    Extrude {
-        profile: Box<ManifoldExpr>,
-        height: TrackedF64,
-    },
-    Revolve {
-        profile: Box<ManifoldExpr>,
-        degrees: TrackedF64,
-        segments: u32,
-    },
-
-    // ポリヘドロン
-    Polyhedron {
-        points: Vec<f64>,
-        faces: Vec<Vec<u32>>,
-    },
 }
 
 fn extract_polygon_points(list_term: &Term, functor: &str) -> Result<Vec<f64>, ConversionError> {
@@ -586,85 +523,139 @@ impl ManifoldExpr {
                 Ok(ManifoldExpr::Polyhedron { points, faces })
             }
             BuiltinFunctor::Polyhedron => Err(a.arity_error("2")),
+
+            // STL
+            BuiltinFunctor::Stl if a.len() == 1 => {
+                let path = a.string(0)?;
+                Ok(ManifoldExpr::Stl { path })
+            }
+            BuiltinFunctor::Stl => Err(a.arity_error("1")),
         }
     }
 
     /// ManifoldExpr を manifold-rs の Manifold に評価
-    pub fn evaluate(&self) -> Manifold {
+    pub fn evaluate(&self, include_paths: &[PathBuf]) -> Result<Manifold, ConversionError> {
         match self {
             // プリミティブ
-            ManifoldExpr::Cube { x, y, z } => Manifold::cube(x.value, y.value, z.value),
-            ManifoldExpr::Sphere { radius, segments } => Manifold::sphere(radius.value, *segments),
+            ManifoldExpr::Cube { x, y, z } => Ok(Manifold::cube(x.value, y.value, z.value)),
+            ManifoldExpr::Sphere { radius, segments } => Ok(Manifold::sphere(radius.value, *segments)),
             ManifoldExpr::Cylinder {
                 radius,
                 height,
                 segments,
-            } => Manifold::cylinder(radius.value, radius.value, height.value, *segments),
-            ManifoldExpr::Tetrahedron => Manifold::tetrahedron(),
+            } => Ok(Manifold::cylinder(radius.value, radius.value, height.value, *segments)),
+            ManifoldExpr::Tetrahedron => Ok(Manifold::tetrahedron()),
 
             // CSG
-            ManifoldExpr::Union(a, b) => a.evaluate().union(&b.evaluate()),
-            ManifoldExpr::Difference(a, b) => a.evaluate().difference(&b.evaluate()),
-            ManifoldExpr::Intersection(a, b) => a.evaluate().intersection(&b.evaluate()),
+            ManifoldExpr::Union(a, b) => Ok(a.evaluate(include_paths)?.union(&b.evaluate(include_paths)?)),
+            ManifoldExpr::Difference(a, b) => Ok(a.evaluate(include_paths)?.difference(&b.evaluate(include_paths)?)),
+            ManifoldExpr::Intersection(a, b) => Ok(a.evaluate(include_paths)?.intersection(&b.evaluate(include_paths)?)),
 
             // 変形
             ManifoldExpr::Translate { expr, x, y, z } => {
-                expr.evaluate().translate(x.value, y.value, z.value)
+                Ok(expr.evaluate(include_paths)?.translate(x.value, y.value, z.value))
             }
             ManifoldExpr::Scale { expr, x, y, z } => {
-                expr.evaluate().scale(x.value, y.value, z.value)
+                Ok(expr.evaluate(include_paths)?.scale(x.value, y.value, z.value))
             }
             ManifoldExpr::Rotate { expr, x, y, z } => {
-                expr.evaluate().rotate(x.value, y.value, z.value)
+                Ok(expr.evaluate(include_paths)?.rotate(x.value, y.value, z.value))
             }
 
             // 2Dプロファイル (単体プレビュー時は薄いextrudeで3D化)
             ManifoldExpr::Polygon { points } => {
-                Manifold::extrude(&[points], 0.001, 0, 0.0, 1.0, 1.0)
+                Ok(Manifold::extrude(&[points], 0.001, 0, 0.0, 1.0, 1.0))
             }
             ManifoldExpr::Circle { .. } => {
-                let data = self.to_polygon_data().unwrap();
-                Manifold::extrude(&[&data], 0.001, 0, 0.0, 1.0, 1.0)
+                let data = self.to_polygon_data().ok_or_else(|| ConversionError::TypeMismatch {
+                    functor: "circle".to_string(),
+                    arg_index: 0,
+                    expected: "polygon data",
+                })?;
+                Ok(Manifold::extrude(&[&data], 0.001, 0, 0.0, 1.0, 1.0))
             }
 
             // 押し出し・回転体
             ManifoldExpr::Extrude { profile, height } => {
-                let data = profile.to_polygon_data().unwrap();
-                Manifold::extrude(&[&data], height.value, 0, 0.0, 1.0, 1.0)
+                let data = profile.to_polygon_data().ok_or_else(|| ConversionError::TypeMismatch {
+                    functor: "extrude".to_string(),
+                    arg_index: 0,
+                    expected: "polygon data",
+                })?;
+                Ok(Manifold::extrude(&[&data], height.value, 0, 0.0, 1.0, 1.0))
             }
             ManifoldExpr::Revolve {
                 profile,
                 degrees,
                 segments,
             } => {
-                let data = profile.to_polygon_data().unwrap();
-                Manifold::revolve(&[&data], *segments, degrees.value)
+                let data = profile.to_polygon_data().ok_or_else(|| ConversionError::TypeMismatch {
+                    functor: "revolve".to_string(),
+                    arg_index: 0,
+                    expected: "polygon data",
+                })?;
+                Ok(Manifold::revolve(&[&data], *segments, degrees.value))
             }
 
             // ポリヘドロン
             ManifoldExpr::Polyhedron { points, faces } => {
-                // manifold-rs の from_mesh で構築
                 let verts: Vec<f32> = points.iter().map(|&v| v as f32).collect();
                 let tri_indices: Vec<u32> = faces
                     .iter()
                     .flat_map(|face| {
-                        // Fan triangulation for faces with > 3 vertices
                         (1..face.len() - 1).flat_map(move |i| {
                             vec![face[0], face[i as usize], face[i as usize + 1]]
                         })
                     })
                     .collect();
                 let mesh = Mesh::new(&verts, &tri_indices);
-                Manifold::from_mesh(mesh)
+                Ok(Manifold::from_mesh(mesh))
+            }
+
+            // STL
+            ManifoldExpr::Stl { path } => {
+                let raw = Path::new(path);
+                let resolved = if raw.is_absolute() {
+                    PathBuf::from(path)
+                } else {
+                    include_paths
+                        .iter()
+                        .map(|dir| dir.join(raw))
+                        .find(|p| p.exists())
+                        .unwrap_or_else(|| PathBuf::from(path))
+                };
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&resolved)
+                    .map_err(|e| ConversionError::IoError {
+                        functor: "stl".into(),
+                        message: format!("{}: {}", resolved.display(), e),
+                    })?;
+                let stl = stl_io::read_stl(&mut file).map_err(|e| ConversionError::IoError {
+                    functor: "stl".into(),
+                    message: format!("{}: {}", resolved.display(), e),
+                })?;
+                let verts: Vec<f32> = stl
+                    .vertices
+                    .iter()
+                    .flat_map(|v| [v[0], v[1], v[2]])
+                    .collect();
+                let indices: Vec<u32> = stl
+                    .faces
+                    .iter()
+                    .flat_map(|f| f.vertices.iter().map(|&i| i as u32))
+                    .collect();
+                let mesh = Mesh::new(&verts, &indices);
+                Ok(Manifold::from_mesh(mesh))
             }
         }
     }
 
     /// ManifoldExpr を Mesh に変換（法線計算込み）
-    pub fn to_mesh(&self) -> Mesh {
-        let manifold = self.evaluate();
+    pub fn to_mesh(&self, include_paths: &[PathBuf]) -> Result<Mesh, ConversionError> {
+        let manifold = self.evaluate(include_paths)?;
         let with_normals = manifold.calculate_normals(0, 30.0);
-        with_normals.to_mesh()
+        Ok(with_normals.to_mesh())
     }
 }
 
@@ -712,8 +703,8 @@ pub fn collect_tracked_spans_from_expr(expr: &ManifoldExpr) -> Vec<(String, Trac
     }
 }
 
-fn build_evaluated_node(expr: &ManifoldExpr) -> EvaluatedNode {
-    let manifold = expr.evaluate();
+fn build_evaluated_node(expr: &ManifoldExpr, include_paths: &[PathBuf]) -> Result<EvaluatedNode, ConversionError> {
+    let manifold = expr.evaluate(include_paths)?;
     let mesh = manifold.calculate_normals(0, 30.0).to_mesh();
     let mesh_verts = mesh.vertices();
     let mesh_indices = mesh.indices();
@@ -741,31 +732,32 @@ fn build_evaluated_node(expr: &ManifoldExpr) -> EvaluatedNode {
         ManifoldExpr::Union(a, b)
         | ManifoldExpr::Difference(a, b)
         | ManifoldExpr::Intersection(a, b) => {
-            vec![build_evaluated_node(a), build_evaluated_node(b)]
+            vec![build_evaluated_node(a, include_paths)?, build_evaluated_node(b, include_paths)?]
         }
         ManifoldExpr::Translate { expr: e, .. }
         | ManifoldExpr::Scale { expr: e, .. }
         | ManifoldExpr::Rotate { expr: e, .. }
         | ManifoldExpr::Extrude { profile: e, .. }
         | ManifoldExpr::Revolve { profile: e, .. } => {
-            vec![build_evaluated_node(e)]
+            vec![build_evaluated_node(e, include_paths)?]
         }
         _ => vec![],
     };
 
-    EvaluatedNode {
+    Ok(EvaluatedNode {
         expr: expr.clone(),
         mesh_verts,
         mesh_indices,
         aabb_min,
         aabb_max,
         children,
-    }
+    })
 }
 
 /// 複数のTermからMeshとEvaluatedNodeツリーを生成する
 pub fn generate_mesh_and_tree_from_terms(
     terms: &[Term],
+    include_paths: &[PathBuf],
 ) -> Result<(Mesh, Vec<EvaluatedNode>), ConversionError> {
     if terms.is_empty() {
         return Err(ConversionError::UnknownPrimitive(
@@ -778,20 +770,23 @@ pub fn generate_mesh_and_tree_from_terms(
         .map(ManifoldExpr::from_term)
         .collect::<Result<Vec<_>, _>>()?;
 
-    let nodes: Vec<EvaluatedNode> = exprs.iter().map(|e| build_evaluated_node(e)).collect();
+    let nodes: Vec<EvaluatedNode> = exprs
+        .iter()
+        .map(|e| build_evaluated_node(e, include_paths))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let manifold = exprs
-        .into_iter()
-        .map(|e| e.evaluate())
-        .reduce(|acc, m| acc.union(&m))
-        .unwrap();
+        .iter()
+        .map(|e| e.evaluate(include_paths))
+        .reduce(|acc, m| Ok(acc?.union(&m?)))
+        .unwrap()?;
 
     let with_normals = manifold.calculate_normals(0, 30.0);
     Ok((with_normals.to_mesh(), nodes))
 }
 
 /// 複数のTermからMeshを生成する（全てをunionする）
-pub fn generate_mesh_from_terms(terms: &[Term]) -> Result<Mesh, ConversionError> {
+pub fn generate_mesh_from_terms(terms: &[Term], include_paths: &[PathBuf]) -> Result<Mesh, ConversionError> {
     if terms.is_empty() {
         return Err(ConversionError::UnknownPrimitive(
             "empty term list".to_string(),
@@ -803,12 +798,11 @@ pub fn generate_mesh_from_terms(terms: &[Term]) -> Result<Mesh, ConversionError>
         .map(ManifoldExpr::from_term)
         .collect::<Result<Vec<_>, _>>()?;
 
-    // 全てのManifoldExprをunionで結合
     let manifold = exprs
-        .into_iter()
-        .map(|e| e.evaluate())
-        .reduce(|acc, m| acc.union(&m))
-        .unwrap(); // exprsが空でないことは上でチェック済み
+        .iter()
+        .map(|e| e.evaluate(include_paths))
+        .reduce(|acc, m| Ok(acc?.union(&m?)))
+        .unwrap()?;
 
     let with_normals = manifold.calculate_normals(0, 30.0);
     Ok(with_normals.to_mesh())
@@ -817,7 +811,7 @@ pub fn generate_mesh_from_terms(terms: &[Term]) -> Result<Mesh, ConversionError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::{number_int, struc, var};
+    use crate::parse::{number_int, string_lit, struc, var};
 
     #[test]
     fn test_cube_conversion() {
@@ -1136,7 +1130,7 @@ mod tests {
     fn test_polygon_standalone_evaluate() {
         let term = make_polygon_term(vec![(1, 0), (0, 0), (0, 1), (1, 1)]);
         let expr = ManifoldExpr::from_term(&term).unwrap();
-        let mesh = expr.to_mesh();
+        let mesh = expr.to_mesh(&[]).unwrap();
         assert!(mesh.vertices().len() > 0);
     }
 
@@ -1145,7 +1139,14 @@ mod tests {
         let polygon = make_polygon_term(vec![(1, 0), (0, 0), (0, 1), (1, 1)]);
         let term = struc("extrude".into(), vec![polygon, number_int(3)]);
         let expr = ManifoldExpr::from_term(&term).unwrap();
-        let mesh = expr.to_mesh();
+        let mesh = expr.to_mesh(&[]).unwrap();
         assert!(mesh.vertices().len() > 0);
+    }
+
+    #[test]
+    fn test_stl_conversion() {
+        let term = struc("stl".into(), vec![string_lit("model.stl".into())]);
+        let expr = ManifoldExpr::from_term(&term).unwrap();
+        assert!(matches!(expr, ManifoldExpr::Stl { .. }));
     }
 }

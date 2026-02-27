@@ -56,7 +56,7 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
 
                 logs.push(format!("Resolved terms: {:?}", resolved));
 
-                let (rs_mesh, evaluated_nodes) = generate_mesh_and_tree_from_terms(&resolved)
+                let (rs_mesh, evaluated_nodes) = generate_mesh_and_tree_from_terms(&resolved, &req.include_paths)
                     .map_err(|e| format!("Mesh error: {}", e))?;
 
                 Ok((rs_mesh_to_bevy_mesh(&rs_mesh), evaluated_nodes))

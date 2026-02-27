@@ -43,6 +43,7 @@ fn builtin_functor_arities(functor: BuiltinFunctor) -> &'static [usize] {
         BuiltinFunctor::Extrude => &[2],
         BuiltinFunctor::Revolve => &[2, 3],
         BuiltinFunctor::Polyhedron => &[2],
+        BuiltinFunctor::Stl => &[1],
     }
 }
 
@@ -267,7 +268,7 @@ fn occurs_check(var_name: &str, term: &Term) -> bool {
         Term::Constraint { left, right } => {
             occurs_check(var_name, left) || occurs_check(var_name, right)
         }
-        Term::Number { .. } => false,
+        Term::Number { .. } | Term::StringLit { .. } => false,
     }
 }
 
@@ -525,6 +526,16 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                     });
                 }
             }
+            // 文字列リテラル
+            (Term::StringLit { value: v1 }, Term::StringLit { value: v2 }) => {
+                if v1 != v2 {
+                    return Err(UnifyError {
+                        message: format!("string mismatch: \"{}\" != \"{}\"", v1, v2),
+                        term1: t1,
+                        term2: t2,
+                    });
+                }
+            }
             // 構造体
             (
                 Term::Struct {
@@ -772,7 +783,7 @@ fn rename_term_vars(term: &mut Term, suffix: &str) {
             rename_term_vars(left.as_mut(), suffix);
             rename_term_vars(right.as_mut(), suffix);
         }
-        Term::Number { .. } => {}
+        Term::Number { .. } | Term::StringLit { .. } => {}
     }
 }
 
@@ -946,7 +957,7 @@ fn resolve_builtin_arg(
     other_goals: &mut Vec<Term>,
 ) -> Result<Term, RewriteError> {
     match term {
-        Term::Number { .. } | Term::Var { .. } | Term::AnnotatedVar { .. } => Ok(term),
+        Term::Number { .. } | Term::Var { .. } | Term::AnnotatedVar { .. } | Term::StringLit { .. } => Ok(term),
         Term::List { items, tail } => {
             let resolved_items = items
                 .into_iter()

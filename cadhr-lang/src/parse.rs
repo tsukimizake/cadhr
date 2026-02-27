@@ -165,6 +165,10 @@ pub enum Term {
         items: Vec<Term>,
         tail: Option<Box<Term>>,
     },
+    /// 文字列リテラル: "hello" など
+    StringLit {
+        value: String,
+    },
     /// 遅延された算術制約: left = right を後で検証
     Constraint {
         left: Box<Term>,
@@ -239,6 +243,7 @@ impl PartialEq for Term {
                     tail: t2,
                 },
             ) => i1 == i2 && t1 == t2,
+            (Term::StringLit { value: v1 }, Term::StringLit { value: v2 }) => v1 == v2,
             (
                 Term::Constraint {
                     left: l1,
@@ -323,6 +328,7 @@ impl fmt::Debug for Term {
                 }
                 write!(f, "]")
             }
+            Term::StringLit { value } => write!(f, "\"{}\"", value),
             Term::Constraint { left, right } => {
                 write!(f, "constraint({:?} = {:?})", left, right)
             }
@@ -418,6 +424,10 @@ pub fn range_var(name: String, min: Option<Bound>, max: Option<Bound>) -> Term {
         max,
         span: None,
     }
+}
+
+pub fn string_lit(value: String) -> Term {
+    Term::StringLit { value }
 }
 
 pub fn arith_expr(op: ArithOp, left: Term, right: Term) -> Term {
@@ -675,6 +685,24 @@ fn annotated_var_term(input: &str) -> PResult<'_, Term> {
     }
 }
 
+fn string_literal(input: &str) -> PResult<'_, Term> {
+    ws(map(
+        delimited(
+            char('"'),
+            many0(alt((
+                map(tag("\\\""), |_| '"'),
+                map(tag("\\\\"), |_| '\\'),
+                map(tag("\\n"), |_| '\n'),
+                map(tag("\\t"), |_| '\t'),
+                nom::character::complete::none_of("\"\\"),
+            ))),
+            cut(char('"')),
+        ),
+        |chars| string_lit(chars.into_iter().collect()),
+    ))
+    .parse(input)
+}
+
 fn atom_term(input: &str) -> PResult<'_, Term> {
     ws(map(
         pair(
@@ -698,6 +726,7 @@ fn primary_term(input: &str) -> PResult<'_, Term> {
     alt((
         list_term,
         paren_term,
+        string_literal,
         annotated_var_term,
         number_term,
         atom_term,

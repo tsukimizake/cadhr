@@ -376,6 +376,9 @@ impl ArithExpr {
             Term::Constraint { .. } => Err(ConversionError {
                 message: "cannot convert constraint to arithmetic expression".to_string(),
             }),
+            Term::StringLit { .. } => Err(ConversionError {
+                message: "cannot convert string literal to arithmetic expression".to_string(),
+            }),
         }
     }
 
