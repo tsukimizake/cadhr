@@ -1163,8 +1163,35 @@ mod tests {
 
     #[test]
     fn test_stl_conversion() {
-        let term = struc("stl".into(), vec![string_lit("model.stl".into())]);
+        use stl_io::{Normal, Triangle, Vertex};
+
+        let v0 = Vertex::new([0.0, 0.0, 0.0]);
+        let v1 = Vertex::new([1.0, 0.0, 0.0]);
+        let v2 = Vertex::new([0.0, 1.0, 0.0]);
+        let v3 = Vertex::new([0.0, 0.0, 1.0]);
+        let tris = vec![
+            Triangle { normal: Normal::new([0.0, 0.0, -1.0]), vertices: [v0, v2, v1] },
+            Triangle { normal: Normal::new([0.0, -1.0, 0.0]), vertices: [v0, v1, v3] },
+            Triangle { normal: Normal::new([-1.0, 0.0, 0.0]), vertices: [v0, v3, v2] },
+            Triangle { normal: Normal::new([1.0, 1.0, 1.0]),  vertices: [v1, v2, v3] },
+        ];
+
+        let dir = std::env::temp_dir().join("cadhr_test_stl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stl_path = dir.join("test.stl");
+        {
+            let mut file = std::fs::File::create(&stl_path).unwrap();
+            stl_io::write_stl(&mut file, tris.iter()).unwrap();
+        }
+
+        let term = struc(
+            "stl".into(),
+            vec![string_lit(stl_path.to_str().unwrap().into())],
+        );
         let expr = ManifoldExpr::from_term(&term).unwrap();
-        assert!(matches!(expr, ManifoldExpr::Stl { .. }));
+        let mesh = expr.to_mesh(&[]).unwrap();
+        assert!(mesh.vertices().len() > 0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
