@@ -903,6 +903,12 @@ fn preview_target_ui(
                 if ui.button("Close").clicked() {
                     action = PreviewAction::Close;
                 }
+                if !target.control_point_overrides.is_empty()
+                    && ui.button("Reset CPs").clicked()
+                {
+                    target.control_point_overrides.clear();
+                    cp_override_regenerate.push(target.preview_id);
+                }
             });
             ui.add_space(4.0);
             // Camera controls (orbit and zoom)
