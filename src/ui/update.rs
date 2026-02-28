@@ -24,7 +24,6 @@ const MIN_CAMERA_PITCH: f64 = -MAX_CAMERA_PITCH;
 const MAX_CAMERA_YAW: f64 = std::f64::consts::PI - 0.001;
 const MIN_CAMERA_YAW: f64 = -MAX_CAMERA_YAW;
 const DEFAULT_ZOOM: f32 = 10.0;
-const AUTO_ZOOM_SENTINEL: f32 = 0.0;
 const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 100.0;
 const CONTROL_SPHERE_RADIUS: f32 = 0.5;
@@ -40,20 +39,13 @@ fn refresh_editable_vars(editor_text: &str, editable_vars: &mut EditableVars) {
 }
 const MIN_CAMERA_DISTANCE: f32 = 5.0;
 
-fn camera_distance_and_zoom_from_mesh(mesh: &Mesh) -> (f32, f32) {
+fn camera_distance_from_mesh(mesh: &Mesh) -> f32 {
     if let Some(aabb) = mesh.compute_aabb() {
         let half_extents = aabb.half_extents;
         let max_extent = half_extents.x.max(half_extents.y).max(half_extents.z);
-        let natural_distance = max_extent * CAMERA_DISTANCE_FACTOR;
-        let camera_distance = natural_distance.max(MIN_CAMERA_DISTANCE);
-        let auto_zoom = if natural_distance > f32::EPSILON {
-            (DEFAULT_ZOOM * camera_distance / natural_distance).clamp(MIN_ZOOM, MAX_ZOOM)
-        } else {
-            DEFAULT_ZOOM
-        };
-        (camera_distance, auto_zoom)
+        (max_extent * CAMERA_DISTANCE_FACTOR).max(MIN_CAMERA_DISTANCE)
     } else {
-        (MIN_CAMERA_DISTANCE, DEFAULT_ZOOM)
+        MIN_CAMERA_DISTANCE
     }
 }
 
@@ -129,7 +121,7 @@ pub(super) fn egui_ui(
                         PreviewState {
                             preview_id: Some(preview_id),
                             query: query_text.clone(),
-                            zoom: AUTO_ZOOM_SENTINEL,
+                            zoom: DEFAULT_ZOOM,
                             rotate_x: 0.0,
                             rotate_y: 0.0,
                             control_point_overrides: Default::default(),
@@ -459,10 +451,7 @@ pub(super) fn on_preview_generated(
                 }
                 target.evaluated_nodes = ev.evaluated_nodes.clone();
                 target.control_points = ev.control_points.clone();
-                let (camera_distance, auto_zoom) =
-                    camera_distance_and_zoom_from_mesh(&ev.mesh);
-                target.base_camera_distance = camera_distance;
-                target.zoom = auto_zoom;
+                target.base_camera_distance = camera_distance_from_mesh(&ev.mesh);
 
                 // Update control sphere entities
                 let render_layer = target.render_layer;
@@ -527,11 +516,11 @@ pub(super) fn on_preview_generated(
         };
         let layer_only = RenderLayers::layer(render_layer);
 
-        let (camera_distance, auto_zoom) = camera_distance_and_zoom_from_mesh(&ev.mesh);
-        let initial_zoom = if pending_state.zoom > AUTO_ZOOM_SENTINEL {
+        let camera_distance = camera_distance_from_mesh(&ev.mesh);
+        let initial_zoom = if pending_state.zoom > 0.0 {
             pending_state.zoom
         } else {
-            auto_zoom
+            DEFAULT_ZOOM
         };
         let cam_pos = Vec3::new(
             camera_distance * 0.5,
