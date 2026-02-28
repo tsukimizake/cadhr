@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use bevy_file_dialog::prelude::*;
-use cadhr_lang::manifold_bridge::EvaluatedNode;
+use cadhr_lang::manifold_bridge::{ControlPoint, EvaluatedNode};
 use derived_deref::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -24,6 +24,8 @@ pub struct PreviewState {
     pub zoom: f32,
     pub rotate_x: f64,
     pub rotate_y: f64,
+    #[serde(default)]
+    pub control_point_overrides: HashMap<String, f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -47,6 +49,9 @@ pub struct PreviewTarget {
     pub rotate_y: f64,
     pub query: String,
     pub evaluated_nodes: Vec<EvaluatedNode>,
+    pub control_points: Vec<ControlPoint>,
+    pub control_sphere_entities: Vec<Entity>,
+    pub control_point_overrides: HashMap<String, f64>,
 }
 
 impl Plugin for UiPlugin {
@@ -83,8 +88,15 @@ impl Plugin for UiPlugin {
             .insert_resource(ErrorMessage::default())
             .insert_resource(CurrentFilePath::default())
             .insert_resource(PendingPreviewStates::default())
-            .insert_resource(EditableVars::default());
+            .insert_resource(EditableVars::default())
+            .insert_resource(SelectedControlPoint::default());
     }
+}
+
+#[derive(Resource, Default)]
+pub struct SelectedControlPoint {
+    pub preview_id: Option<u64>,
+    pub index: usize,
 }
 
 #[derive(Resource, Default, Clone, Deref, DerefMut)]

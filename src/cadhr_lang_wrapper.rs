@@ -5,7 +5,7 @@ use bevy::{mesh::Indices, prelude::*};
 use bevy_async_ecs::AsyncWorld;
 
 use crate::events::{CadhrLangOutput, GeneratePreviewRequest, PreviewGenerated};
-use cadhr_lang::manifold_bridge::generate_mesh_and_tree_from_terms;
+use cadhr_lang::manifold_bridge::{apply_var_overrides, extract_control_points, generate_mesh_and_tree_from_terms};
 use cadhr_lang::parse::{database, query as parse_query};
 use cadhr_lang::term_rewrite::execute;
 use manifold_rs::Mesh as RsMesh;
@@ -41,7 +41,7 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
             let query = req.query;
 
             let mut logs: Vec<String> = Vec::new();
-            let result = (|| -> Result<(Mesh, Vec<cadhr_lang::manifold_bridge::EvaluatedNode>), String> {
+            let result = (|| -> Result<(Mesh, Vec<cadhr_lang::manifold_bridge::EvaluatedNode>, Vec<cadhr_lang::manifold_bridge::ControlPoint>), String> {
                 let (_, query_terms) =
                     parse_query(&query).map_err(|e| format!("Query parse error: {:?}", e))?;
 
@@ -51,15 +51,28 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
                 logs.push(format!("Query terms: {:?}", query_terms));
                 logs.push(format!("Database clauses: {:#?}", db));
 
-                let resolved =
+                let mut resolved =
                     execute(&mut db, query_terms).map_err(|e| format!("Rewrite error: {}", e))?;
 
                 logs.push(format!("Resolved terms: {:?}", resolved));
 
+                apply_var_overrides(&mut resolved, &req.control_point_overrides);
+
+                let control_points = extract_control_points(&mut resolved);
+
+                if resolved.is_empty() {
+                    // control pointsのみでgeometryがない場合、空メッシュを返す
+                    let empty_mesh = Mesh::new(
+                        bevy::render::render_resource::PrimitiveTopology::TriangleList,
+                        bevy::asset::RenderAssetUsages::RENDER_WORLD | bevy::asset::RenderAssetUsages::MAIN_WORLD,
+                    );
+                    return Ok((empty_mesh, vec![], control_points));
+                }
+
                 let (rs_mesh, evaluated_nodes) = generate_mesh_and_tree_from_terms(&resolved, &req.include_paths)
                     .map_err(|e| format!("Mesh error: {}", e))?;
 
-                Ok((rs_mesh_to_bevy_mesh(&rs_mesh), evaluated_nodes))
+                Ok((rs_mesh_to_bevy_mesh(&rs_mesh), evaluated_nodes, control_points))
             })();
 
             let log_message = logs.join("\n");
@@ -73,13 +86,14 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
             }
 
             match result {
-                Ok((mesh, evaluated_nodes)) => {
+                Ok((mesh, evaluated_nodes, control_points)) => {
                     async_world
                         .send_message(PreviewGenerated {
                             preview_id,
                             query,
                             mesh,
                             evaluated_nodes,
+                            control_points,
                         })
                         .await;
                 }

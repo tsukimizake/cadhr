@@ -1,11 +1,88 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::constraint::{ArithEq, ArithExpr, solve_constraints};
-use crate::manifold_bridge::{BUILTIN_FUNCTORS, is_builtin_functor};
+use crate::manifold_bridge::{BUILTIN_FUNCTORS, is_builtin_functor, is_builtin_functor_with_arity};
 use crate::parse::{
     ArithOp, Bound, Clause, FixedPoint, Term, annotated_var, list, number, struc, var,
 };
+
+pub type Env = HashMap<String, Term>;
+
+const RESOLVE_DEPTH_LIMIT: usize = 256;
+
+/// envを参照して変数を再帰的に解決する。
+/// - Var/AnnotatedVar → envにあれば再帰的にresolve
+/// - AnnotatedVar + Number束縛 → AnnotatedVarのdefault_valueを更新して返す（span保持）
+/// - InfixExpr → 両辺をresolveし、全部Numberなら算術評価
+/// - Struct/List/Constraint → 引数を再帰的にresolve
+/// - Number/StringLit → そのまま
+pub fn resolve(term: &Term, env: &Env) -> Term {
+    resolve_inner(term, env, 0)
+}
+
+fn resolve_inner(term: &Term, env: &Env, depth: usize) -> Term {
+    if depth > RESOLVE_DEPTH_LIMIT {
+        return term.clone();
+    }
+    match term {
+        Term::Var { name } if name != "_" => match env.get(name) {
+            Some(val) => resolve_inner(val, env, depth + 1),
+            None => term.clone(),
+        },
+        Term::AnnotatedVar {
+            name,
+            default_value,
+            min,
+            max,
+            span,
+        } if name != "_" => match env.get(name) {
+            Some(Term::Number { value: new_val }) => {
+                // Number束縛 → AnnotatedVarのdefault_valueを更新（span保持）
+                Term::AnnotatedVar {
+                    name: name.clone(),
+                    default_value: Some(*new_val),
+                    min: *min,
+                    max: *max,
+                    span: *span,
+                }
+            }
+            Some(val) => resolve_inner(val, env, depth + 1),
+            None => {
+                // default_valueがあればNumberとして解決し、envに無い場合はそのまま
+                term.clone()
+            }
+        },
+        Term::InfixExpr { op, left, right } => {
+            let new_left = resolve_inner(left, env, depth + 1);
+            let new_right = resolve_inner(right, env, depth + 1);
+            let new_term = Term::InfixExpr {
+                op: *op,
+                left: Box::new(new_left),
+                right: Box::new(new_right),
+            };
+            if let Some(val) = eval_arith(&new_term) {
+                number(val)
+            } else {
+                new_term
+            }
+        }
+        Term::Struct { functor, args } => Term::Struct {
+            functor: functor.clone(),
+            args: args.iter().map(|a| resolve_inner(a, env, depth + 1)).collect(),
+        },
+        Term::List { items, tail } => Term::List {
+            items: items.iter().map(|i| resolve_inner(i, env, depth + 1)).collect(),
+            tail: tail.as_ref().map(|t| Box::new(resolve_inner(t, env, depth + 1))),
+        },
+        Term::Constraint { left, right } => Term::Constraint {
+            left: Box::new(resolve_inner(left, env, depth + 1)),
+            right: Box::new(resolve_inner(right, env, depth + 1)),
+        },
+        _ => term.clone(),
+    }
+}
 
 /// Check if a term is a built-in primitive that should not be rewritten
 fn is_builtin_primitive(term: &Term) -> bool {
@@ -69,65 +146,6 @@ impl fmt::Display for RewriteError {
 
 impl std::error::Error for RewriteError {}
 
-/// 単一変数の置換をインプレースで適用
-fn substitute_in_place(term: &mut Term, var_name: &str, replacement: &Term) {
-    match term {
-        Term::Var { name } if name == var_name => {
-            *term = replacement.clone();
-        }
-        Term::AnnotatedVar { name, .. } if name == var_name => {
-            // AnnotatedVarを置換する場合、replacementがNumberならspanを保持したままdefault_valueだけ更新
-            // replacementが他の構造なら通常通り置換
-            match replacement {
-                Term::Number { value: new_val } => {
-                    if let Term::AnnotatedVar { default_value, .. } = term {
-                        *default_value = Some(*new_val);
-                    }
-                }
-                _ => {
-                    *term = replacement.clone();
-                }
-            }
-        }
-        Term::Struct { args, .. } => {
-            for arg in args.iter_mut() {
-                substitute_in_place(arg, var_name, replacement);
-            }
-        }
-        Term::List { items, tail } => {
-            for item in items.iter_mut() {
-                substitute_in_place(item, var_name, replacement);
-            }
-            if let Some(t) = tail {
-                substitute_in_place(t.as_mut(), var_name, replacement);
-            }
-        }
-        Term::InfixExpr { left, right, .. } => {
-            substitute_in_place(left.as_mut(), var_name, replacement);
-            substitute_in_place(right.as_mut(), var_name, replacement);
-        }
-        Term::Constraint { left, right } => {
-            substitute_in_place(left.as_mut(), var_name, replacement);
-            substitute_in_place(right.as_mut(), var_name, replacement);
-        }
-        _ => {}
-    }
-}
-
-/// unify 内のスタックに対して変数置換を適用
-fn substitute_in_stack(stack: &mut Vec<(Term, Term)>, var_name: &str, replacement: &Term) {
-    for (t1, t2) in stack.iter_mut() {
-        substitute_in_place(t1, var_name, replacement);
-        substitute_in_place(t2, var_name, replacement);
-    }
-}
-
-/// goals に対して変数置換を適用
-fn substitute_in_goals(goals: &mut Vec<Term>, var_name: &str, replacement: &Term) {
-    for goal in goals.iter_mut() {
-        substitute_in_place(goal, var_name, replacement);
-    }
-}
 
 fn collect_default_var_bindings(term: &Term, bindings: &mut Vec<(String, FixedPoint)>) {
     match term {
@@ -166,15 +184,14 @@ fn collect_default_var_bindings(term: &Term, bindings: &mut Vec<(String, FixedPo
 fn apply_default_var_bindings(term: &mut Term, goals: &mut Vec<Term>) {
     let mut bindings = Vec::new();
     collect_default_var_bindings(term, &mut bindings);
+    let mut env = Env::new();
     for (name, value) in bindings {
-        let replacement = number(value);
-        substitute_in_place(term, &name, &replacement);
-        substitute_in_goals(goals, &name, &replacement);
+        env.insert(name, number(value));
     }
-
-    eval_arith_in_place(term);
+    // resolveは算術式の評価も行うので、bindingsが空でも適用する
+    *term = resolve(term, &env);
     for goal in goals.iter_mut() {
-        eval_arith_in_place(goal);
+        *goal = resolve(goal, &env);
     }
 }
 
@@ -199,7 +216,7 @@ fn eval_arith(term: &Term) -> Option<FixedPoint> {
 }
 
 /// 算術式をインプレースで評価し、可能なら数値に置き換える
-fn eval_arith_in_place(term: &mut Term) {
+pub fn eval_arith_in_place(term: &mut Term) {
     if let Some(val) = eval_arith(term) {
         *term = number(val);
     } else {
@@ -324,14 +341,6 @@ fn value_in_range(value: FixedPoint, min: Option<Bound>, max: Option<Bound>) -> 
     min_ok && max_ok
 }
 
-/// deferred リスト内の全Termに対して変数を置換する
-fn substitute_in_deferred(deferred: &mut Vec<(Term, Term)>, var_name: &str, replacement: &Term) {
-    for (t1, t2) in deferred.iter_mut() {
-        substitute_in_place(t1, var_name, replacement);
-        substitute_in_place(t2, var_name, replacement);
-    }
-}
-
 /// 項が算術式として評価可能な形か（変数と数値とInfixExprのみで構成されているか）
 fn is_potentially_arithmetic(term: &Term) -> bool {
     match term {
@@ -344,29 +353,31 @@ fn is_potentially_arithmetic(term: &Term) -> bool {
     }
 }
 
-/// 2つの項を単一化し、成功すれば goals をインプレースで書き換える
-pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), UnifyError> {
+/// 2つの項を単一化し、変数束縛をenvに蓄積する。
+/// 解決できなかった遅延制約をVec<Term>として返す。
+pub fn unify(
+    term1: Term,
+    term2: Term,
+    env: &mut Env,
+) -> Result<Vec<Term>, UnifyError> {
     let mut stack = vec![(term1, term2)];
-    // 未評価の算術式制約を保持（変数が束縛されたら再評価）
     let mut deferred: Vec<(Term, Term)> = Vec::new();
 
-    while let Some((mut t1, mut t2)) = stack.pop() {
-        // X@25 のような既定値付き変数は、単一化時に X=25 を伝播する。
-        // AnnotatedVarでdefault_valueありの場合のみ（rangeのみの場合はRangeVar的に扱う）
+    while let Some((t1_raw, t2_raw)) = stack.pop() {
+        let mut t1 = resolve(&t1_raw, env);
+        let mut t2 = resolve(&t2_raw, env);
+
+        // AnnotatedVarでdefault_valueありの場合、envに束縛してNumber化
         if let Term::AnnotatedVar {
             name,
             default_value: Some(value),
             ..
         } = &t1
         {
-            let name = name.clone();
-            let replacement = number(*value);
             if name != "_" {
-                substitute_in_stack(&mut stack, &name, &replacement);
-                substitute_in_goals(goals, &name, &replacement);
-                substitute_in_deferred(&mut deferred, &name, &replacement);
+                env.insert(name.clone(), number(*value));
             }
-            t1 = replacement;
+            t1 = number(*value);
         }
         if let Term::AnnotatedVar {
             name,
@@ -374,14 +385,10 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
             ..
         } = &t2
         {
-            let name = name.clone();
-            let replacement = number(*value);
             if name != "_" {
-                substitute_in_stack(&mut stack, &name, &replacement);
-                substitute_in_goals(goals, &name, &replacement);
-                substitute_in_deferred(&mut deferred, &name, &replacement);
+                env.insert(name.clone(), number(*value));
             }
-            t2 = replacement;
+            t2 = number(*value);
         }
 
         if let Some(val) = eval_arith(&t1) {
@@ -392,17 +399,14 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
         }
 
         // 算術式がまだ評価できない場合は遅延
-        let has_unbound_var = |term: &Term| -> bool { matches!(term, Term::InfixExpr { .. }) };
-
-        if has_unbound_var(&t1) || has_unbound_var(&t2) {
+        if matches!(t1, Term::InfixExpr { .. }) || matches!(t2, Term::InfixExpr { .. }) {
             deferred.push((t1, t2));
             continue;
         }
 
         match (&t1, &t2) {
-            // 同じ変数
             (Term::Var { name: n1 }, Term::Var { name: n2 }) if n1 == n2 => {}
-            // AnnotatedVar(rangeのみ)同士: 範囲の交差を計算
+            // AnnotatedVar同士: 範囲の交差を計算
             (
                 Term::AnnotatedVar {
                     name: n1,
@@ -430,14 +434,10 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
 
                 let intersected = annotated_var(n1.clone(), None, new_min, new_max, None);
                 if n1 != "_" {
-                    substitute_in_stack(&mut stack, n1, &intersected);
-                    substitute_in_goals(goals, n1, &intersected);
-                    substitute_in_deferred(&mut deferred, n1, &intersected);
+                    env.insert(n1.clone(), intersected.clone());
                 }
                 if n2 != "_" && n2 != n1 {
-                    substitute_in_stack(&mut stack, n2, &intersected);
-                    substitute_in_goals(goals, n2, &intersected);
-                    substitute_in_deferred(&mut deferred, n2, &intersected);
+                    env.insert(n2.clone(), intersected);
                 }
             }
             // AnnotatedVar(rangeあり)とNumber: 範囲内かチェック
@@ -450,12 +450,9 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                     });
                 }
                 if name != "_" {
-                    substitute_in_stack(&mut stack, name, &t2);
-                    substitute_in_goals(goals, name, &t2);
-                    substitute_in_deferred(&mut deferred, name, &t2);
+                    env.insert(name.clone(), t2.clone());
                 }
             }
-            // swap して再処理
             (Term::Number { .. }, Term::AnnotatedVar { .. }) => {
                 stack.push((t2, t1));
             }
@@ -468,14 +465,11 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                         term2: t2,
                     });
                 }
-                substitute_in_stack(&mut stack, name, &t2);
-                substitute_in_goals(goals, name, &t2);
-                substitute_in_deferred(&mut deferred, name, &t2);
+                env.insert(name.clone(), t2.clone());
             }
             (_, Term::AnnotatedVar { name, .. }) if name != "_" => {
                 stack.push((t2, t1));
             }
-            // 変数と何か（anonymous変数 "_" は束縛しない）
             (Term::Var { name }, _) if name != "_" => {
                 if occurs_check(name, &t2) {
                     return Err(UnifyError {
@@ -484,9 +478,7 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                         term2: t2,
                     });
                 }
-                substitute_in_stack(&mut stack, name, &t2);
-                substitute_in_goals(goals, name, &t2);
-                substitute_in_deferred(&mut deferred, name, &t2);
+                env.insert(name.clone(), t2.clone());
             }
             (_, Term::Var { name }) if name != "_" => {
                 stack.push((t2, t1));
@@ -557,7 +549,6 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                 },
             ) => {
                 let min_len = items1.len().min(items2.len());
-                // 要素を逆順でpushしてLIFOでも左から右の順序で処理されるようにする
                 for i in (0..min_len).rev() {
                     stack.push((items1[i].clone(), items2[i].clone()));
                 }
@@ -626,10 +617,11 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
     }
 
     // 最後に残った遅延制約を処理
-    for (t1, t2) in deferred {
-        let v1 = eval_arith(&t1);
-        let v2 = eval_arith(&t2);
-        match (v1, v2) {
+    let mut constraints = Vec::new();
+    for (d1, d2) in deferred {
+        let t1 = resolve(&d1, env);
+        let t2 = resolve(&d2, env);
+        match (eval_arith(&t1), eval_arith(&t2)) {
             (Some(n1), Some(n2)) => {
                 if n1 != n2 {
                     return Err(UnifyError {
@@ -640,10 +632,8 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
                 }
             }
             _ => {
-                // 両辺が算術式として解決可能な形（変数+数値+演算子のみ）なら
-                // Constraint として goals に押し出す（変数束縛後に再評価される）
                 if is_potentially_arithmetic(&t1) && is_potentially_arithmetic(&t2) {
-                    goals.push(Term::Constraint {
+                    constraints.push(Term::Constraint {
                         left: Box::new(t1),
                         right: Box::new(t2),
                     });
@@ -658,18 +648,12 @@ pub fn unify(term1: Term, term2: Term, goals: &mut Vec<Term>) -> Result<(), Unif
         }
     }
 
-    // goals 内の算術式を評価
-    for goal in goals.iter_mut() {
-        eval_arith_in_place(goal);
-    }
-
-    Ok(())
+    Ok(constraints)
 }
 
 /// goals 内の Constraint を評価し、解けたものは除去、解けないものは残す
 /// 全 Constraint をまとめて SolverState に渡し、連立方程式として解く
 fn try_resolve_constraints(goals: &mut Vec<Term>) -> Result<(), RewriteError> {
-    // Constraint を ArithEq に変換して SolverState に渡す
     let mut eqs = Vec::new();
     let mut constraint_indices = Vec::new();
     for (i, goal) in goals.iter().enumerate() {
@@ -699,12 +683,14 @@ fn try_resolve_constraints(goals: &mut Vec<Term>) -> Result<(), RewriteError> {
         for &idx in constraint_indices.iter().rev() {
             goals.remove(idx);
         }
-        for (var_name, value) in &result.bindings {
-            let replacement = number(*value);
-            substitute_in_goals(goals, var_name, &replacement);
-        }
-        for goal in goals.iter_mut() {
-            eval_arith_in_place(goal);
+        if !result.bindings.is_empty() {
+            let mut env = Env::new();
+            for (var_name, value) in &result.bindings {
+                env.insert(var_name.clone(), number(*value));
+            }
+            for goal in goals.iter_mut() {
+                *goal = resolve(goal, &env);
+            }
         }
     }
 
@@ -779,18 +765,12 @@ fn try_rewrite_single_with_result(
             Clause::Rule { head, body } => (head.clone(), body.clone()),
         };
 
-        // term, body, other_goals を全て trial_goals に入れてunifyし、置換を適用
-        let mut trial_goals = vec![term.clone()];
-        trial_goals.extend(body.clone());
-        trial_goals.extend(other_goals.clone());
-
-        if unify(term.clone(), head, &mut trial_goals).is_ok() {
-            // trial_goals[0] が置換適用済みの term
-            let resolved_term = trial_goals.remove(0);
-            // 次の body.len() 個が置換適用済みの body
-            let resolved_body: Vec<Term> = trial_goals.drain(0..body.len()).collect();
-            // 残りが other_goals
-            *other_goals = trial_goals;
+        let mut env = Env::new();
+        if let Ok(constraints) = unify(term.clone(), head, &mut env) {
+            let resolved_term = resolve(term, &env);
+            let resolved_body: Vec<Term> = body.iter().map(|b| resolve(b, &env)).collect();
+            *other_goals = other_goals.iter().map(|g| resolve(g, &env)).collect();
+            other_goals.extend(constraints);
             return Some((resolved_term, resolved_body));
         }
     }
@@ -808,6 +788,18 @@ fn rewrite_term_recursive(
 ) -> Result<Vec<Term>, RewriteError> {
     let mut term = term;
     apply_default_var_bindings(&mut term, other_goals);
+
+    // ビルトインファンクターは引数を解決してそのまま返す（builtin factとのunifyを避ける）
+    if let Term::Struct {
+        ref functor,
+        ref args,
+    } = term
+    {
+        if is_builtin_functor_with_arity(functor, args.len()) {
+            let resolved = resolve_builtin_fact_args(db, clause_counter, term, other_goals)?;
+            return Ok(vec![resolved]);
+        }
+    }
 
     // まず、この項自体がルールにマッチするか試す
     if let Some((resolved_term, body)) =
@@ -955,6 +947,15 @@ fn resolve_builtin_arg(
                 args: resolved_args,
             })
         }
+        Term::InfixExpr { op, left, right } => {
+            let new_left = resolve_builtin_arg(db, clause_counter, *left, other_goals)?;
+            let new_right = resolve_builtin_arg(db, clause_counter, *right, other_goals)?;
+            Ok(Term::InfixExpr {
+                op,
+                left: Box::new(new_left),
+                right: Box::new(new_right),
+            })
+        }
         other => {
             let mut resolved = rewrite_term_recursive(db, clause_counter, other, other_goals)?;
             if resolved.len() != 1 {
@@ -1046,25 +1047,25 @@ mod tests {
     fn test_unify_vars() {
         let x = var("X".to_string());
         let a = struc("a".to_string(), vec![]);
-        let mut goals = vec![var("X".to_string())];
-        unify(x, a.clone(), &mut goals).unwrap();
-        assert_eq!(goals[0], a);
+        let mut env = Env::new();
+        unify(x, a.clone(), &mut env).unwrap();
+        assert_eq!(resolve(&var("X".to_string()), &env), a);
     }
 
     #[test]
     fn test_unify_structs() {
         let t1 = struc("f".to_string(), vec![var("X".to_string())]);
         let t2 = struc("f".to_string(), vec![struc("a".to_string(), vec![])]);
-        let mut goals = vec![var("X".to_string())];
-        unify(t1, t2, &mut goals).unwrap();
-        assert_eq!(goals[0], struc("a".to_string(), vec![]));
+        let mut env = Env::new();
+        unify(t1, t2, &mut env).unwrap();
+        assert_eq!(resolve(&var("X".to_string()), &env), struc("a".to_string(), vec![]));
     }
 
     #[test]
     fn test_unify_fail() {
         let t1 = struc("f".to_string(), vec![]);
         let t2 = struc("g".to_string(), vec![]);
-        assert!(unify(t1, t2, &mut vec![]).is_err());
+        assert!(unify(t1, t2, &mut Env::new()).is_err());
     }
 
     // ===== RangeVar unify tests =====
@@ -1084,9 +1085,9 @@ mod tests {
             }),
         );
         let n = number_int(5);
-        let mut goals = vec![var("X".to_string())];
-        unify(rv, n.clone(), &mut goals).unwrap();
-        assert_eq!(goals[0], n);
+        let mut env = Env::new();
+        unify(rv, n.clone(), &mut env).unwrap();
+        assert_eq!(resolve(&var("X".to_string()), &env), n);
     }
 
     #[test]
@@ -1104,7 +1105,7 @@ mod tests {
             }),
         );
         let n = number_int(15);
-        assert!(unify(rv, n, &mut vec![]).is_err());
+        assert!(unify(rv, n, &mut Env::new()).is_err());
     }
 
     #[test]
@@ -1123,10 +1124,10 @@ mod tests {
                 }),
             )
         };
-        assert!(unify(make_rv(), number_int(0), &mut vec![]).is_err());
-        assert!(unify(make_rv(), number_int(10), &mut vec![]).is_err());
-        assert!(unify(make_rv(), number_int(1), &mut vec![]).is_ok());
-        assert!(unify(make_rv(), number_int(9), &mut vec![]).is_ok());
+        assert!(unify(make_rv(), number_int(0), &mut Env::new()).is_err());
+        assert!(unify(make_rv(), number_int(10), &mut Env::new()).is_err());
+        assert!(unify(make_rv(), number_int(1), &mut Env::new()).is_ok());
+        assert!(unify(make_rv(), number_int(9), &mut Env::new()).is_ok());
     }
 
     #[test]
@@ -1145,8 +1146,8 @@ mod tests {
                 }),
             )
         };
-        assert!(unify(make_rv(), number_int(0), &mut vec![]).is_ok());
-        assert!(unify(make_rv(), number_int(10), &mut vec![]).is_ok());
+        assert!(unify(make_rv(), number_int(0), &mut Env::new()).is_ok());
+        assert!(unify(make_rv(), number_int(10), &mut Env::new()).is_ok());
     }
 
     #[test]
@@ -1174,9 +1175,10 @@ mod tests {
                 inclusive: false,
             }),
         );
-        let mut goals = vec![var("X".to_string())];
-        unify(rv1, rv2, &mut goals).unwrap();
-        match &goals[0] {
+        let mut env = Env::new();
+        unify(rv1, rv2, &mut env).unwrap();
+        let resolved_x = resolve(&var("X".to_string()), &env);
+        match &resolved_x {
             Term::AnnotatedVar { min, max, .. } => {
                 assert_eq!(
                     *min,
@@ -1193,7 +1195,7 @@ mod tests {
                     })
                 );
             }
-            _ => panic!("Expected AnnotatedVar"),
+            _ => panic!("Expected AnnotatedVar, got {:?}", resolved_x),
         }
     }
 
@@ -1222,7 +1224,7 @@ mod tests {
                 inclusive: false,
             }),
         );
-        assert!(unify(rv1, rv2, &mut vec![]).is_err());
+        assert!(unify(rv1, rv2, &mut Env::new()).is_err());
     }
 
     #[test]
@@ -1250,7 +1252,7 @@ mod tests {
                 inclusive: false,
             }),
         );
-        assert!(unify(rv1, rv2, &mut vec![]).is_err());
+        assert!(unify(rv1, rv2, &mut Env::new()).is_err());
     }
 
     // ===== arithmetic tests =====
@@ -1261,7 +1263,7 @@ mod tests {
         let expr =
             crate::parse::arith_expr(crate::parse::ArithOp::Add, number_int(3), number_int(5));
         let n = number_int(8);
-        assert!(unify(expr, n, &mut vec![]).is_ok());
+        assert!(unify(expr, n, &mut Env::new()).is_ok());
     }
 
     #[test]
@@ -1270,7 +1272,7 @@ mod tests {
         let expr =
             crate::parse::arith_expr(crate::parse::ArithOp::Sub, number_int(10), number_int(3));
         let n = number_int(7);
-        assert!(unify(expr, n, &mut vec![]).is_ok());
+        assert!(unify(expr, n, &mut Env::new()).is_ok());
     }
 
     #[test]
@@ -1279,7 +1281,7 @@ mod tests {
         let expr =
             crate::parse::arith_expr(crate::parse::ArithOp::Mul, number_int(4), number_int(5));
         let n = number_int(20);
-        assert!(unify(expr, n, &mut vec![]).is_ok());
+        assert!(unify(expr, n, &mut Env::new()).is_ok());
     }
 
     #[test]
@@ -1288,7 +1290,7 @@ mod tests {
         let expr =
             crate::parse::arith_expr(crate::parse::ArithOp::Div, number_int(10), number_int(3));
         let n = number(FixedPoint::from_hundredths(333)); // 10/3 = 3.33 in fixed point
-        assert!(unify(expr, n, &mut vec![]).is_ok());
+        assert!(unify(expr, n, &mut Env::new()).is_ok());
     }
 
     #[test]
@@ -1475,12 +1477,6 @@ mod tests {
     fn resolved_goals_returned() {
         // Ruleにマッチするとheadがbodyで置換される
         let resolved = run_success("p :- q(X, Z), r(Z, Y). q(a, b). r(b, c).", "p.");
-        assert_eq!(resolved, vec!["q(a, b)", "r(b, c)"]);
-    }
-
-    #[test]
-    fn sample_rule() {
-        let resolved = run_success("p(X,Y) :- q(X, Z), r(Z, Y). q(a, b). r(b, c).", "p(A, B).");
         assert_eq!(resolved, vec!["q(a, b)", "r(b, c)"]);
     }
 

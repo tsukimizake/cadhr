@@ -3,7 +3,7 @@
 //! Term（書き換え後の項）を ManifoldExpr 中間表現に変換し、
 //! それを manifold-rs の Manifold オブジェクトに評価する。
 
-use crate::parse::{ArithOp, SrcSpan, Term, term_as_fixed_point};
+use crate::parse::{ArithOp, FixedPoint, SrcSpan, Term, term_as_fixed_point};
 use cadhr_lang_macros::define_manifold_expr;
 use manifold_rs::{Manifold, Mesh};
 use std::fmt;
@@ -67,6 +67,14 @@ define_manifold_expr! {
     Revolve { profile: Box<ManifoldExpr>, degrees: TrackedF64, segments: u32 };
     Polyhedron { points: Vec<f64>, faces: Vec<Vec<u32>> };
     Stl { path: String };
+    @also_arity(3) @no_variant
+    Control { x: TrackedF64, y: TrackedF64, z: TrackedF64, name: String };
+}
+
+pub fn is_builtin_functor_with_arity(functor: &str, arity: usize) -> bool {
+    BUILTIN_FUNCTORS
+        .iter()
+        .any(|(name, arities)| *name == functor && arities.contains(&arity))
 }
 
 /// 変換エラー
@@ -131,6 +139,189 @@ impl fmt::Display for ConversionError {
 }
 
 impl std::error::Error for ConversionError {}
+
+// ============================================================
+// ControlPoint: ドラッグ可能なコントロールポイント
+// ============================================================
+
+#[derive(Debug, Clone)]
+pub struct ControlPoint {
+    pub x: TrackedF64,
+    pub y: TrackedF64,
+    pub z: TrackedF64,
+    pub name: Option<String>,
+    /// リネーム前の変数名 (サフィックス _\d+ 除去済み)。x,y,zそれぞれに対応。
+    pub var_names: [Option<String>; 3],
+}
+
+/// TermからTrackedF64を抽出する。Number, AnnotatedVar(デフォルト値あり), Var(0にフォールバック)に対応。
+fn term_to_tracked_f64(term: &Term) -> Option<TrackedF64> {
+    if let Some((fp, span)) = term_as_fixed_point(term) {
+        return Some(TrackedF64 {
+            value: fp.to_f64(),
+            source_span: span,
+        });
+    }
+    match term {
+        Term::AnnotatedVar {
+            default_value: Some(fp),
+            span,
+            ..
+        } => Some(TrackedF64 {
+            value: fp.to_f64(),
+            source_span: *span,
+        }),
+        Term::AnnotatedVar { span, .. } => Some(TrackedF64 {
+            value: 0.0,
+            source_span: *span,
+        }),
+        Term::Var { .. } => Some(TrackedF64 {
+            value: 0.0,
+            source_span: None,
+        }),
+        _ => None,
+    }
+}
+
+/// Var/AnnotatedVarから変数名を取り出す
+fn var_name(term: &Term) -> Option<&str> {
+    match term {
+        Term::Var { name } | Term::AnnotatedVar { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
+/// control(X,Y,Z) / control(X,Y,Z,Name) のTermを抽出し、残りのTermを返す。
+/// control座標がVarの場合、同名の変数を残りのtermsからも置換する。
+pub fn extract_control_points(terms: &mut Vec<Term>) -> Vec<ControlPoint> {
+    let mut control_points = Vec::new();
+    // Var名 → 置換するNumber値 のマッピング
+    let mut var_substitutions: Vec<(String, FixedPoint)> = Vec::new();
+
+    terms.retain(|term| {
+        if let Term::Struct { functor, args } = term {
+            if functor == "control" && (args.len() == 3 || args.len() == 4) {
+                let x = term_to_tracked_f64(&args[0]);
+                let y = term_to_tracked_f64(&args[1]);
+                let z = term_to_tracked_f64(&args[2]);
+                let name = if args.len() == 4 {
+                    match &args[3] {
+                        Term::StringLit { value } => Some(value.clone()),
+                        Term::Struct { functor, args } if args.is_empty() => {
+                            Some(functor.clone())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let (Some(x), Some(y), Some(z)) = (x, y, z) {
+                    let mut vnames: [Option<String>; 3] = [None, None, None];
+                    for (idx, (arg, val)) in [(&args[0], x.value), (&args[1], y.value), (&args[2], z.value)].iter().enumerate() {
+                        if let Some(vname) = var_name(arg) {
+                            vnames[idx] = Some(strip_rename_suffix(vname).to_string());
+                            var_substitutions.push((vname.to_string(), FixedPoint::from_hundredths((val * 100.0).round() as i64)));
+                        }
+                    }
+                    control_points.push(ControlPoint { x, y, z, name, var_names: vnames });
+                    return false;
+                }
+            }
+        }
+        true
+    });
+
+    // 残りのtermsに変数置換を適用し、算術式を評価
+    if !var_substitutions.is_empty() {
+        for term in terms.iter_mut() {
+            substitute_vars(term, &var_substitutions);
+            crate::term_rewrite::eval_arith_in_place(term);
+        }
+    }
+
+    control_points
+}
+
+fn substitute_vars(term: &mut Term, subs: &[(String, FixedPoint)]) {
+    match term {
+        Term::Var { name } | Term::AnnotatedVar { name, .. } => {
+            if let Some((_, val)) = subs.iter().find(|(n, _)| n == name) {
+                *term = Term::Number { value: *val };
+            }
+        }
+        Term::Struct { args, .. } => {
+            for arg in args.iter_mut() {
+                substitute_vars(arg, subs);
+            }
+        }
+        Term::InfixExpr { left, right, .. } => {
+            substitute_vars(left, subs);
+            substitute_vars(right, subs);
+        }
+        Term::List { items, tail } => {
+            for item in items.iter_mut() {
+                substitute_vars(item, subs);
+            }
+            if let Some(t) = tail {
+                substitute_vars(t, subs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// リネームサフィックス `_\d+` を除去して元の変数名を返す
+fn strip_rename_suffix(name: &str) -> &str {
+    if let Some(pos) = name.rfind('_') {
+        let suffix = &name[pos + 1..];
+        if pos > 0 && !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return &name[..pos];
+        }
+    }
+    name
+}
+
+/// override mapに基づいてterms中のVar/AnnotatedVarを置換する
+pub fn apply_var_overrides(terms: &mut Vec<Term>, overrides: &std::collections::HashMap<String, f64>) {
+    if overrides.is_empty() {
+        return;
+    }
+    for term in terms.iter_mut() {
+        apply_var_overrides_to_term(term, overrides);
+        crate::term_rewrite::eval_arith_in_place(term);
+    }
+}
+
+fn apply_var_overrides_to_term(term: &mut Term, overrides: &std::collections::HashMap<String, f64>) {
+    match term {
+        Term::Var { name } | Term::AnnotatedVar { name, .. } => {
+            let base = strip_rename_suffix(name);
+            if let Some(&val) = overrides.get(base) {
+                *term = Term::Number {
+                    value: FixedPoint::from_hundredths((val * 100.0).round() as i64),
+                };
+            }
+        }
+        Term::Struct { args, .. } => {
+            for arg in args.iter_mut() {
+                apply_var_overrides_to_term(arg, overrides);
+            }
+        }
+        Term::InfixExpr { left, right, .. } => {
+            apply_var_overrides_to_term(left, overrides);
+            apply_var_overrides_to_term(right, overrides);
+        }
+        Term::List { items, tail } => {
+            for item in items.iter_mut() {
+                apply_var_overrides_to_term(item, overrides);
+            }
+            if let Some(t) = tail {
+                apply_var_overrides_to_term(t, overrides);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// 引数抽出用ヘルパー
 struct Args<'a> {
@@ -525,6 +716,10 @@ impl ManifoldExpr {
                 Ok(ManifoldExpr::Stl { path })
             }
             ManifoldTag::Stl => Err(a.arity_error("1")),
+
+            ManifoldTag::Control => Err(ConversionError::UnknownPrimitive(
+                "control is a data constructor, not a shape primitive".to_string(),
+            )),
         }
     }
 
@@ -1193,5 +1388,213 @@ mod tests {
         assert!(mesh.vertices().len() > 0);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_extract_control_points() {
+        let cube = struc(
+            "cube".into(),
+            vec![number_int(10), number_int(20), number_int(30)],
+        );
+        let cp1 = struc(
+            "control".into(),
+            vec![number_int(1), number_int(2), number_int(3)],
+        );
+        let cp2 = struc(
+            "control".into(),
+            vec![
+                number_int(4),
+                number_int(5),
+                number_int(6),
+                string_lit("origin".into()),
+            ],
+        );
+        let mut terms = vec![cube, cp1, cp2];
+        let cps = extract_control_points(&mut terms);
+        assert_eq!(terms.len(), 1); // cube remains
+        assert_eq!(cps.len(), 2);
+        assert_eq!(cps[0].x.value, 1.0);
+        assert_eq!(cps[0].y.value, 2.0);
+        assert_eq!(cps[0].z.value, 3.0);
+        assert!(cps[0].name.is_none());
+        assert_eq!(cps[1].x.value, 4.0);
+        assert_eq!(cps[1].name.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn test_extract_control_points_with_var() {
+        let cube = struc(
+            "cube".into(),
+            vec![number_int(10), number_int(20), number_int(30)],
+        );
+        let cp = struc(
+            "control".into(),
+            vec![var("X".into()), number_int(0), number_int(0)],
+        );
+        let mut terms = vec![cube, cp];
+        let cps = extract_control_points(&mut terms);
+        assert_eq!(terms.len(), 1);
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].x.value, 0.0); // Varは0にフォールバック
+        assert_eq!(cps[0].var_names[0].as_deref(), Some("X"));
+        assert!(cps[0].var_names[1].is_none());
+        assert!(cps[0].var_names[2].is_none());
+    }
+
+    #[test]
+    fn test_control_shared_var_with_geometry() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let mut db = database(
+            "main :- extrude(polygon([p(0, 0), p(0, 40), p(30, 0)]), X@10), control(X, 0, 0, \"width\")."
+        ).unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let mut resolved = execute(&mut db, q).unwrap();
+        let cps = extract_control_points(&mut resolved);
+
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].name.as_deref(), Some("width"));
+        // X@10 のデフォルト値がcontrolにも伝播
+        assert_eq!(cps[0].x.value, 10.0);
+        // 残りのgeometryでメッシュ生成が成功する
+        assert_eq!(resolved.len(), 1);
+        let (mesh, _) = generate_mesh_and_tree_from_terms(&resolved, &[]).unwrap();
+        assert!(mesh.vertices().len() > 0);
+    }
+
+    #[test]
+    fn test_control_shared_var_without_default() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        // X@なし: controlのVar座標が0にフォールバックし、extrude側にも0が代入される
+        let mut db = database(
+            "main :- extrude(polygon([p(0, 0), p(0, 40), p(30, 0)]), X), control(X, -10, -10).",
+        )
+        .unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let mut resolved = execute(&mut db, q).unwrap();
+        let cps = extract_control_points(&mut resolved);
+
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].x.value, 0.0);
+        assert_eq!(cps[0].y.value, -10.0);
+        assert_eq!(cps[0].z.value, -10.0);
+        // Xが0に代入されたのでメッシュ生成がエラーにならない（高さ0のextrudeは空メッシュ）
+        assert_eq!(resolved.len(), 1);
+        let _result = generate_mesh_and_tree_from_terms(&resolved, &[]).unwrap();
+    }
+
+    #[test]
+    fn test_control_shared_var_in_arith_expr() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let mut db = database(
+            "main :- polygon([p(0,0), p(0,40), p(30,0)]) |> extrude(X+1), control(X, -10, -10).",
+        )
+        .unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let mut resolved = execute(&mut db, q).unwrap();
+        let cps = extract_control_points(&mut resolved);
+
+        assert_eq!(cps.len(), 1);
+        assert_eq!(resolved.len(), 1);
+        let _result = generate_mesh_and_tree_from_terms(&resolved, &[]).unwrap();
+    }
+
+    #[test]
+    fn test_control_is_builtin_functor() {
+        assert!(is_builtin_functor("control"));
+    }
+
+    #[test]
+    fn test_strip_rename_suffix() {
+        assert_eq!(strip_rename_suffix("X_1"), "X");
+        assert_eq!(strip_rename_suffix("Foo_123"), "Foo");
+        assert_eq!(strip_rename_suffix("X"), "X");
+        assert_eq!(strip_rename_suffix("X_abc"), "X_abc");
+        assert_eq!(strip_rename_suffix("_1"), "_1"); // 空になるケースは除去しない（rfind('_')=0, prefix=""）
+    }
+
+    #[test]
+    fn test_resolved_var_names_after_execute() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        // クエリの変数名を確認
+        let mut db = database(
+            "box(X) :- cube(X, X, X).\nmain :- box(10), box(20), control(X, 0, 0).",
+        ).unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let resolved = execute(&mut db, q).unwrap();
+        eprintln!("case1: {:?}", resolved);
+
+        // 2つのcontrolが同じ変数名Xを使うケース
+        let mut db2 = database(
+            "main :- cube(X+Y, 20, 30), control(X, 0, 0), control(Y, 0, 0).",
+        ).unwrap();
+        let (_, q2) = parse_query("main.").unwrap();
+        let resolved2 = execute(&mut db2, q2).unwrap();
+        eprintln!("case2: {:?}", resolved2);
+
+        // ルール経由で同名変数が複数スコープに存在するケース
+        let mut db3 = database(
+            "helper(X) :- cube(X, X, X), control(X, 0, 0).\nmain :- helper(10), helper(20).",
+        ).unwrap();
+        let (_, q3) = parse_query("main.").unwrap();
+        let resolved3 = execute(&mut db3, q3).unwrap();
+        eprintln!("case3: {:?}", resolved3);
+    }
+
+    #[test]
+    fn test_apply_var_overrides() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+        use std::collections::HashMap;
+
+        let mut db = database(
+            "main :- cube(X+10, 20, 30), control(X, 0, 0).",
+        ).unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let mut resolved = execute(&mut db, q).unwrap();
+
+        let mut overrides = HashMap::new();
+        overrides.insert("X".to_string(), 5.0);
+        apply_var_overrides(&mut resolved, &overrides);
+
+        let cps = extract_control_points(&mut resolved);
+        assert_eq!(cps.len(), 1);
+        assert_eq!(resolved.len(), 1);
+        // cube(X+10, 20, 30) where X=5 → cube(15, 20, 30)
+        let (mesh, _) = generate_mesh_and_tree_from_terms(&resolved, &[]).unwrap();
+        assert!(mesh.vertices().len() > 0);
+    }
+
+    #[test]
+    fn test_apply_var_overrides_no_cross_contamination() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+        use std::collections::HashMap;
+
+        // box(X)が2回使われ、control(X,0,0)のXはクエリ由来
+        // overrideはcontrolのXのみに影響し、box(10),box(20)は変わらないはず
+        let mut db = database(
+            "box(X) :- cube(X, X, X).\nmain :- box(10), box(20), control(X, 0, 0).",
+        ).unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let mut resolved = execute(&mut db, q).unwrap();
+
+        let mut overrides = HashMap::new();
+        overrides.insert("X".to_string(), 5.0);
+        apply_var_overrides(&mut resolved, &overrides);
+
+        let cps = extract_control_points(&mut resolved);
+        assert_eq!(cps.len(), 1);
+        // box(10)→cube(10,10,10), box(20)→cube(20,20,20) が残るはず
+        assert_eq!(resolved.len(), 2);
+        let (mesh, _) = generate_mesh_and_tree_from_terms(&resolved, &[]).unwrap();
+        assert!(mesh.vertices().len() > 0);
     }
 }
