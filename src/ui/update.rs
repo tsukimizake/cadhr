@@ -68,6 +68,7 @@ pub(super) fn egui_ui(
     error_message: Res<ErrorMessage>,
     current_file_path: Res<CurrentFilePath>,
     meshes: Res<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     // Parse editable vars if not yet populated (e.g. initial load, session load)
     if editable_vars.is_empty() && !editor_text.is_empty() {
@@ -283,6 +284,25 @@ pub(super) fn egui_ui(
                             }
                         }
                     });
+                // Update control sphere colors based on selection
+                for (_, target) in preview_targets.iter() {
+                    let is_selected_preview = selected_cp.preview_id == Some(target.preview_id);
+                    for (ci, entity) in target.control_sphere_entities.iter().enumerate() {
+                        let selected = is_selected_preview && selected_cp.index == ci;
+                        let color = if selected {
+                            Color::srgb(0.0, 1.0, 0.5)
+                        } else {
+                            Color::srgb(1.0, 0.9, 0.0)
+                        };
+                        let mat = materials.add(StandardMaterial {
+                            base_color: color,
+                            unlit: true,
+                            ..default()
+                        });
+                        commands.entity(*entity).insert(MeshMaterial3d(mat));
+                    }
+                }
+
                 // Send update requests
                 for (preview_id, query) in updates_to_send {
                     let overrides = preview_targets
@@ -924,8 +944,8 @@ fn preview_target_ui(
                     let v = (pos.y - rect.min.y) / rect.height();
                     let (ray_origin, ray_dir) = generate_ray_from_uv(u, v, target);
 
-                    // Ray-sphere intersection for each control point
-                    let sphere_radius = 0.5_f64;
+                    // Ray-sphere intersection with larger radius for easier clicking
+                    let sphere_radius = 1.5_f64;
                     let mut best_hit: Option<(f64, usize)> = None;
                     for (ci, cp) in target.control_points.iter().enumerate() {
                         let center = [cp.x.value, cp.y.value, cp.z.value];
