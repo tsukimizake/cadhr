@@ -5,7 +5,7 @@ use bevy::{mesh::Indices, prelude::*};
 use bevy_async_ecs::AsyncWorld;
 
 use crate::events::{CadhrLangOutput, GeneratePreviewRequest, PreviewGenerated};
-use cadhr_lang::manifold_bridge::{apply_var_overrides, extract_control_points, generate_mesh_and_tree_from_terms};
+use cadhr_lang::manifold_bridge::{extract_control_points, generate_mesh_and_tree_from_terms};
 use cadhr_lang::parse::{database, query as parse_query};
 use cadhr_lang::term_rewrite::execute;
 use manifold_rs::Mesh as RsMesh;
@@ -56,9 +56,7 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
 
                 logs.push(format!("Resolved terms: {:?}", resolved));
 
-                apply_var_overrides(&mut resolved, &req.control_point_overrides);
-
-                let control_points = extract_control_points(&mut resolved);
+                let control_points = extract_control_points(&mut resolved, &req.control_point_overrides);
 
                 if resolved.is_empty() {
                     // control pointsのみでgeometryがない場合、空メッシュを返す
@@ -72,7 +70,8 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
                 let (rs_mesh, evaluated_nodes) = generate_mesh_and_tree_from_terms(&resolved, &req.include_paths)
                     .map_err(|e| format!("Mesh error: {}", e))?;
 
-                Ok((rs_mesh_to_bevy_mesh(&rs_mesh), evaluated_nodes, control_points))
+                let bevy_mesh = rs_mesh_to_bevy_mesh(&rs_mesh)?;
+                Ok((bevy_mesh, evaluated_nodes, control_points))
             })();
 
             let log_message = logs.join("\n");
@@ -112,17 +111,15 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
 }
 
 // Convert a manifold-rs Mesh into a Bevy Mesh
-fn rs_mesh_to_bevy_mesh(rs_mesh: &RsMesh) -> Mesh {
-    // Vertices are a flat Vec<f32> with `num_props` stride (first 3 are XYZ).
-    // 法線がプロパティに無い場合はpanicします（calculate_normalsを先に呼んでいることを想定）。
+fn rs_mesh_to_bevy_mesh(rs_mesh: &RsMesh) -> Result<Mesh, String> {
     let vertices = rs_mesh.vertices();
-    bevy::log::info!("manifold-rs mesh has {} vertices", vertices.len());
     let stride = rs_mesh.num_props() as usize;
-    bevy::log::info!("num_props (stride) = {}", stride);
-    assert!(
-        stride == 6,
-        "manifold-rs mesh has no normals; call calculate_normals(0, ...) before to_mesh()"
-    );
+    if stride != 6 {
+        return Err(format!(
+            "manifold-rs mesh has unexpected num_props={} (expected 6: xyz+normals)",
+            stride
+        ));
+    }
 
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(vertices.len() / stride);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity(vertices.len() / stride);
@@ -141,8 +138,7 @@ fn rs_mesh_to_bevy_mesh(rs_mesh: &RsMesh) -> Mesh {
     bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     bevy_mesh.insert_indices(Indices::U32(indices));
 
-    // Insert normals from manifold-rs (required by assertion above)
     bevy_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
 
-    bevy_mesh
+    Ok(bevy_mesh)
 }

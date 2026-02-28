@@ -193,7 +193,10 @@ fn var_name(term: &Term) -> Option<&str> {
 
 /// control(X,Y,Z) / control(X,Y,Z,Name) のTermを抽出し、残りのTermを返す。
 /// control座標がVarの場合、同名の変数を残りのtermsからも置換する。
-pub fn extract_control_points(terms: &mut Vec<Term>) -> Vec<ControlPoint> {
+pub fn extract_control_points(
+    terms: &mut Vec<Term>,
+    overrides: &std::collections::HashMap<String, f64>,
+) -> Vec<ControlPoint> {
     let mut control_points = Vec::new();
     // Var名 → 置換するNumber値 のマッピング
     let mut var_substitutions: Vec<(String, FixedPoint)> = Vec::new();
@@ -215,12 +218,23 @@ pub fn extract_control_points(terms: &mut Vec<Term>) -> Vec<ControlPoint> {
                 } else {
                     None
                 };
-                if let (Some(x), Some(y), Some(z)) = (x, y, z) {
+                if let (Some(mut x), Some(mut y), Some(mut z)) = (x, y, z) {
                     let mut vnames: [Option<String>; 3] = [None, None, None];
-                    for (idx, (arg, val)) in [(&args[0], x.value), (&args[1], y.value), (&args[2], z.value)].iter().enumerate() {
+                    let tracked = [&mut x, &mut y, &mut z];
+                    for (idx, arg) in [&args[0], &args[1], &args[2]].iter().enumerate() {
                         if let Some(vname) = var_name(arg) {
-                            vnames[idx] = Some(strip_rename_suffix(vname).to_string());
-                            var_substitutions.push((vname.to_string(), FixedPoint::from_hundredths((val * 100.0).round() as i64)));
+                            let base_name = strip_rename_suffix(vname).to_string();
+                            // overrideがあればその値を使い、なければデフォルト値を使う
+                            let val = overrides
+                                .get(&base_name)
+                                .copied()
+                                .unwrap_or(tracked[idx].value);
+                            tracked[idx].value = val;
+                            vnames[idx] = Some(base_name);
+                            var_substitutions.push((
+                                vname.to_string(),
+                                FixedPoint::from_hundredths((val * 100.0).round() as i64),
+                            ));
                         }
                     }
                     control_points.push(ControlPoint { x, y, z, name, var_names: vnames });
@@ -1410,7 +1424,7 @@ mod tests {
             ],
         );
         let mut terms = vec![cube, cp1, cp2];
-        let cps = extract_control_points(&mut terms);
+        let cps = extract_control_points(&mut terms, &Default::default());
         assert_eq!(terms.len(), 1); // cube remains
         assert_eq!(cps.len(), 2);
         assert_eq!(cps[0].x.value, 1.0);
@@ -1432,7 +1446,7 @@ mod tests {
             vec![var("X".into()), number_int(0), number_int(0)],
         );
         let mut terms = vec![cube, cp];
-        let cps = extract_control_points(&mut terms);
+        let cps = extract_control_points(&mut terms, &Default::default());
         assert_eq!(terms.len(), 1);
         assert_eq!(cps.len(), 1);
         assert_eq!(cps[0].x.value, 0.0); // Varは0にフォールバック
@@ -1451,7 +1465,7 @@ mod tests {
         ).unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let mut resolved = execute(&mut db, q).unwrap();
-        let cps = extract_control_points(&mut resolved);
+        let cps = extract_control_points(&mut resolved, &Default::default());
 
         assert_eq!(cps.len(), 1);
         assert_eq!(cps[0].name.as_deref(), Some("width"));
@@ -1475,7 +1489,7 @@ mod tests {
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let mut resolved = execute(&mut db, q).unwrap();
-        let cps = extract_control_points(&mut resolved);
+        let cps = extract_control_points(&mut resolved, &Default::default());
 
         assert_eq!(cps.len(), 1);
         assert_eq!(cps[0].x.value, 0.0);
@@ -1497,11 +1511,42 @@ mod tests {
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let mut resolved = execute(&mut db, q).unwrap();
-        let cps = extract_control_points(&mut resolved);
+        let cps = extract_control_points(&mut resolved, &Default::default());
 
         assert_eq!(cps.len(), 1);
         assert_eq!(resolved.len(), 1);
         let _result = generate_mesh_and_tree_from_terms(&resolved, &[]).unwrap();
+    }
+
+    #[test]
+    fn test_control_override_preserves_var_names() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let src = "main :- polygon([p(0,0), p(0,40), p(30,0)]) |> extrude(X+1), control(X, -10, -10).";
+        let mut db = database(src).unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+
+        // 初回: overridesなし
+        let mut resolved = execute(&mut db, q.clone()).unwrap();
+        let cps = extract_control_points(&mut resolved, &Default::default());
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].var_names[0], Some("X".to_string()));
+        assert_eq!(cps[0].x.value, 0.0); // Varフォールバック
+
+        // 2回目: X=5.0でoverride → var_namesが保持されること
+        let mut db2 = database(src).unwrap();
+        let (_, q2) = parse_query("main.").unwrap();
+        let mut resolved2 = execute(&mut db2, q2).unwrap();
+        let overrides = std::collections::HashMap::from([("X".to_string(), 5.0)]);
+        let cps2 = extract_control_points(&mut resolved2, &overrides);
+        assert_eq!(cps2.len(), 1);
+        assert_eq!(cps2[0].var_names[0], Some("X".to_string()));
+        assert_eq!(cps2[0].x.value, 5.0);
+        // 残りのtermsでextrude(polygon(...), 6)になっていること
+        assert_eq!(resolved2.len(), 1);
+        let (mesh, _) = generate_mesh_and_tree_from_terms(&resolved2, &[]).unwrap();
+        assert!(mesh.vertices().len() > 0);
     }
 
     #[test]
@@ -1564,7 +1609,7 @@ mod tests {
         overrides.insert("X".to_string(), 5.0);
         apply_var_overrides(&mut resolved, &overrides);
 
-        let cps = extract_control_points(&mut resolved);
+        let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
         assert_eq!(resolved.len(), 1);
         // cube(X+10, 20, 30) where X=5 → cube(15, 20, 30)
@@ -1590,7 +1635,7 @@ mod tests {
         overrides.insert("X".to_string(), 5.0);
         apply_var_overrides(&mut resolved, &overrides);
 
-        let cps = extract_control_points(&mut resolved);
+        let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
         // box(10)→cube(10,10,10), box(20)→cube(20,20,20) が残るはず
         assert_eq!(resolved.len(), 2);
