@@ -26,6 +26,7 @@ pub struct PreviewGenerated {
 // CadhrLang -> UI: error or log message from cadhr-lang execution
 #[derive(Message)]
 pub struct CadhrLangOutput {
+    pub preview_id: Option<u64>,
     pub message: String,
     pub is_error: bool,
 }

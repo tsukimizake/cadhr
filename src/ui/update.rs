@@ -27,6 +27,10 @@ const DEFAULT_ZOOM: f32 = 10.0;
 const AUTO_ZOOM_SENTINEL: f32 = 0.0;
 const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 100.0;
+const CONTROL_SPHERE_RADIUS: f32 = 0.5;
+const CONTROL_SPHERE_HIT_RADIUS: f64 = 1.5;
+const CONTROL_SPHERE_COLOR: Color = Color::srgb(1.0, 0.9, 0.0);
+const CONTROL_SPHERE_SELECTED_COLOR: Color = Color::srgb(0.0, 1.0, 0.5);
 const CAMERA_DISTANCE_FACTOR: f32 = 2.4 * 3.0;
 
 fn refresh_editable_vars(editor_text: &str, editable_vars: &mut EditableVars) {
@@ -290,9 +294,9 @@ pub(super) fn egui_ui(
                     for (ci, entity) in target.control_sphere_entities.iter().enumerate() {
                         let selected = is_selected_preview && selected_cp.index == ci;
                         let color = if selected {
-                            Color::srgb(0.0, 1.0, 0.5)
+                            CONTROL_SPHERE_SELECTED_COLOR
                         } else {
-                            Color::srgb(1.0, 0.9, 0.0)
+                            CONTROL_SPHERE_COLOR
                         };
                         let mat = materials.add(StandardMaterial {
                             base_color: color,
@@ -404,9 +408,9 @@ fn update_control_spheres(
     }
 
     // Spawn new spheres if count increased
-    let sphere_mesh = meshes.add(Sphere::new(0.5));
+    let sphere_mesh = meshes.add(Sphere::new(CONTROL_SPHERE_RADIUS));
     let sphere_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.9, 0.0),
+        base_color: CONTROL_SPHERE_COLOR,
         unlit: true,
         ..default()
     });
@@ -560,9 +564,9 @@ pub(super) fn on_preview_generated(
         });
 
         // Control point sphere material
-        let cp_sphere_mesh = meshes.add(Sphere::new(0.5));
+        let cp_sphere_mesh = meshes.add(Sphere::new(CONTROL_SPHERE_RADIUS));
         let cp_material = materials.add(StandardMaterial {
-            base_color: Color::srgb(1.0, 0.9, 0.0),
+            base_color: CONTROL_SPHERE_COLOR,
             unlit: true,
             ..default()
         });
@@ -944,8 +948,7 @@ fn preview_target_ui(
                     let v = (pos.y - rect.min.y) / rect.height();
                     let (ray_origin, ray_dir) = generate_ray_from_uv(u, v, target);
 
-                    // Ray-sphere intersection with larger radius for easier clicking
-                    let sphere_radius = 1.5_f64;
+                    let sphere_radius = CONTROL_SPHERE_HIT_RADIUS;
                     let mut best_hit: Option<(f64, usize)> = None;
                     for (ci, cp) in target.control_points.iter().enumerate() {
                         let center = [cp.x.value, cp.y.value, cp.z.value];
@@ -1002,16 +1005,19 @@ fn preview_target_ui(
                             ("Z:", &mut cp.z),
                         ].iter_mut().enumerate() {
                             ui.label(*axis_label);
-                            let mut val = tracked.value;
-                            if ui
-                                .add(egui::DragValue::new(&mut val).speed(0.5))
-                                .changed()
-                            {
-                                tracked.value = val;
+                            let mut val = cp.var_names[axis_idx]
+                                .as_ref()
+                                .and_then(|vn| target.control_point_overrides.get(vn).copied())
+                                .unwrap_or(tracked.value);
+                            let response = ui
+                                .add(egui::DragValue::new(&mut val).speed(0.5));
+                            if response.changed() {
                                 if let Some(ref vname) = cp.var_names[axis_idx] {
                                     target.control_point_overrides.insert(vname.clone(), val);
-                                    cp_override_regenerate.push(target.preview_id);
                                 }
+                            }
+                            if response.drag_stopped() || response.lost_focus() {
+                                cp_override_regenerate.push(target.preview_id);
                             }
                         }
                     });
@@ -1071,14 +1077,33 @@ pub(super) fn update_preview_transforms(
 pub(super) fn handle_cadhr_lang_output(
     mut ev_output: MessageReader<CadhrLangOutput>,
     mut error_message: ResMut<ErrorMessage>,
+    mut preview_query: Query<&mut PreviewTarget>,
 ) {
     for output in ev_output.read() {
         if output.is_error {
             **error_message = output.message.clone();
+            if let Some(pid) = output.preview_id {
+                for mut target in preview_query.iter_mut() {
+                    if target.preview_id == pid {
+                        target.control_point_overrides = target
+                            .control_points
+                            .iter()
+                            .flat_map(|cp| {
+                                [(&cp.x, 0), (&cp.y, 1), (&cp.z, 2)]
+                                    .into_iter()
+                                    .filter_map(|(tracked, ai)| {
+                                        cp.var_names[ai]
+                                            .as_ref()
+                                            .map(|vn| (vn.clone(), tracked.value))
+                                    })
+                            })
+                            .collect();
+                        break;
+                    }
+                }
+            }
         } else {
-            // For non-error logs, we could display them differently or just log
             bevy::log::info!("CadhrLang: {}", output.message);
-            // Clear error message on successful execution
             **error_message = String::new();
         }
     }

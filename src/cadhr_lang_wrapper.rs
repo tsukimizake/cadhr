@@ -41,51 +41,74 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
             let query = req.query;
 
             let mut logs: Vec<String> = Vec::new();
-            let result = (|| -> Result<(Mesh, Vec<cadhr_lang::manifold_bridge::EvaluatedNode>, Vec<cadhr_lang::manifold_bridge::ControlPoint>), String> {
+
+            // Parse and resolve: extract control points before mesh generation
+            // so they're available even when mesh generation fails
+            let resolve_result = (|| -> Result<(Vec<cadhr_lang::parse::Term>, Vec<cadhr_lang::manifold_bridge::ControlPoint>), String> {
                 let (_, query_terms) =
                     parse_query(&query).map_err(|e| format!("Query parse error: {:?}", e))?;
-
                 let mut db =
                     database(&db_src).map_err(|e| format!("Database parse error: {:?}", e))?;
-
                 logs.push(format!("Query terms: {:?}", query_terms));
                 logs.push(format!("Database clauses: {:#?}", db));
-
                 let mut resolved =
                     execute(&mut db, query_terms).map_err(|e| format!("Rewrite error: {}", e))?;
-
                 logs.push(format!("Resolved terms: {:?}", resolved));
-
                 let control_points = extract_control_points(&mut resolved, &req.control_point_overrides);
-
-                if resolved.is_empty() {
-                    // control pointsのみでgeometryがない場合、空メッシュを返す
-                    let empty_mesh = Mesh::new(
-                        bevy::render::render_resource::PrimitiveTopology::TriangleList,
-                        bevy::asset::RenderAssetUsages::RENDER_WORLD | bevy::asset::RenderAssetUsages::MAIN_WORLD,
-                    );
-                    return Ok((empty_mesh, vec![], control_points));
-                }
-
-                let (rs_mesh, evaluated_nodes) = generate_mesh_and_tree_from_terms(&resolved, &req.include_paths)
-                    .map_err(|e| format!("Mesh error: {}", e))?;
-
-                let bevy_mesh = rs_mesh_to_bevy_mesh(&rs_mesh)?;
-                Ok((bevy_mesh, evaluated_nodes, control_points))
+                Ok((resolved, control_points))
             })();
 
             let log_message = logs.join("\n");
             if !log_message.is_empty() {
                 async_world
                     .send_message(CadhrLangOutput {
+                        preview_id: None,
                         message: log_message,
                         is_error: false,
                     })
                     .await;
             }
 
-            match result {
-                Ok((mesh, evaluated_nodes, control_points)) => {
+            let (resolved, control_points) = match resolve_result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    bevy::log::error!("Failed to resolve: {}", e);
+                    async_world
+                        .send_message(CadhrLangOutput {
+                            preview_id: Some(preview_id),
+                            message: e,
+                            is_error: true,
+                            })
+                        .await;
+                    return;
+                }
+            };
+
+            if resolved.is_empty() {
+                let empty_mesh = Mesh::new(
+                    PrimitiveTopology::TriangleList,
+                    RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+                );
+                async_world
+                    .send_message(PreviewGenerated {
+                        preview_id,
+                        query,
+                        mesh: empty_mesh,
+                        evaluated_nodes: vec![],
+                        control_points,
+                    })
+                    .await;
+                return;
+            }
+
+            let mesh_result = generate_mesh_and_tree_from_terms(&resolved, &req.include_paths)
+                .map_err(|e| format!("Mesh error: {}", e))
+                .and_then(|(rs_mesh, evaluated_nodes)| {
+                    rs_mesh_to_bevy_mesh(&rs_mesh).map(|m| (m, evaluated_nodes))
+                });
+
+            match mesh_result {
+                Ok((mesh, evaluated_nodes)) => {
                     async_world
                         .send_message(PreviewGenerated {
                             preview_id,
@@ -100,6 +123,7 @@ fn spawn_mesh_job(async_world: AsyncWorld, req: GeneratePreviewRequest) {
                     bevy::log::error!("Failed to generate mesh: {}", e);
                     async_world
                         .send_message(CadhrLangOutput {
+                            preview_id: Some(preview_id),
                             message: e,
                             is_error: true,
                         })
