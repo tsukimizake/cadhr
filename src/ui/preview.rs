@@ -40,6 +40,7 @@ pub struct Preview {
     pub bom_entries: Vec<BomEntry>,
     /// false: 注視点は原点 / true: bbox 中心
     pub view_at_object_center: bool,
+    pub minimized: bool,
 }
 
 pub struct PreviewModel {
@@ -77,6 +78,7 @@ impl PreviewModel {
             last_indices: vec![],
             bom_entries: vec![],
             view_at_object_center: sp.view_at_object_center,
+            minimized: sp.minimized,
         });
         id
     }
@@ -112,6 +114,7 @@ pub enum Msg {
     UpdatePreviews,
     UpdatePreview(u64),
     ClosePreview(u64),
+    ToggleMinimize(u64),
     MovePreviewUp(u64),
     MovePreviewDown(u64),
     QueryChanged(u64, String),
@@ -153,6 +156,7 @@ pub fn update(model: &mut PreviewModel, msg: Msg, ctx: Context) -> (Task<Msg>, O
                 last_indices: vec![],
                 bom_entries: vec![],
                 view_at_object_center: false,
+                minimized: false,
             });
             (
                 generate(model, id, ctx),
@@ -184,6 +188,7 @@ pub fn update(model: &mut PreviewModel, msg: Msg, ctx: Context) -> (Task<Msg>, O
                 last_indices: vec![],
                 bom_entries: vec![],
                 view_at_object_center: false,
+                minimized: false,
             });
             (
                 generate(model, id, ctx),
@@ -212,6 +217,16 @@ pub fn update(model: &mut PreviewModel, msg: Msg, ctx: Context) -> (Task<Msg>, O
         Msg::ClosePreview(id) => {
             model.previews.retain(|p| p.id != id);
             Outcome::none()
+        }
+        Msg::ToggleMinimize(id) => {
+            if let Some(p) = model.previews.iter_mut().find(|p| p.id == id) {
+                p.minimized = !p.minimized;
+            }
+            (Task::none(), Outcome {
+                mark_unsaved: true,
+                error: None,
+                source_edit: None,
+            })
         }
         Msg::MovePreviewUp(id) => {
             if let Some(i) = model.previews.iter().position(|p| p.id == id) {
@@ -593,6 +608,7 @@ pub fn collect_session_previews(model: &PreviewModel) -> Vec<SessionPreview> {
             control_point_overrides: p.control_point_overrides.clone(),
             query_param_overrides: p.query_param_overrides.clone(),
             view_at_object_center: p.view_at_object_center,
+            minimized: p.minimized,
         })
         .collect()
 }
@@ -631,6 +647,7 @@ pub fn view(p: &Preview, index: usize, total: usize) -> Element<'_, Msg> {
     } else {
         "View: Origin"
     };
+    let minimize_label = if p.minimized { "+" } else { "−" };
     let mut header = row![
         up_btn,
         down_btn,
@@ -643,7 +660,13 @@ pub fn view(p: &Preview, index: usize, total: usize) -> Element<'_, Msg> {
     if !p.bom_entries.is_empty() {
         header = header.push(parts::dark_button("Export BOM").on_press(Msg::ExportBOM(id)));
     }
-    let header = header.push(parts::dark_button("Close").on_press(Msg::ClosePreview(id)));
+    let header = header
+        .push(parts::dark_button(minimize_label).on_press(Msg::ToggleMinimize(id)))
+        .push(parts::dark_button("Close").on_press(Msg::ClosePreview(id)));
+
+    if p.minimized {
+        return column![header].spacing(4).into();
+    }
 
     let query_row = row![
         text("?- "),

@@ -457,6 +457,7 @@ mod tests {
                 control_point_overrides: Default::default(),
                 query_param_overrides: Default::default(),
                 view_at_object_center: false,
+                minimized: false,
             })
             .collect();
         session::save_session(dir, db, &previews).unwrap();
@@ -494,5 +495,93 @@ mod tests {
             "session A のプレビューが残っている"
         );
         assert_eq!(model.preview_model.previews[0].query, "main");
+    }
+
+    #[test]
+    fn scene_view_center_uses_bbox_when_toggled() {
+        use glam::Vec3;
+        use preview::pipeline::Vertex;
+
+        let v = |p: [f32; 3]| Vertex {
+            position: p,
+            normal: [0.0, 0.0, 1.0],
+            color: [0.0; 4],
+        };
+        let mut scene = preview::Scene::new();
+        scene.set_mesh(vec![v([10.0, 20.0, 30.0]), v([20.0, 40.0, 60.0])], vec![]);
+
+        assert_eq!(scene.view_center(), Vec3::ZERO);
+        let origin_dist = scene.base_camera_distance();
+
+        scene.view_at_object_center = true;
+        assert_eq!(scene.view_center(), Vec3::new(15.0, 30.0, 45.0));
+
+        // 中心モードでは bbox 半径ベース、原点モードでは原点からの最大距離ベース。
+        // 同じメッシュなら中心モードの方が短くなるはず。
+        assert!(
+            scene.base_camera_distance() < origin_dist,
+            "center mode distance {} should be less than origin mode distance {}",
+            scene.base_camera_distance(),
+            origin_dist
+        );
+    }
+
+    fn find_preview(model: &Model, id: u64) -> &ui::preview::Preview {
+        model
+            .preview_model
+            .previews
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+    }
+
+    fn click_and_drain(model: &mut Model, label: &str) {
+        let mut ui = simulator(view(model));
+        ui.click(label)
+            .unwrap_or_else(|_| panic!("ボタン '{}' が見つからない", label));
+        for msg in ui.into_messages() {
+            let task = update(model, msg);
+            for follow_up in drain_task(task) {
+                let _ = update(model, follow_up);
+            }
+        }
+    }
+
+    #[test]
+    fn view_center_toggle_button_flips_flag() {
+        let mut model = fresh_model();
+        let id = model
+            .preview_model
+            .add_from_session(&session::SessionPreview {
+                preview_id: 0,
+                query: "main.".to_string(),
+                order: 0,
+                control_point_overrides: Default::default(),
+                query_param_overrides: Default::default(),
+                view_at_object_center: false,
+                minimized: false,
+            });
+
+        assert!(!find_preview(&model, id).view_at_object_center);
+        assert!(!find_preview(&model, id).scene.view_at_object_center);
+
+        // 1 回目のクリックで Origin → Center
+        click_and_drain(&mut model, "View: Origin");
+        assert!(
+            find_preview(&model, id).view_at_object_center,
+            "1 回目のトグルで true に"
+        );
+        assert!(
+            find_preview(&model, id).scene.view_at_object_center,
+            "scene 側 flag も同期しているべき"
+        );
+
+        // 2 回目のクリックで Center → Origin。ラベルが反転していることも検証。
+        click_and_drain(&mut model, "View: Center");
+        assert!(
+            !find_preview(&model, id).view_at_object_center,
+            "2 回目のトグルで false に"
+        );
+        assert!(!find_preview(&model, id).scene.view_at_object_center);
     }
 }

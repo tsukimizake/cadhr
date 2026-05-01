@@ -14,6 +14,8 @@ pub struct SessionPreview {
     pub query_param_overrides: HashMap<String, f64>,
     #[serde(default)]
     pub view_at_object_center: bool,
+    #[serde(default)]
+    pub minimized: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
