@@ -38,6 +38,8 @@ pub struct Preview {
     pub last_vertices: Vec<preview::pipeline::Vertex>,
     pub last_indices: Vec<u32>,
     pub bom_entries: Vec<BomEntry>,
+    /// false: 注視点は原点 / true: bbox 中心
+    pub view_at_object_center: bool,
 }
 
 pub struct PreviewModel {
@@ -60,11 +62,13 @@ impl PreviewModel {
         if id >= self.next_preview_id {
             self.next_preview_id = id + 1;
         }
+        let mut scene = Scene::new();
+        scene.view_at_object_center = sp.view_at_object_center;
         self.previews.push(Preview {
             id,
             kind: PreviewKind::Normal,
             query: sp.query.clone(),
-            scene: Scene::new(),
+            scene,
             control_points: vec![],
             control_point_overrides: sp.control_point_overrides.clone(),
             query_params: vec![],
@@ -72,6 +76,7 @@ impl PreviewModel {
             last_vertices: vec![],
             last_indices: vec![],
             bom_entries: vec![],
+            view_at_object_center: sp.view_at_object_center,
         });
         id
     }
@@ -110,6 +115,7 @@ pub enum Msg {
     MovePreviewUp(u64),
     MovePreviewDown(u64),
     QueryChanged(u64, String),
+    ToggleViewCenter(u64),
     PreviewGenerated(u64, MeshJobResult),
     CollisionGenerated(u64, CollisionJobResult),
     CpOverrideChanged(u64, String, f64),
@@ -146,6 +152,7 @@ pub fn update(model: &mut PreviewModel, msg: Msg, ctx: Context) -> (Task<Msg>, O
                 last_vertices: vec![],
                 last_indices: vec![],
                 bom_entries: vec![],
+                view_at_object_center: false,
             });
             (
                 generate(model, id, ctx),
@@ -176,6 +183,7 @@ pub fn update(model: &mut PreviewModel, msg: Msg, ctx: Context) -> (Task<Msg>, O
                 last_vertices: vec![],
                 last_indices: vec![],
                 bom_entries: vec![],
+                view_at_object_center: false,
             });
             (
                 generate(model, id, ctx),
@@ -234,6 +242,41 @@ pub fn update(model: &mut PreviewModel, msg: Msg, ctx: Context) -> (Task<Msg>, O
                 p.query = query;
             }
             Outcome::none()
+        }
+        Msg::ToggleViewCenter(id) => {
+            if let Some(p) = model.previews.iter_mut().find(|p| p.id == id) {
+                p.view_at_object_center = !p.view_at_object_center;
+                p.scene.view_at_object_center = p.view_at_object_center;
+                // 注視点の切り替えだけでは shader の再描画が走らないので
+                // 現メッシュを再アップロードしてバージョンを進める
+                let vertices = p.last_vertices.clone();
+                let indices = p.last_indices.clone();
+                if !vertices.is_empty() {
+                    let selected = model
+                        .selected_cp
+                        .and_then(|(pid, ci)| if pid == id { Some(ci) } else { None });
+                    if let Some(p) = model.previews.iter_mut().find(|p| p.id == id) {
+                        match &p.kind {
+                            PreviewKind::Normal => {
+                                p.scene.set_mesh_with_control_points(
+                                    vertices,
+                                    indices,
+                                    &p.control_points,
+                                    selected,
+                                );
+                            }
+                            PreviewKind::Collision { .. } => {
+                                p.scene.set_mesh(vertices, indices);
+                            }
+                        }
+                    }
+                }
+            }
+            (Task::none(), Outcome {
+                mark_unsaved: true,
+                error: None,
+                source_edit: None,
+            })
         }
         Msg::PreviewGenerated(id, result) => {
             debug_log!("MeshJob completed (id={}): {:?}", id, result);
@@ -333,8 +376,14 @@ pub fn update(model: &mut PreviewModel, msg: Msg, ctx: Context) -> (Task<Msg>, O
                 }
 
                 let cam = preview::CameraState::with_values(rotate_x, rotate_y, zoom);
-                let (ray_origin, ray_dir) =
-                    preview::generate_ray_from_uv(u, v, &cam, p.scene.base_camera_distance, aspect);
+                let (ray_origin, ray_dir) = preview::generate_ray_from_uv(
+                    u,
+                    v,
+                    &cam,
+                    p.scene.base_camera_distance(),
+                    aspect,
+                    p.scene.view_center(),
+                );
 
                 let aabb = compute_aabb_from_vertices(&p.last_vertices);
                 let hit_radius = (aabb * 0.03).max(0.5) * 1.5;
@@ -543,6 +592,7 @@ pub fn collect_session_previews(model: &PreviewModel) -> Vec<SessionPreview> {
             order: i,
             control_point_overrides: p.control_point_overrides.clone(),
             query_param_overrides: p.query_param_overrides.clone(),
+            view_at_object_center: p.view_at_object_center,
         })
         .collect()
 }
@@ -576,11 +626,17 @@ pub fn view(p: &Preview, index: usize, total: usize) -> Element<'_, Msg> {
     } else {
         parts::dark_button("↓")
     };
+    let view_label = if p.view_at_object_center {
+        "View: Center"
+    } else {
+        "View: Origin"
+    };
     let mut header = row![
         up_btn,
         down_btn,
         text(preview_label),
         parts::dark_button("Update").on_press(Msg::UpdatePreview(id)),
+        parts::dark_button(view_label).on_press(Msg::ToggleViewCenter(id)),
         parts::dark_button("Export 3MF").on_press(Msg::Export3MF(id)),
     ]
     .spacing(4);

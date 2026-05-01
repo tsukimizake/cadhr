@@ -456,6 +456,7 @@ mod tests {
                 order: i,
                 control_point_overrides: Default::default(),
                 query_param_overrides: Default::default(),
+                view_at_object_center: false,
             })
             .collect();
         session::save_session(dir, db, &previews).unwrap();

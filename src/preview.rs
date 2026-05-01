@@ -43,7 +43,10 @@ pub enum SceneMessage {
 pub struct Scene {
     pub id: u64,
     pub color: [f32; 4],
-    pub base_camera_distance: f32,
+    pub bbox_min: Vec3,
+    pub bbox_max: Vec3,
+    /// false: 注視点は原点 / true: bbox 中心
+    pub view_at_object_center: bool,
     pub mesh: Arc<MeshData>,
     /// 0 = まだメッシュが設定されていない
     pub mesh_version: u64,
@@ -88,7 +91,9 @@ impl Scene {
         Self {
             id: NEXT_SCENE_ID.fetch_add(1, Ordering::Relaxed),
             color: DEFAULT_COLOR,
-            base_camera_distance: 5.0,
+            bbox_min: Vec3::ZERO,
+            bbox_max: Vec3::ZERO,
+            view_at_object_center: false,
             mesh: Arc::new(MeshData {
                 vertices: vec![],
                 indices: vec![],
@@ -99,8 +104,7 @@ impl Scene {
     }
 
     pub fn set_mesh(&mut self, vertices: Vec<Vertex>, indices: Vec<u32>) {
-        let aabb = compute_aabb(&vertices);
-        self.base_camera_distance = (aabb * 2.4 * 3.0).max(5.0);
+        self.update_bbox(&vertices);
         let edge_indices = extract_sharp_edges(&vertices, &indices, EDGE_ANGLE_THRESHOLD_DEG);
         self.mesh = Arc::new(MeshData {
             vertices,
@@ -117,13 +121,12 @@ impl Scene {
         control_points: &[cadhr_lang::manifold_bridge::ControlPoint],
         selected_cp: Option<usize>,
     ) {
-        let aabb = compute_aabb(&vertices);
-        self.base_camera_distance = (aabb * 2.4 * 3.0).max(5.0);
+        self.update_bbox(&vertices);
 
         // CP 球体を追加する前のメインメッシュからエッジ抽出
         let edge_indices = extract_sharp_edges(&vertices, &indices, EDGE_ANGLE_THRESHOLD_DEG);
 
-        let cp_radius = (aabb * 0.03).max(0.5);
+        let cp_radius = (self.aabb_max_abs() * 0.03).max(0.5);
         for (ci, cp) in control_points.iter().enumerate() {
             let color = if selected_cp == Some(ci) {
                 [0.0, 1.0, 0.5, 1.0]
@@ -142,23 +145,68 @@ impl Scene {
         self.mesh_version = NEXT_MESH_VERSION.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn update_bbox(&mut self, vertices: &[Vertex]) {
+        if vertices.is_empty() {
+            self.bbox_min = Vec3::ZERO;
+            self.bbox_max = Vec3::ZERO;
+            return;
+        }
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for v in vertices {
+            let p = Vec3::from_array(v.position);
+            min = min.min(p);
+            max = max.max(p);
+        }
+        self.bbox_min = min;
+        self.bbox_max = max;
+    }
+
+    /// 現在の表示モードに応じた注視点 (camera target)
+    pub fn view_center(&self) -> Vec3 {
+        if self.view_at_object_center {
+            (self.bbox_min + self.bbox_max) * 0.5
+        } else {
+            Vec3::ZERO
+        }
+    }
+
+    /// 現在の表示モードに応じた基準カメラ距離。
+    /// 原点モード: 原点からの最大距離 / 中心モード: bbox 半径の最大成分
+    pub fn base_camera_distance(&self) -> f32 {
+        let extent = if self.view_at_object_center {
+            (self.bbox_max - self.bbox_min) * 0.5
+        } else {
+            self.bbox_min.abs().max(self.bbox_max.abs())
+        };
+        let max = extent.x.max(extent.y).max(extent.z);
+        (max * 2.4 * 3.0).max(5.0)
+    }
+
+    /// CP 球体半径計算用: 原点からの最大距離 (旧 compute_aabb 互換)
+    fn aabb_max_abs(&self) -> f32 {
+        let v = self.bbox_min.abs().max(self.bbox_max.abs());
+        v.x.max(v.y).max(v.z)
+    }
+
     fn build_uniforms(&self, cam: &CameraState, bounds: Rectangle) -> Uniforms {
         let aspect = (bounds.width / bounds.height.max(1.0)).max(0.01);
 
         let rx = cam.rotate_x as f32;
         let ry = cam.rotate_y as f32;
-        let dist = self.base_camera_distance * (20.0 / cam.zoom);
+        let dist = self.base_camera_distance() * (20.0 / cam.zoom);
 
         // near/far を dist に比例させる: そうしないと大きなモデルで far クリップに全部消える
         let near = (dist * 0.01).max(0.1);
         let far = (dist * 10.0).max(1000.0);
         let proj = Mat4::perspective_rh(45.0_f32.to_radians(), aspect, near, far);
 
+        let center = self.view_center();
         let x = dist * ry.sin() * rx.cos();
         let y = dist * ry.cos() * rx.cos();
         let z = dist * rx.sin();
-        let eye = Vec3::new(x, y, z);
-        let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Z);
+        let eye = center + Vec3::new(x, y, z);
+        let view = Mat4::look_at_rh(eye, center, Vec3::Z);
 
         Uniforms {
             view_proj: (proj * view).to_cols_array_2d(),
@@ -177,6 +225,7 @@ pub fn generate_ray_from_uv(
     cam: &CameraState,
     base_camera_distance: f32,
     aspect: f32,
+    view_center: Vec3,
 ) -> ([f64; 3], [f64; 3]) {
     let rx = cam.rotate_x as f32;
     let ry = cam.rotate_y as f32;
@@ -185,7 +234,7 @@ pub fn generate_ray_from_uv(
     let x = dist * ry.sin() * rx.cos();
     let y = dist * ry.cos() * rx.cos();
     let z = dist * rx.sin();
-    let eye = Vec3::new(x, y, z);
+    let eye = view_center + Vec3::new(x, y, z);
 
     let fov_y = 45.0_f32.to_radians();
     let half_h = (fov_y / 2.0).tan();
@@ -195,7 +244,7 @@ pub fn generate_ray_from_uv(
     let ndc_x = u * 2.0 - 1.0;
     let ndc_y = 1.0 - v * 2.0; // flip Y
 
-    let forward = (Vec3::ZERO - eye).normalize();
+    let forward = (view_center - eye).normalize();
     let right = forward.cross(Vec3::Z).normalize();
     let up = right.cross(forward).normalize();
 
@@ -348,19 +397,6 @@ fn extract_sharp_edges(vertices: &[Vertex], indices: &[u32], threshold_deg: f32)
     }
 
     line_indices
-}
-
-fn compute_aabb(vertices: &[Vertex]) -> f32 {
-    if vertices.is_empty() {
-        return 0.0;
-    }
-    let mut max_extent: f32 = 0.0;
-    for v in vertices {
-        for &c in &v.position {
-            max_extent = max_extent.max(c.abs());
-        }
-    }
-    max_extent
 }
 
 impl shader::Program<SceneMessage> for Scene {
