@@ -70,7 +70,8 @@ fn main() -> iced::Result {
 
 struct Model {
     editor: text_editor::Content,
-    preview_model: ui::preview::PreviewModel,
+    previews: Vec<ui::preview::Preview>,
+    next_preview_id: u64,
     current_file_path: Option<PathBuf>,
     error_message: String,
     error_span: Option<SrcSpan>,
@@ -84,8 +85,11 @@ struct Model {
 enum Msg {
     EditorAction(text_editor::Action),
 
-    // Preview (delegated)
-    Preview(ui::preview::Msg),
+    // Preview list operations
+    AddPreview,
+    AddCollisionCheck,
+    UpdateAllPreviews,
+    Preview(u64, ui::preview::Msg),
 
     // File I/O
     NewSession,
@@ -105,7 +109,8 @@ fn init() -> (Model, Task<Msg>) {
         if let Some((db_content, previews)) = session::load_session(&path) {
             let mut model = Model {
                 editor: text_editor::Content::with_text(&db_content),
-                preview_model: ui::preview::PreviewModel::new(),
+                previews: vec![],
+                next_preview_id: 0,
                 current_file_path: Some(path),
                 error_message: String::new(),
                 error_span: None,
@@ -116,21 +121,26 @@ fn init() -> (Model, Task<Msg>) {
             };
             let mut tasks = vec![];
             for sp in &previews.previews {
-                let id = model.preview_model.add_from_session(sp);
-                tasks.push(ui::preview::generate(
-                    &model.preview_model,
-                    id,
-                    make_ctx(&model),
-                ));
+                let p = ui::preview::Preview::from_session(sp);
+                let id = p.id;
+                if id >= model.next_preview_id {
+                    model.next_preview_id = id + 1;
+                }
+                let ctx = make_ctx(&model);
+                tasks.push(
+                    ui::preview::generate(&p, ctx).map(move |m| Msg::Preview(id, m)),
+                );
+                model.previews.push(p);
             }
-            return (model, Task::batch(tasks).map(Msg::Preview));
+            return (model, Task::batch(tasks));
         }
     }
 
     (
         Model {
             editor: text_editor::Content::with_text("main :- cube(10, 20, 30)."),
-            preview_model: ui::preview::PreviewModel::new(),
+            previews: vec![],
+            next_preview_id: 0,
             current_file_path: None,
             error_message: String::new(),
             error_span: None,
@@ -157,6 +167,32 @@ fn make_ctx(model: &Model) -> ui::preview::Context {
     }
 }
 
+fn collect_session_previews(model: &Model) -> Vec<session::SessionPreview> {
+    model
+        .previews
+        .iter()
+        .enumerate()
+        .map(|(i, p)| p.to_session(i))
+        .collect()
+}
+
+fn apply_preview_outcome(model: &mut Model, outcome: ui::preview::Outcome) {
+    if outcome.mark_unsaved {
+        model.unsaved = true;
+    }
+    if let Some((msg_text, span)) = outcome.error {
+        model.error_message = msg_text;
+        model.error_span = span;
+    } else {
+        model.error_message.clear();
+        model.error_span = None;
+    }
+    if let Some(new_text) = outcome.source_edit {
+        model.editor = text_editor::Content::with_text(&new_text);
+        model.unsaved = true;
+    }
+}
+
 fn update(model: &mut Model, message: Msg) -> Task<Msg> {
     match message {
         Msg::EditorAction(action) => {
@@ -167,30 +203,79 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             }
             Task::none()
         }
-        Msg::Preview(msg) => {
+
+        Msg::AddPreview => {
+            let id = model.next_preview_id;
+            model.next_preview_id += 1;
+            let p = ui::preview::Preview::new(id);
             let ctx = make_ctx(model);
-            let (task, outcome) = ui::preview::update(&mut model.preview_model, msg, ctx);
-            if outcome.mark_unsaved {
-                model.unsaved = true;
-            }
-            if let Some((msg_text, span)) = outcome.error {
-                model.error_message = msg_text;
-                model.error_span = span;
-            } else {
-                model.error_message.clear();
-                model.error_span = None;
-            }
-            if let Some(new_text) = outcome.source_edit {
-                model.editor = text_editor::Content::with_text(&new_text);
-                model.unsaved = true;
-            }
-            task.map(Msg::Preview)
+            let task = ui::preview::generate(&p, ctx).map(move |m| Msg::Preview(id, m));
+            model.previews.push(p);
+            model.unsaved = true;
+            task
         }
+        Msg::AddCollisionCheck => {
+            let id = model.next_preview_id;
+            model.next_preview_id += 1;
+            let p = ui::preview::Preview::new_collision(id);
+            let ctx = make_ctx(model);
+            let task = ui::preview::generate(&p, ctx).map(move |m| Msg::Preview(id, m));
+            model.previews.push(p);
+            model.unsaved = true;
+            task
+        }
+        Msg::UpdateAllPreviews => {
+            let ctx = make_ctx(model);
+            let tasks: Vec<Task<Msg>> = model
+                .previews
+                .iter()
+                .map(|p| {
+                    let id = p.id;
+                    ui::preview::generate(p, ctx.clone()).map(move |m| Msg::Preview(id, m))
+                })
+                .collect();
+            Task::batch(tasks)
+        }
+        Msg::Preview(id, pm) => match pm {
+            ui::preview::Msg::MoveUp => {
+                if let Some(i) = model.previews.iter().position(|p| p.id == id) {
+                    if i > 0 {
+                        model.previews.swap(i - 1, i);
+                        model.unsaved = true;
+                    }
+                }
+                Task::none()
+            }
+            ui::preview::Msg::MoveDown => {
+                if let Some(i) = model.previews.iter().position(|p| p.id == id) {
+                    if i + 1 < model.previews.len() {
+                        model.previews.swap(i, i + 1);
+                        model.unsaved = true;
+                    }
+                }
+                Task::none()
+            }
+            ui::preview::Msg::Close => {
+                model.previews.retain(|p| p.id != id);
+                Task::none()
+            }
+            other => {
+                let ctx = make_ctx(model);
+                if let Some(p) = model.previews.iter_mut().find(|p| p.id == id) {
+                    let (task, outcome) = ui::preview::update(p, other, ctx);
+                    apply_preview_outcome(model, outcome);
+                    task.map(move |m| Msg::Preview(id, m))
+                } else {
+                    Task::none()
+                }
+            }
+        },
 
         // File I/O
         Msg::NewSession => {
             model.editor = text_editor::Content::with_text("main :- cube(10, 20, 30).");
-            model.preview_model = ui::preview::PreviewModel::new();
+            model.previews.clear();
+            model.next_preview_id = 0;
             model.current_file_path = None;
             model.error_message.clear();
             model.error_span = None;
@@ -202,7 +287,8 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
         Msg::SessionOpened(result) => {
             if let Some((path, db_content, previews)) = result {
                 model.editor = text_editor::Content::with_text(&db_content);
-                model.preview_model = ui::preview::PreviewModel::new();
+                model.previews.clear();
+                model.next_preview_id = 0;
                 model.current_file_path = Some(path.clone());
                 model.error_message.clear();
                 model.error_span = None;
@@ -212,14 +298,18 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
 
                 let mut tasks = vec![];
                 for sp in previews.previews {
-                    let id = model.preview_model.add_from_session(&sp);
-                    tasks.push(ui::preview::generate(
-                        &model.preview_model,
-                        id,
-                        make_ctx(&model),
-                    ));
+                    let p = ui::preview::Preview::from_session(&sp);
+                    let id = p.id;
+                    if id >= model.next_preview_id {
+                        model.next_preview_id = id + 1;
+                    }
+                    let ctx = make_ctx(model);
+                    tasks.push(
+                        ui::preview::generate(&p, ctx).map(move |m| Msg::Preview(id, m)),
+                    );
+                    model.previews.push(p);
                 }
-                return Task::batch(tasks).map(Msg::Preview);
+                return Task::batch(tasks);
             }
             Task::none()
         }
@@ -227,7 +317,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             if let Some(ref path) = model.current_file_path {
                 let path = path.clone();
                 let text = model.editor.text();
-                let previews = ui::preview::collect_session_previews(&model.preview_model);
+                let previews = collect_session_previews(model);
                 Task::perform(
                     async move { session::save_session(&path, &text, &previews).map(|()| path) },
                     Msg::SessionSaved,
@@ -238,7 +328,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
         }
         Msg::SaveSessionAs => {
             let text = model.editor.text();
-            let previews = ui::preview::collect_session_previews(&model.preview_model);
+            let previews = collect_session_previews(model);
             model.dialogs.save_session_as(text, previews)
         }
         Msg::SessionSaved(result) => {
@@ -279,10 +369,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                             model.last_modified = Some(modified);
                             if let Ok(content) = std::fs::read_to_string(&db_path) {
                                 model.editor = text_editor::Content::with_text(&content);
-                                return update(
-                                    model,
-                                    Msg::Preview(ui::preview::Msg::UpdatePreviews),
-                                );
+                                return update(model, Msg::UpdateAllPreviews);
                             }
                         }
                     }
@@ -316,11 +403,9 @@ fn view(model: &Model) -> Element<'_, Msg> {
         ui::parts::dark_button("Save").on_press(Msg::SaveSession),
         ui::parts::dark_button("Save As").on_press(Msg::SaveSessionAs),
         text(" | "),
-        ui::parts::dark_button("Add Preview").on_press(Msg::Preview(ui::preview::Msg::AddPreview)),
-        ui::parts::dark_button("Collision Check")
-            .on_press(Msg::Preview(ui::preview::Msg::AddCollisionCheck)),
-        ui::parts::dark_button("Update All")
-            .on_press(Msg::Preview(ui::preview::Msg::UpdatePreviews)),
+        ui::parts::dark_button("Add Preview").on_press(Msg::AddPreview),
+        ui::parts::dark_button("Collision Check").on_press(Msg::AddCollisionCheck),
+        ui::parts::dark_button("Update All").on_press(Msg::UpdateAllPreviews),
         text(" | "),
         toggler(model.auto_reload)
             .label("Auto Reload")
@@ -340,16 +425,18 @@ fn view(model: &Model) -> Element<'_, Msg> {
         .highlight_with::<highlight::SpanHighlighter>(hl_settings, highlight::format)
         .height(Fill);
 
-    let preview_list: Element<'_, Msg> = if model.preview_model.previews.is_empty() {
+    let preview_list: Element<'_, Msg> = if model.previews.is_empty() {
         text("Add Preview を押してください").into()
     } else {
-        let total = model.preview_model.previews.len();
+        let total = model.previews.len();
         let items: Vec<Element<'_, Msg>> = model
-            .preview_model
             .previews
             .iter()
             .enumerate()
-            .map(|(i, p)| ui::preview::view(p, i, total).map(Msg::Preview))
+            .map(|(i, p)| {
+                let id = p.id;
+                ui::preview::view(p, i, total).map(move |m| Msg::Preview(id, m))
+            })
             .collect();
         scrollable(column(items).spacing(12)).height(Fill).into()
     };
@@ -414,7 +501,8 @@ mod tests {
     fn fresh_model() -> Model {
         Model {
             editor: text_editor::Content::with_text("main :- cube(10, 20, 30)."),
-            preview_model: ui::preview::PreviewModel::new(),
+            previews: vec![],
+            next_preview_id: 0,
             current_file_path: None,
             error_message: String::new(),
             error_span: None,
@@ -484,17 +572,17 @@ mod tests {
 
         let mut model = fresh_model();
         simulate_open(&mut model, tmp_a.path());
-        assert_eq!(model.preview_model.previews.len(), 2);
+        assert_eq!(model.previews.len(), 2);
 
         simulate_open(&mut model, tmp_b.path());
 
         assert_eq!(model.current_file_path.as_deref(), Some(tmp_b.path()));
         assert_eq!(
-            model.preview_model.previews.len(),
+            model.previews.len(),
             1,
             "session A のプレビューが残っている"
         );
-        assert_eq!(model.preview_model.previews[0].query, "main");
+        assert_eq!(model.previews[0].query, "main");
     }
 
     #[test]
@@ -527,12 +615,7 @@ mod tests {
     }
 
     fn find_preview(model: &Model, id: u64) -> &ui::preview::Preview {
-        model
-            .preview_model
-            .previews
-            .iter()
-            .find(|p| p.id == id)
-            .unwrap()
+        model.previews.iter().find(|p| p.id == id).unwrap()
     }
 
     fn click_and_drain(model: &mut Model, label: &str) {
@@ -550,17 +633,20 @@ mod tests {
     #[test]
     fn view_center_toggle_button_flips_flag() {
         let mut model = fresh_model();
-        let id = model
-            .preview_model
-            .add_from_session(&session::SessionPreview {
-                preview_id: 0,
-                query: "main.".to_string(),
-                order: 0,
-                control_point_overrides: Default::default(),
-                query_param_overrides: Default::default(),
-                view_at_object_center: false,
-                minimized: false,
-            });
+        let p = ui::preview::Preview::from_session(&session::SessionPreview {
+            preview_id: 0,
+            query: "main.".to_string(),
+            order: 0,
+            control_point_overrides: Default::default(),
+            query_param_overrides: Default::default(),
+            view_at_object_center: false,
+            minimized: false,
+        });
+        let id = p.id;
+        if id >= model.next_preview_id {
+            model.next_preview_id = id + 1;
+        }
+        model.previews.push(p);
 
         assert!(!find_preview(&model, id).view_at_object_center);
         assert!(!find_preview(&model, id).scene.view_at_object_center);
