@@ -275,6 +275,24 @@ fn apply_default_var_bindings(term: &mut ScopedTerm, goals: &mut Vec<ScopedTerm>
     }
 }
 
+/// term に含まれる @-default を `targets` の各項に反映させる。
+/// rewrite_term_recursive 内の apply_default_var_bindings は other_goals にしか伝播しないので、
+/// 同じルール本体の未処理 body 項に @-default を波及させたい時はこのヘルパーを使う。
+fn propagate_defaults_to(term: &ScopedTerm, targets: &mut [ScopedTerm]) {
+    let mut bindings = Vec::new();
+    collect_default_var_bindings(term, &mut bindings);
+    if bindings.is_empty() {
+        return;
+    }
+    let mut env = ScopedEnv::new();
+    for (name, scope, value) in bindings {
+        env.insert(scope, name, number(value));
+    }
+    for t in targets.iter_mut() {
+        *t = resolve(t, &env);
+    }
+}
+
 /// Number と InfixExpr だけで構成された算術式を畳み込む。
 /// Var は処理しない。unify の Var ハンドラが名前ベースの置換を伴って処理するため、
 /// ここで Number に変換すると置換が抜け落ちる。
@@ -993,9 +1011,47 @@ pub fn unify(
     Ok(constraints)
 }
 
+/// goals に shared_env のバインディングを適用する
+fn apply_env_in_place(goals: &mut [ScopedTerm], shared_env: &ScopedEnv) {
+    for g in goals.iter_mut() {
+        *g = resolve(g, shared_env);
+    }
+}
+
+/// body と other_goals 双方から Constraint を抜き出してまとめて解き、束縛を shared_env に
+/// 反映する。残った未解決 Constraint は other_goals 末尾に戻す。
+fn split_and_resolve_constraints(
+    remaining_body: &mut Vec<ScopedTerm>,
+    other_goals: &mut Vec<ScopedTerm>,
+    shared_env: &mut ScopedEnv,
+) -> Result<(), RewriteError> {
+    let (body_constraints, body_rest): (Vec<_>, Vec<_>) = std::mem::take(remaining_body)
+        .into_iter()
+        .partition(|t| matches!(t, Term::Constraint { .. }));
+    let (og_constraints, og_rest): (Vec<_>, Vec<_>) = std::mem::take(other_goals)
+        .into_iter()
+        .partition(|t| matches!(t, Term::Constraint { .. }));
+    *remaining_body = body_rest;
+    *other_goals = og_rest;
+    let mut constraints = body_constraints;
+    constraints.extend(og_constraints);
+    if constraints.is_empty() {
+        return Ok(());
+    }
+    // 既存の shared_env 束縛を反映してから solver に渡す
+    apply_env_in_place(&mut constraints, shared_env);
+    try_resolve_constraints(&mut constraints, shared_env)?;
+    other_goals.extend(constraints);
+    Ok(())
+}
+
 /// goals 内の Constraint を評価し、解けたものは除去、解けないものは残す
 /// 全 Constraint をまとめて SolverState に渡し、連立方程式として解く
-fn try_resolve_constraints(goals: &mut Vec<ScopedTerm>) -> Result<(), RewriteError> {
+/// 解けた束縛は shared_env にも反映され、以降のサブゴール展開で利用可能になる
+fn try_resolve_constraints(
+    goals: &mut Vec<ScopedTerm>,
+    shared_env: &mut ScopedEnv,
+) -> Result<(), RewriteError> {
     let mut eqs = Vec::new();
     let mut constraint_indices = Vec::new();
     for (i, goal) in goals.iter().enumerate() {
@@ -1036,6 +1092,9 @@ fn try_resolve_constraints(goals: &mut Vec<ScopedTerm>) -> Result<(), RewriteErr
             for (var_name, value) in &result.bindings {
                 if let Some(&scope) = var_scopes.get(var_name) {
                     scoped_env.insert(scope, var_name.clone(), number(*value));
+                    // shared_env にも反映: 制約は解消されて消えるので、束縛を共有 env に残さないと
+                    // 後続のサブゴール展開で同じ Var を解決できなくなる。
+                    shared_env.insert(scope, var_name.clone(), number(*value));
                 }
             }
             for goal in goals.iter_mut() {
@@ -1221,41 +1280,40 @@ fn rewrite_term_recursive(
             };
             return Ok(vec![resolved_term]);
         } else {
-            // Ruleにマッチ: bodyの各項を再帰的に解決
+            // Ruleにマッチ: bodyの各項を再帰的に解決。
+            // remaining_body は「未処理の非 Constraint body 項」、other_goals は「外側ゴール
+            // ＋未解決 Constraint」と役割を物理的に分離する。再帰呼び出しには other_goals
+            // だけを渡し、binding は shared_env 経由で伝播させる。
             let mut remaining_body: Vec<ScopedTerm> = body;
             let mut all_resolved = Vec::new();
 
-            // body 解決前に制約を解き、変数束縛を body と other_goals に伝播
-            {
-                let body_len = remaining_body.len();
-                let mut combined = remaining_body;
-                combined.extend(other_goals.drain(..));
-                try_resolve_constraints(&mut combined)?;
-                // 制約解消で要素が除去されうるので、body_len を上限にclamp
-                let split = body_len.min(combined.len());
-                remaining_body = combined.drain(0..split).collect();
-                *other_goals = combined;
-            }
+            // body と other_goals 双方から Constraint を集めて解き、束縛を shared_env に伝播。
+            // 残った未解決 Constraint は other_goals に戻す。
+            split_and_resolve_constraints(&mut remaining_body, other_goals, shared_env)?;
+            apply_env_in_place(&mut remaining_body, shared_env);
+            apply_env_in_place(other_goals, shared_env);
 
             while let Some(b) = remaining_body.first().cloned() {
                 remaining_body.remove(0);
 
-                // remaining_body を other_goals の先頭に追加
-                let mut temp_other_goals = remaining_body.clone();
-                temp_other_goals.extend(other_goals.clone());
+                // b に含まれる @-default を未処理の body 項にも事前伝播。
+                // rewrite_term_recursive 内の apply_default_var_bindings は other_goals に
+                // しか伝播しないため、ここで明示的に行う必要がある。
+                propagate_defaults_to(&b, &mut remaining_body);
 
                 let resolved = rewrite_term_recursive(
                     db,
                     clause_counter,
                     b,
-                    &mut temp_other_goals,
+                    other_goals,
                     shared_env,
                 )?;
                 all_resolved.extend(resolved);
 
-                // 置換が適用された remaining_body と other_goals を復元
-                remaining_body = temp_other_goals.drain(0..remaining_body.len()).collect();
-                *other_goals = temp_other_goals;
+                // 再帰中に other_goals に新しい Constraint が追加されたり、shared_env が
+                // 更新された可能性があるので、再度 Constraint を解いて未処理 body にも反映する。
+                try_resolve_constraints(other_goals, shared_env)?;
+                apply_env_in_place(&mut remaining_body, shared_env);
             }
 
             return Ok(all_resolved);
@@ -1486,7 +1544,7 @@ pub fn execute(
         results.extend(other_goals);
 
         // 各ゴールの rewrite 後に制約解決し、得られた束縛を後続に伝播
-        try_resolve_constraints(&mut results)?;
+        try_resolve_constraints(&mut results, &mut shared_env)?;
     }
 
     // 解決済み Constraint を結果から除去
@@ -2251,6 +2309,36 @@ mod tests {
                 inclusive: false
             }
         );
+    }
+
+    #[test]
+    fn rule_body_with_constraints_does_not_panic() {
+        // 再帰中の制約解消で temp_other_goals が縮むケース。以前は drain(0..remaining_body.len())
+        // が out-of-range で panic していた。また、本体内のサブゴール展開時に @-default が
+        // constraint に伝播するが、その後 try_resolve_constraints が呼ばれず Var が未解決のまま
+        // メッシュ生成に渡って "Unbound variable" エラーになっていた。
+        let db_src = "\
+main :- battery_box.\n\
+battery_box :- ((cube(X@20, Y@18, OUTLEN@58)\n\
+                - wire_hole(X/2, WH_Y1, 0)\n\
+                - wire_hole(X/2, WH_Y2, 0)\n\
+                ) |> translate(0-X/2, 0-Y/2, 0)),\n\
+                WH_Y1 = Y/4, WH_Y2 = Y*3/4.\n\
+wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(X, Y, H).\n\
+";
+        let mut db = database(db_src).expect("failed to parse db");
+        let (_, query_terms) = query("main.").expect("failed to parse query");
+        let (results, _) = execute(&mut db, query_terms).expect("execute should succeed");
+        // Model3D::from_term が Var を見つけたら Err(UnboundVariable(...)) を返す。
+        for t in &results {
+            let r = crate::manifold_bridge::Model3D::from_term(t);
+            assert!(
+                !matches!(r, Err(crate::manifold_bridge::ConversionError::UnboundVariable(_))),
+                "term has unbound variable: term={:?} err={:?}",
+                t,
+                r.err()
+            );
+        }
     }
 
     #[test]
