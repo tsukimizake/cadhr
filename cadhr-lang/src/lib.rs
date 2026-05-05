@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[macro_use]
+mod test_helpers;
+
 pub mod bezier;
 pub mod bom;
 pub mod collision;

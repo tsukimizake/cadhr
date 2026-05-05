@@ -90,7 +90,7 @@ pub enum Model3D {
         profile_data: Vec<(f64, f64)>,
         path_data: Vec<(f64, f64)>,
     },
-    Center {
+    Center3D {
         model: Box<Model3D>,
         x: f64,
         y: f64,
@@ -103,10 +103,17 @@ pub enum Model2D {
     SketchXY(Plane2D),
     SketchYZ(Plane2D),
     SketchXZ(Plane2D),
-    Path { points: Vec<(f64, f64)> },
+    Path {
+        points: Vec<(f64, f64)>,
+    },
     Union(Box<Model2D>, Box<Model2D>),
     Difference(Box<Model2D>, Box<Model2D>),
     Intersection(Box<Model2D>, Box<Model2D>),
+    Center2D {
+        profile: Box<Model2D>,
+        x: f64,
+        y: f64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -143,7 +150,8 @@ pub const BUILTIN_FUNCTORS: &[(&str, &[usize])] = &[
     ("path", &[2]),
     ("sweep_extrude", &[2]),
     ("control", &[3, 4]),
-    ("center", &[4]),
+    ("center3d", &[4]),
+    ("center2d", &[3]),
 ];
 
 inventory::submit! {
@@ -180,7 +188,8 @@ enum FunctorTag {
     Path,
     SweepExtrude,
     Control,
-    Center,
+    Center3D,
+    Center2D,
 }
 
 impl FromStr for FunctorTag {
@@ -212,7 +221,8 @@ impl FromStr for FunctorTag {
             "path" => Ok(FunctorTag::Path),
             "sweep_extrude" => Ok(FunctorTag::SweepExtrude),
             "control" => Ok(FunctorTag::Control),
-            "center" => Ok(FunctorTag::Center),
+            "center3d" => Ok(FunctorTag::Center3D),
+            "center2d" => Ok(FunctorTag::Center2D),
             _ => Err(()),
         }
     }
@@ -246,7 +256,8 @@ impl fmt::Display for FunctorTag {
             FunctorTag::Path => "path",
             FunctorTag::SweepExtrude => "sweep_extrude",
             FunctorTag::Control => "control",
-            FunctorTag::Center => "center",
+            FunctorTag::Center3D => "center3d",
+            FunctorTag::Center2D => "center2d",
         };
         f.write_str(s)
     }
@@ -873,6 +884,13 @@ impl Model2D {
                 Box::new(Model2D::from_term(&a.args[1])?),
             )),
 
+            FunctorTag::Center2D if a.len() == 3 => Ok(Model2D::Center2D {
+                profile: Box::new(Model2D::from_term(&a.args[0])?),
+                x: a.f64(1)?,
+                y: a.f64(2)?,
+            }),
+            FunctorTag::Center2D => Err(a.arity_error("3")),
+
             _ => Err(ConversionError::UnknownPrimitive(format!(
                 "expected 2D profile, got {}",
                 functor
@@ -905,6 +923,40 @@ impl Model2D {
             Model2D::Union(a, b) => polygon_boolean_2d(a, b, |ma, mb| ma.union(mb)),
             Model2D::Difference(a, b) => polygon_boolean_2d(a, b, |ma, mb| ma.difference(mb)),
             Model2D::Intersection(a, b) => polygon_boolean_2d(a, b, |ma, mb| ma.intersection(mb)),
+            Model2D::Center2D { profile, x, y } => {
+                let rings = profile.to_polygon_rings()?;
+                let mut min_x = f64::INFINITY;
+                let mut min_y = f64::INFINITY;
+                let mut max_x = f64::NEG_INFINITY;
+                let mut max_y = f64::NEG_INFINITY;
+                for ring in &rings {
+                    for chunk in ring.chunks_exact(2) {
+                        if chunk[0] < min_x {
+                            min_x = chunk[0];
+                        }
+                        if chunk[0] > max_x {
+                            max_x = chunk[0];
+                        }
+                        if chunk[1] < min_y {
+                            min_y = chunk[1];
+                        }
+                        if chunk[1] > max_y {
+                            max_y = chunk[1];
+                        }
+                    }
+                }
+                let dx = x - (min_x + max_x) / 2.0;
+                let dy = y - (min_y + max_y) / 2.0;
+                let translated = rings
+                    .into_iter()
+                    .map(|ring| {
+                        ring.chunks_exact(2)
+                            .flat_map(|c| [c[0] + dx, c[1] + dy])
+                            .collect()
+                    })
+                    .collect();
+                Some(translated)
+            }
         }
     }
 
@@ -913,6 +965,7 @@ impl Model2D {
         match self {
             Model2D::SketchYZ(_) => Some((90.0, 0.0, 90.0)),
             Model2D::SketchXZ(_) => Some((-90.0, 0.0, 0.0)),
+            Model2D::Center2D { profile, .. } => profile.plane_rotation(),
             _ => None,
         }
     }
@@ -1151,13 +1204,17 @@ impl Model3D {
                     functor
                 )))
             }
-            FunctorTag::Center if a.len() == 4 => Ok(Model3D::Center {
+            FunctorTag::Center3D if a.len() == 4 => Ok(Model3D::Center3D {
                 model: Box::new(a.term_3d(0)?),
                 x: a.f64(1)?,
                 y: a.f64(2)?,
                 z: a.f64(3)?,
             }),
-            FunctorTag::Center => Err(a.arity_error("4")),
+            FunctorTag::Center3D => Err(a.arity_error("4")),
+
+            FunctorTag::Center2D => Err(ConversionError::UnknownPrimitive(
+                "center2d is a 2D-only operation; wrap with linear_extrude/revolve before using as 3D".to_string(),
+            )),
 
             FunctorTag::Control => Err(ConversionError::UnknownPrimitive(
                 "control is a data constructor, not a shape primitive".to_string(),
@@ -1251,7 +1308,7 @@ impl Model3D {
                 Ok(Manifold::from_mesh(mesh))
             }
 
-            Model3D::Center { model, x, y, z } => {
+            Model3D::Center3D { model, x, y, z } => {
                 let manifold = model.evaluate(include_paths)?;
                 let mesh = manifold.calculate_normals(0, 30.0).to_mesh();
                 let num_props = mesh.num_props() as usize;
@@ -1375,7 +1432,7 @@ fn build_evaluated_node(
         Model3D::Translate { model: e, .. }
         | Model3D::Scale { model: e, .. }
         | Model3D::Rotate { model: e, .. }
-        | Model3D::Center { model: e, .. } => {
+        | Model3D::Center3D { model: e, .. } => {
             vec![build_evaluated_node(e, include_paths)?]
         }
         _ => vec![],
@@ -2212,8 +2269,8 @@ mod tests {
                 // start(1) + 16 bezier steps = 17 points
                 assert_eq!(points.len(), 17);
                 assert_eq!(points[0], (0.0, 0.0));
-                assert!((points[16].0 - 10.0).abs() < 1e-9);
-                assert!((points[16].1 - 0.0).abs() < 1e-9);
+                assert_close!(points[16].0, 10.0);
+                assert_close!(points[16].1, 0.0);
             }
             _ => panic!("Expected Path"),
         }
@@ -2229,8 +2286,8 @@ mod tests {
         match &expr {
             Model2D::Path { points } => {
                 assert_eq!(points.len(), 17);
-                assert!((points[16].0 - 10.0).abs() < 1e-9);
-                assert!((points[16].1 - 0.0).abs() < 1e-9);
+                assert_close!(points[16].0, 10.0);
+                assert_close!(points[16].1, 0.0);
             }
             _ => panic!("Expected Path"),
         }
@@ -2320,12 +2377,12 @@ mod tests {
     }
 
     #[test]
-    fn test_center_with_translate() {
+    fn test_center3d_with_translate() {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
         let mut db =
-            database("main :- cube(10,10,10) |> translate(5,0,0) |> center(0,0,0).").unwrap();
+            database("main :- cube(10,10,10) |> translate(5,0,0) |> center3d(0,0,0).").unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (resolved, _) = execute(&mut db, q).unwrap();
         let exprs: Vec<Model3D> = resolved
@@ -2343,14 +2400,13 @@ mod tests {
     }
 
     #[test]
-    fn test_center_with_control() {
+    fn test_center3d_with_control() {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let mut db = database(
-            "main :- control(X@0, Y@0, Z@0), cube(10,10,10) |> center(X, Y, Z).",
-        )
-        .unwrap();
+        let mut db =
+            database("main :- control(X@0, Y@0, Z@0), cube(10,10,10) |> center3d(X, Y, Z).")
+                .unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (mut resolved, _) = execute(&mut db, q).unwrap();
         let cps = extract_control_points(&mut resolved, &Default::default());
@@ -2370,5 +2426,79 @@ mod tests {
         assert_eq!(node.aabb_max[0], 5.0);
         assert_eq!(node.aabb_max[1], 5.0);
         assert_eq!(node.aabb_max[2], 5.0);
+    }
+
+    #[test]
+    fn test_center2d_with_circle() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let mut db =
+            database("main :- circle(5) |> center2d(10, 20) |> linear_extrude(2).").unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let (resolved, _) = execute(&mut db, q).unwrap();
+        let exprs: Vec<Model3D> = resolved
+            .iter()
+            .filter_map(|t| Model3D::from_term(t).ok())
+            .collect();
+        assert_eq!(exprs.len(), 1);
+        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
+        let cx = (node.aabb_min[0] + node.aabb_max[0]) / 2.0;
+        let cy = (node.aabb_min[1] + node.aabb_max[1]) / 2.0;
+        assert_close!(cx, 10.0);
+        assert_close!(cy, 20.0);
+    }
+
+    #[test]
+    fn test_center2d_with_sketch_yz() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let mut db = database(
+            "main :- sketchYZ([p(10,20), p(20,20), p(20,30), p(10,30)]) |> center2d(0, 0) |> linear_extrude(2).",
+        )
+        .unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let (resolved, _) = execute(&mut db, q).unwrap();
+        let exprs: Vec<Model3D> = resolved
+            .iter()
+            .filter_map(|t| Model3D::from_term(t).ok())
+            .collect();
+        assert_eq!(exprs.len(), 1);
+        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
+        let cy = (node.aabb_min[1] + node.aabb_max[1]) / 2.0;
+        let cz = (node.aabb_min[2] + node.aabb_max[2]) / 2.0;
+        assert_close!(cy, 0.0);
+        assert_close!(cz, 0.0);
+
+        let x_extent = node.aabb_max[0] - node.aabb_min[0];
+        let y_extent = node.aabb_max[1] - node.aabb_min[1];
+        let z_extent = node.aabb_max[2] - node.aabb_min[2];
+        assert_close!(x_extent, 2.0);
+        assert_close!(y_extent, 10.0);
+        assert_close!(z_extent, 10.0);
+    }
+
+    #[test]
+    fn test_center2d_with_sketch() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let mut db = database(
+            "main :- sketchXY([p(0,0), p(10,0), p(10,4), p(0,4)]) |> center2d(0, 0) |> linear_extrude(1).",
+        )
+        .unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let (resolved, _) = execute(&mut db, q).unwrap();
+        let exprs: Vec<Model3D> = resolved
+            .iter()
+            .filter_map(|t| Model3D::from_term(t).ok())
+            .collect();
+        assert_eq!(exprs.len(), 1);
+        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
+        assert_close!(node.aabb_min[0], -5.0);
+        assert_close!(node.aabb_max[0], 5.0);
+        assert_close!(node.aabb_min[1], -2.0);
+        assert_close!(node.aabb_max[1], 2.0);
     }
 }

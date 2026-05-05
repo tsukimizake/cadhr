@@ -49,23 +49,23 @@ mod tests {
     fn test_quadratic_endpoints() {
         let pts = evaluate_quadratic((0.0, 0.0), (5.0, 10.0), (10.0, 0.0), 16);
         assert_eq!(pts.len(), 16);
-        assert!((pts.last().unwrap().0 - 10.0).abs() < 1e-9);
-        assert!((pts.last().unwrap().1 - 0.0).abs() < 1e-9);
+        assert_close!(pts.last().unwrap().0, 10.0);
+        assert_close!(pts.last().unwrap().1, 0.0);
     }
 
     #[test]
     fn test_cubic_endpoints() {
         let pts = evaluate_cubic((0.0, 0.0), (5.0, 10.0), (10.0, 10.0), (10.0, 0.0), 16);
         assert_eq!(pts.len(), 16);
-        assert!((pts.last().unwrap().0 - 10.0).abs() < 1e-9);
-        assert!((pts.last().unwrap().1 - 0.0).abs() < 1e-9);
+        assert_close!(pts.last().unwrap().0, 10.0);
+        assert_close!(pts.last().unwrap().1, 0.0);
     }
 
     #[test]
     fn test_quadratic_midpoint() {
         // t=0.5: 0.25*start + 0.5*control + 0.25*end
         let pts = evaluate_quadratic((0.0, 0.0), (0.0, 10.0), (10.0, 0.0), 2);
-        assert!((pts[0].0 - 2.5).abs() < 1e-9);
-        assert!((pts[0].1 - 5.0).abs() < 1e-9);
+        assert_close!(pts[0].0, 2.5);
+        assert_close!(pts[0].1, 5.0);
     }
 }
