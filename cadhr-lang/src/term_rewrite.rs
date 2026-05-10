@@ -313,8 +313,7 @@ fn try_fold_number_literals<S>(term: &Term<S>) -> Option<FixedPoint> {
         | Term::Struct { .. }
         | Term::List { .. }
         | Term::StringLit { .. }
-        | Term::Constraint { .. }
-        => None,
+        | Term::Constraint { .. } => None,
     }
 }
 
@@ -344,8 +343,7 @@ pub fn try_eval_to_number<S>(term: &Term<S>) -> Option<FixedPoint> {
         | Term::Struct { .. }
         | Term::List { .. }
         | Term::StringLit { .. }
-        | Term::Constraint { .. }
-        => None,
+        | Term::Constraint { .. } => None,
     }
 }
 
@@ -376,10 +374,7 @@ pub fn fold_number_literals_in_place<S>(term: &mut Term<S>) {
                 fold_number_literals_in_place(left.as_mut());
                 fold_number_literals_in_place(right.as_mut());
             }
-            Term::Number { .. }
-            | Term::Var { .. }
-            | Term::StringLit { .. }
-            => {}
+            Term::Number { .. } | Term::Var { .. } | Term::StringLit { .. } => {}
         }
     }
 }
@@ -645,15 +640,9 @@ pub fn infer_query_param_ranges(
 
                         // query arg → head arg name → body range のマッピング
                         for (q_arg, h_arg) in q_args.iter().zip(h_args.iter()) {
-                            if let Term::Var {
-                                name: q_name, ..
-                            } = q_arg
-                            {
+                            if let Term::Var { name: q_name, .. } = q_arg {
                                 // head arg の変数名を取得
-                                if let Term::Var {
-                                    name: h_name, ..
-                                } = h_arg
-                                {
+                                if let Term::Var { name: h_name, .. } = h_arg {
                                     if let Some((r_min, r_max)) = body_ranges.get(h_name) {
                                         for param in params.iter_mut() {
                                             if &param.name == q_name {
@@ -805,14 +794,7 @@ pub fn unify(
                 },
             ) if n1 == n2 && s1 == s2 => {}
             // Var vs Number
-            (
-                Term::Var {
-                    name,
-                    scope,
-                    ..
-                },
-                Term::Number { .. },
-            ) => {
+            (Term::Var { name, scope, .. }, Term::Number { .. }) => {
                 if name != "_" {
                     env.insert(*scope, name.clone(), t2.clone());
                 }
@@ -821,14 +803,7 @@ pub fn unify(
                 stack.push((t2, t1));
             }
             // Var vs other
-            (
-                Term::Var {
-                    name,
-                    scope,
-                    ..
-                },
-                _,
-            ) if name != "_" => {
+            (Term::Var { name, scope, .. }, _) if name != "_" => {
                 if occurs_check_scoped(name, *scope, &t2) {
                     return Err(UnifyError {
                         message: format!("occurs check failed: {} occurs in {:?}", name, t2),
@@ -1018,8 +993,11 @@ fn apply_env_in_place(goals: &mut [ScopedTerm], shared_env: &ScopedEnv) {
     }
 }
 
-/// body と other_goals 双方から Constraint を抜き出してまとめて解き、束縛を shared_env に
-/// 反映する。残った未解決 Constraint は other_goals 末尾に戻す。
+/// body と other_goals 双方から Constraint を抜き出してまとめて処理する。
+/// 各 Constraint は左右の resolved 形を見て：
+///   - 両側が ArithExpr に変換できる → 線形ソルバへ
+///   - 変換不能 (Struct/List 含む)   → unify()
+/// 解けた束縛は shared_env に反映、残った未解決 Constraint は other_goals 末尾に戻す。
 fn split_and_resolve_constraints(
     remaining_body: &mut Vec<ScopedTerm>,
     other_goals: &mut Vec<ScopedTerm>,
@@ -1038,20 +1016,65 @@ fn split_and_resolve_constraints(
     if constraints.is_empty() {
         return Ok(());
     }
-    // 既存の shared_env 束縛を反映してから solver に渡す
+    // 既存の shared_env 束縛を反映してから solver/unify に渡す
     apply_env_in_place(&mut constraints, shared_env);
     try_resolve_constraints(&mut constraints, shared_env)?;
     other_goals.extend(constraints);
     Ok(())
 }
 
-/// goals 内の Constraint を評価し、解けたものは除去、解けないものは残す
-/// 全 Constraint をまとめて SolverState に渡し、連立方程式として解く
-/// 解けた束縛は shared_env にも反映され、以降のサブゴール展開で利用可能になる
+/// goals 内の Constraint を評価し、解けたものは除去、解けないものは残す。
+///
+/// 各 Constraint について、左右が ArithExpr に変換できるかを実行時に判定する：
+///   - 両側変換可能       → 算術連立方程式の一部として線形ソルバに渡す
+///   - 変換不能（Struct/List 含む） → unify() で構造的単一化を試みる
+/// 解けた束縛は shared_env にも反映され、以降のサブゴール展開で利用可能になる。
 fn try_resolve_constraints(
     goals: &mut Vec<ScopedTerm>,
     shared_env: &mut ScopedEnv,
 ) -> Result<(), RewriteError> {
+    // ディスパッチ判定（ArithExpr 変換可能か）が Var の最新束縛を見落とさないよう、
+    // shared_env を反映してから判定する。Var → Struct 束縛があるとき、未解決 Var の
+    // ままだと try_from_term が Ok を返してしまい誤って算術ソルバに渡されるため。
+    apply_env_in_place(goals, shared_env);
+
+    // 1. unifyが必要な Constraint を先に処理する。
+    //    インデックスを後ろから処理することで goals.remove() のずれを防ぐ。
+    let mut unify_indices = Vec::new();
+    for (i, goal) in goals.iter().enumerate() {
+        if let Term::Constraint { left, right } = goal {
+            let left_arith = ArithExpr::try_from_term(left).is_ok();
+            let right_arith = ArithExpr::try_from_term(right).is_ok();
+            if !(left_arith && right_arith) {
+                unify_indices.push(i);
+            }
+        }
+    }
+    for &idx in unify_indices.iter().rev() {
+        let g = goals.remove(idx);
+        let (left, right) = match g {
+            Term::Constraint { left, right } => (*left, *right),
+            _ => unreachable!(),
+        };
+        // unify は left/right を消費する。エラー時の goal 復元用に clone しておくが、
+        // 関数冒頭の apply_env_in_place で既に env 反映済みなので resolve は不要。
+        let original_goal = Term::Constraint {
+            left: Box::new(left.clone()),
+            right: Box::new(right.clone()),
+        };
+        unify(left, right, shared_env).map_err(|e| RewriteError {
+            message: format!("unify failed: {}", e.message),
+            goal: original_goal,
+        })?;
+    }
+    if !unify_indices.is_empty() {
+        // unify で得た束縛を残りの goals に反映
+        for g in goals.iter_mut() {
+            *g = resolve(g, shared_env);
+        }
+    }
+
+    // 2. 残った Constraint（両側が ArithExpr に変換可能なもの）を線形ソルバに渡す。
     let mut eqs = Vec::new();
     let mut constraint_indices = Vec::new();
     for (i, goal) in goals.iter().enumerate() {
@@ -1301,13 +1324,8 @@ fn rewrite_term_recursive(
                 // しか伝播しないため、ここで明示的に行う必要がある。
                 propagate_defaults_to(&b, &mut remaining_body);
 
-                let resolved = rewrite_term_recursive(
-                    db,
-                    clause_counter,
-                    b,
-                    other_goals,
-                    shared_env,
-                )?;
+                let resolved =
+                    rewrite_term_recursive(db, clause_counter, b, other_goals, shared_env)?;
                 all_resolved.extend(resolved);
 
                 // 再帰中に other_goals に新しい Constraint が追加されたり、shared_env が
@@ -1421,9 +1439,7 @@ fn resolve_builtin_arg(
     shared_env: &mut ScopedEnv,
 ) -> Result<ScopedTerm, RewriteError> {
     match term {
-        Term::Number { .. } | Term::Var { .. } | Term::StringLit { .. } => {
-            Ok(term)
-        }
+        Term::Number { .. } | Term::Var { .. } | Term::StringLit { .. } => Ok(term),
         Term::List { items, tail } => {
             let resolved_items = items
                 .into_iter()
@@ -2015,53 +2031,6 @@ mod tests {
         assert_eq!(resolved, vec!["left(a)", "right(b)"]);
     }
 
-    // ===== backtracking required (ignored for now) =====
-
-    #[test]
-    #[ignore]
-    fn rule_multiple_goals() {
-        let resolved = run_success(
-            "grandparent(X, Z) :- parent(X, Y), parent(Y, Z). parent(a, b). parent(b, c).",
-            "grandparent(a, c).",
-        );
-        assert_eq!(
-            resolved,
-            vec!["grandparent(a, c)", "parent(a, b)", "parent(b, c)"]
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn rule_multiple_goals_with_var() {
-        let resolved = run_success(
-            "grandparent(X, Z) :- parent(X, Y), parent(Y, Z). parent(a, b). parent(b, c).",
-            "grandparent(a, W).",
-        );
-        assert_eq!(
-            resolved,
-            vec!["grandparent(a, c)", "parent(a, b)", "parent(b, c)"]
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn rule_shared_variable_propagation() {
-        let resolved = run_success(
-            "connect(X, Z) :- link(X, Y), link(Y, Z). link(a, b). link(b, c).",
-            "connect(a, Z).",
-        );
-        assert_eq!(resolved, vec!["connect(a, c)", "link(a, b)", "link(b, c)"]);
-    }
-
-    #[test]
-    #[ignore]
-    fn rule_mixed_with_facts() {
-        run_success(
-            "animal(dog). animal(cat). is_pet(X) :- animal(X).",
-            "is_pet(dog).",
-        );
-    }
-
     #[test]
     fn arith_with_user_defined_rule() {
         // ob :- cube(1,1,1). main :- ob + cube(2,2,2).
@@ -2333,7 +2302,10 @@ wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(X, Y, H).\n\
         for t in &results {
             let r = crate::manifold_bridge::Model3D::from_term(t);
             assert!(
-                !matches!(r, Err(crate::manifold_bridge::ConversionError::UnboundVariable(_))),
+                !matches!(
+                    r,
+                    Err(crate::manifold_bridge::ConversionError::UnboundVariable(_))
+                ),
                 "term has unbound variable: term={:?} err={:?}",
                 t,
                 r.err()
@@ -2366,5 +2338,155 @@ wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(X, Y, H).\n\
                 inclusive: false,
             }
         );
+    }
+
+    // ===== 機構モデリングを支える基礎挙動のテスト =====
+    // body の `=` の動的ディスパッチ、リスト要素変数の共有、線形ソルバの
+    // 歯車比解決、距離整合の二乗式、範囲注釈付きデフォルトの伝播が揃って
+    // 機構ライブラリ (`gear pair` の噛み合い検証) の前提となる。
+
+    /// body の `[1, 2, 3] = [A, B, C]` は構造的単一化として処理され、A=1, B=2, C=3 を束縛する。
+    #[test]
+    fn body_eq_unifies_lists() {
+        let mut db =
+            database("test :- L = [1, 2, 3], L = [A, B, C], cube(A, B, C).").expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
+        let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
+        assert_eq!(strs, vec!["cube(1, 2, 3)"]);
+    }
+
+    /// body で構造体を変数に束縛し、後続の `=` で各フィールドを取り出せる。
+    /// 機構ライブラリで `G = gp(_, M, Z, _, _, _, _)` のように歯車のフィールド分解に使う。
+    #[test]
+    fn body_eq_unifies_structs() {
+        let mut db = database(
+            "test :- G = gp(g1, 1, 20, X@10, Y@20, T@5, 5),\n\
+                     G = gp(_, M, Z, _, _, _, _),\n\
+                     cube(M, Z, T).",
+        )
+        .expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
+        let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
+        assert_eq!(strs, vec!["cube(1, 20, 5)"]);
+    }
+
+    /// `=` の左右が parse 時には両方 Var でも、ランタイムで Struct に束縛されれば
+    /// 単一化として処理される。`try_resolve_constraints` での実行時ディスパッチの動作確認。
+    #[test]
+    fn body_eq_var_to_var_unifies_when_struct_bound_at_runtime() {
+        let mut db = database(
+            "mesh(GA, GB) :- GA = GB.\n\
+             test :- mesh(gp(g1, 1, M, X, Y), gp(g1, 1, 20, 30, 40)),\n\
+                     cube(M, X, Y).\n",
+        )
+        .expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
+        let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
+        assert_eq!(strs, vec!["cube(20, 30, 40)"]);
+    }
+
+    /// リスト要素として埋め込まれた変数が、複数の述語呼び出しを跨いで束縛を共有する。
+    /// 機構ライブラリでは `[gp(g1,...,T1,...), gp(g2,...,T2,...), ...]` をリストで持ち回り、
+    /// 噛み合い制約と描画の両方で同じ T1, T2 が見えることが必須。
+    ///
+    /// constrain で B = 7, C = 3 が束縛される。
+    /// 続く show でも同じ B, C が値として展開され、cylinder(7, 7) / cylinder(3, 3) が出る。
+    #[test]
+    fn list_element_var_shared_across_predicates() {
+        let db_src = "\
+constrain([_]).\n\
+constrain([A, B | Rest]) :- pair_eq(A, B), constrain([B | Rest]).\n\
+pair_eq(item(_, X), item(_, Y)) :- X + Y = 10.\n\
+show([]).\n\
+show([item(_, X) | R]) :- cylinder(X, X), show(R).\n\
+test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
+        show([item(a, 3), item(b, B), item(c, C)]).\n";
+        let mut db = database(db_src).expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
+        let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
+        assert!(
+            strs.iter().any(|s| s == "cylinder(7, 7)"),
+            "B=7 should propagate through show: got {:?}",
+            strs
+        );
+        assert!(
+            strs.iter().any(|s| s == "cylinder(3, 3)"),
+            "C=3 should propagate through show: got {:?}",
+            strs
+        );
+    }
+
+    /// 線形ソルバが歯車比 `Z1*T1 + Z2*T2 = 0` を T2 について解く。
+    /// Z1, Z2, T1 が既知なら T2 = -(Z1*T1)/Z2。
+    /// Z1=20, Z2=40, T1=5 なら T2 = -2.5。
+    #[test]
+    fn linear_solver_solves_gear_ratio_for_t2() {
+        let db_src = "test(T2) :- Z1 = 20, Z2 = 40, T1 = 5,\n\
+                                 Z1 * T1 + Z2 * T2 = 0,\n\
+                                 cylinder(T2, T2).\n";
+        let mut db = database(db_src).expect("parse db");
+        let q = query("test(T).").expect("parse query").1;
+        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
+        let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
+        assert_eq!(strs, vec!["cylinder(-2.5, -2.5)"]);
+    }
+
+    /// 中心距離整合: `DX*DX + DY*DY = (M*(Z1+Z2)/2)^2` が定数だけで成り立つ場合は通る。
+    /// 二乗形式を採るのは sqrt が無いため。M=1, Z1=20, Z2=40, X2-X1=30, Y2-Y1=0 では
+    /// 30*30 + 0 = 900 = 30*30 で整合する。
+    #[test]
+    fn gear_distance_squared_form_matches() {
+        let db_src = "test :- M = 1, Z1 = 20, Z2 = 40,\n\
+                              X1 = 0, Y1 = 0, X2 = 30, Y2 = 0,\n\
+                              DX = X2 - X1, DY = Y2 - Y1,\n\
+                              DistSq = DX*DX + DY*DY,\n\
+                              R = M*(Z1+Z2)/2,\n\
+                              DistSq = R*R,\n\
+                              cube(M, Z1, Z2).\n";
+        let mut db = database(db_src).expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
+        let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
+        assert_eq!(strs, vec!["cube(1, 20, 40)"]);
+    }
+
+    /// 中心距離不整合: 距離が規格と合わなければ算術矛盾で実行が失敗する。
+    /// X2=31 (期待値 30) のとき 31*31 = 961 ≠ 900 = 30*30。
+    #[test]
+    fn gear_distance_mismatch_yields_contradiction() {
+        let db_src = "test :- M = 1, Z1 = 20, Z2 = 40,\n\
+                              X1 = 0, Y1 = 0, X2 = 31, Y2 = 0,\n\
+                              DX = X2 - X1, DY = Y2 - Y1,\n\
+                              DistSq = DX*DX + DY*DY,\n\
+                              R = M*(Z1+Z2)/2,\n\
+                              DistSq = R*R,\n\
+                              cube(M, Z1, Z2).\n";
+        let mut db = database(db_src).expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let err = execute(&mut db, q).expect_err("distance mismatch should fail");
+        assert!(
+            err.error_message().contains("contradiction"),
+            "expected constraint contradiction, got: {}",
+            err.error_message()
+        );
+    }
+
+    /// 範囲注釈付きデフォルトの線形伝播: `-180 < T1 @ 0 < 180` で T1 にデフォルト 0 と
+    /// 範囲制約を与え、`T2 = 0 - T1` で T2 が連動する。query で T1=30 を渡すと T2=-30。
+    /// GUI でスライダーから T1 を変えた時の連動回転に対応。
+    #[test]
+    fn range_annotated_default_propagates_linearly() {
+        let db_src = "test(T1) :- -180 < T1 @ 0 < 180,\n\
+                                  T2 = 0 - T1,\n\
+                                  cylinder(5, T2).\n";
+        let mut db = database(db_src).expect("parse db");
+        let q = query("test(30).").expect("parse query").1;
+        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
+        let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
+        assert_eq!(strs, vec!["cylinder(5, -30)"]);
     }
 }

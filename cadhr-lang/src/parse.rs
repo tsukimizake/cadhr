@@ -228,7 +228,9 @@ pub enum Term<Scope = ()> {
     StringLit {
         value: String,
     },
-    /// 遅延された算術制約: left = right を後で検証
+    /// 遅延された等値ゴール: left = right を後で検証
+    /// 解決時に左右の resolved 形を見て、算術制約 (linear solver) か
+    /// 構造的単一化 (unify) かを判別する。
     Constraint {
         left: Box<Term<Scope>>,
         right: Box<Term<Scope>>,
@@ -987,7 +989,13 @@ pub(super) fn term(input: &str) -> PResult<'_, Term> {
     pipe_expr(input)
 }
 
-/// goal内の等値制約: `term = term` → Term::Constraint { left, right }
+/// goal内の等値: `term = term` → Term::Constraint { left, right }
+///
+/// パース時には常に `Term::Constraint` を生成する。実行時（`try_resolve_constraints`）に
+/// 左右の resolved 形を見て、両側が ArithExpr に変換できれば算術制約として、
+/// 変換不能な Struct/List が含まれれば構造的単一化（unify）として処理する。
+/// `X = Y` の Var 同士は parse 時には判別不能（後で Struct に束縛される可能性がある）
+/// なので、判別を実行時まで遅延する。
 fn eq_goal(input: &str) -> PResult<'_, Term> {
     let (input, left) = term(input)?;
     let (input, rhs) = opt(preceded(ws(char('=')), term)).parse(input)?;
