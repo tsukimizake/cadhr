@@ -1,0 +1,70 @@
+% mechanism: 平歯車 (spur gear) の機構記述ライブラリ
+%
+% 部品レコード:
+%   gp(Name, Module, Teeth, X, Y, Theta, Thickness)
+%     - Name      : 部品名 (アトム or 文字列)
+%     - Module    : 歯車モジュール (M)
+%     - Teeth     : 歯数 (Z)
+%     - X, Y      : 中心座標 (XY 平面)
+%     - Theta     : 回転角 (degree)
+%     - Thickness : 軸方向の厚み
+%
+% 使い方の概略:
+%   #use("mechanism").
+%   main :- mechanism::do_mech([
+%       mechanism::gp(g1, 1, 20, 0,  0, T1@0, 5),
+%       mechanism::gp(g2, 1, 40, 30, 0, T2,    5),
+%       mechanism::gp(g3, 1, 20, 60, 0, T3,    5)
+%   ]).
+%
+% NOTE: 現在の cadhr-lang では `expose([...])` で alias 節を作っても、
+%   alias の body 内で参照される内部ヘルパー (mesh/2, render_part/1) や
+%   データ記録子 (gp/7) も自動展開されない。そのためライブラリ呼び出しは
+%   `mechanism::` 前置詞をフルに付ける必要がある。
+%   (将来 module システム改修で expose を改善予定。)
+%
+% NOTE on tooth counts:
+%   cadhr-lang は 2 桁固定小数点 + 完全整除を要求する線形ソルバを使うため、
+%   隣接ペアの歯数比 (Z2/Z1) で割り切れる組み合わせを選ぶ必要がある。
+%   例: Z=20, 40, 20 や Z=15, 30, 60 は OK。Z=20, 40, 30 だと
+%   T3 = -40*T2/30 が割り切れず solver が解を出せない。
+%
+% リスト要素として埋め込まれた T1, T2, T3 は同じ節のスコープに居るため、
+% 内部の mesh/2 制約で束縛が伝播し、render_part でその値が描画に反映される。
+
+% ─────── 歯車の描画 ───────
+% 歯車本体はピッチ円半径の円柱で代用する (歯形は今のところ非表示)。
+% 隣接歯車同士は規格通りに配置されればちょうど接触する。
+render_part(gp(_, M, Z, X, Y, T, Th)) :-
+    R = M*Z/2,
+    cylinder(R, Th)
+        |> rotate(0, 0, T)
+        |> translate(X, Y, 0).
+
+% ─────── 噛み合い制約 ───────
+% 隣接する 2 つの平歯車の噛み合いを表現する。
+%
+% 1. モジュール一致: head パターンの同じ M で構造的に強制
+%    (不一致なら unify 失敗で no-clause-matches となる)
+% 2. 中心距離整合: (X2-X1)^2 + (Y2-Y1)^2 = (M*(Z1+Z2)/2)^2
+%    (sqrt が無いため二乗形式)
+%    位置 (X,Y) はユーザが直接書く想定で、不整合は assert_eq でラベル付きエラー
+% 3. 回転比: Z1*T1 + Z2*T2 = 0
+%    (外接歯車では歯数比に反比例し、回転は逆向き)
+%    この式は通常 T1 が既知で T2 を解く形になるため `=` で線形ソルバに渡す。
+%    ソルバの線形拡張により後続のサブゴールで T2 が定数として使える。
+mesh(gp(_, M, Z1, X1, Y1, T1, _), gp(_, M, Z2, X2, Y2, T2, _)) :-
+    DX = X2 - X1,
+    DY = Y2 - Y1,
+    R = M*(Z1 + Z2)/2,
+    assert_eq(DX*DX + DY*DY, R*R, "gear center distance"),
+    Z1*T1 + Z2*T2 = 0.
+
+% ─────── トラバーサル ───────
+% 部品リストを 1 本の chain として扱い、隣接ペアごとに mesh/2 を適用、
+% 同時に各部品を描画する。
+do_mech([G]) :- render_part(G).
+do_mech([A, B | Rest]) :-
+    mesh(A, B),
+    render_part(A),
+    do_mech([B | Rest]).

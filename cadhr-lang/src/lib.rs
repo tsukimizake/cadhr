@@ -2,6 +2,7 @@
 #[macro_use]
 mod test_helpers;
 
+pub mod assertions;
 pub mod bezier;
 pub mod bom;
 pub mod collision;

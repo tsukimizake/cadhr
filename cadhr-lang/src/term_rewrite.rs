@@ -1023,6 +1023,44 @@ fn split_and_resolve_constraints(
     Ok(())
 }
 
+/// `assert_eq(Expected, Actual)` / `assert_eq(Expected, Actual, "label")` を評価する。
+/// 両辺を shared_env で展開して数値に畳み込み、一致すれば結果空のベクタを返し、
+/// 不一致または評価不能なら `RewriteError` を返す。
+fn handle_assert_eq(
+    args: &[ScopedTerm],
+    span: Option<crate::parse::SrcSpan>,
+    shared_env: &ScopedEnv,
+) -> Result<Vec<ScopedTerm>, RewriteError> {
+    let (left, right, label) = crate::assertions::split_assert_eq_args(args);
+    let label_str = label.as_deref().unwrap_or("assert_eq");
+
+    let left_resolved = resolve(&left, shared_env);
+    let right_resolved = resolve(&right, shared_env);
+    let left_val = try_eval_to_number(&left_resolved);
+    let right_val = try_eval_to_number(&right_resolved);
+
+    let goal_term = Term::Struct {
+        functor: "assert_eq".to_string(),
+        args: args.to_vec(),
+        span,
+    };
+
+    match (left_val, right_val) {
+        (Some(l), Some(r)) if l == r => Ok(vec![]),
+        (Some(l), Some(r)) => Err(RewriteError {
+            message: format!("{}: expected {}, got {}", label_str, l, r),
+            goal: goal_term,
+        }),
+        _ => Err(RewriteError {
+            message: format!(
+                "{}: cannot evaluate args to numbers (left={:?}, right={:?})",
+                label_str, left_resolved, right_resolved
+            ),
+            goal: goal_term,
+        }),
+    }
+}
+
 /// goals 内の Constraint を評価し、解けたものは除去、解けないものは残す。
 ///
 /// 各 Constraint について、左右が ArithExpr に変換できるかを実行時に判定する：
@@ -1241,6 +1279,14 @@ fn rewrite_term_recursive(
 ) -> Result<Vec<ScopedTerm>, RewriteError> {
     let mut term = term;
     apply_default_var_bindings(&mut term, other_goals);
+
+    // assert_eq(Expected, Actual) / assert_eq(Expected, Actual, "label"):
+    // 両辺を数値に評価して比較。一致なら成功（結果空）、不一致なら RewriteError。
+    if let Term::Struct { functor, args, span } = &term {
+        if functor == "assert_eq" && (args.len() == 2 || args.len() == 3) {
+            return handle_assert_eq(args, *span, shared_env);
+        }
+    }
 
     // range付きVarがゴールとして出現: 値の範囲チェックのみ行い、結果は返さない
     if let Term::Var {
@@ -2488,5 +2534,109 @@ test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
         assert_eq!(strs, vec!["cylinder(5, -30)"]);
+    }
+
+    /// `assert_eq(L, R)` は両辺が等しければ結果に何も残さず通過する。
+    #[test]
+    fn assert_eq_passes_when_equal() {
+        let mut db = database(
+            "test :- X = 30, assert_eq(X*X, 900), cube(X, X, X).",
+        )
+        .expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
+        let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
+        assert_eq!(strs, vec!["cube(30, 30, 30)"]);
+    }
+
+    /// `assert_eq(L, R)` は両辺が異なれば RewriteError を返す。
+    #[test]
+    fn assert_eq_fails_when_unequal() {
+        let mut db = database("test :- assert_eq(2 + 2, 5), cube(1, 1, 1).")
+            .expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let err = execute(&mut db, q).expect_err("assert_eq mismatch should fail");
+        assert!(
+            err.error_message().contains("expected 4")
+                && err.error_message().contains("got 5"),
+            "expected message to mention expected/got values: {}",
+            err.error_message()
+        );
+    }
+
+    /// 3 引数版 `assert_eq(L, R, "label")` のラベルがエラーメッセージに含まれる。
+    /// 機構ライブラリで「中心距離整合」「歯車比」など人間に読めるエラーを出すために使う。
+    #[test]
+    fn assert_eq_includes_label_in_error_message() {
+        let mut db = database(
+            "test :- M = 1, Z1 = 20, Z2 = 40, X1 = 0, X2 = 31, Y1 = 0, Y2 = 0,\n\
+                     DX = X2 - X1, DY = Y2 - Y1,\n\
+                     R = M*(Z1+Z2)/2,\n\
+                     assert_eq(DX*DX + DY*DY, R*R, \"gear center distance\"),\n\
+                     cube(M, Z1, Z2).",
+        )
+        .expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let err = execute(&mut db, q).expect_err("distance mismatch should fail");
+        assert!(
+            err.error_message().contains("gear center distance"),
+            "expected label in error: {}",
+            err.error_message()
+        );
+        // 数値も含まれるはず: 期待 900, 実測 961
+        assert!(
+            err.error_message().contains("900") && err.error_message().contains("961"),
+            "expected expected/got values in message: {}",
+            err.error_message()
+        );
+    }
+
+    /// 線形ソルバが、ユーザ呼び出し側で1つの変数が定数に束縛されたときに、
+    /// 別ルールの body 内の制約 (`A*X + B*Y = 0`) を Y について解けることを確認する。
+    /// 機構ライブラリの連鎖伝播で必要な挙動。
+    #[test]
+    fn linear_solver_propagates_through_rule_call() {
+        let mut db = database(
+            "foo(T1, T2) :- 40*T1 + 20*T2 = 0.\n\
+             test :- T1 = -10, foo(T1, T2), cylinder(T2, T2).",
+        )
+        .expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
+        let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
+        // T1 = -10, 40*(-10) + 20*T2 = 0 → T2 = 20
+        assert_eq!(strs, vec!["cylinder(20, 20)"]);
+    }
+
+    /// 線形ソルバの丸め許容: 非整除な除算でも、近似値で変数を束縛し連鎖を継続できる。
+    /// `30 * T2 = 400` のような完全整除しないケースで T2 = 13.33 (本来 13.333...) を返す。
+    /// 機構ライブラリで歯数比が割り切れない組み合わせ (Z1*T1 / Z2 が非整数) でも
+    /// 駆動角伝播ができるようにする。
+    #[test]
+    fn linear_solver_rounds_non_exact_division() {
+        let mut db = database(
+            "foo(T1, T2) :- 40*T1 + 30*T2 = 0.\n\
+             test :- T1 = -10, foo(T1, T2), cylinder(T2, T2).",
+        )
+        .expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
+        let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
+        // 40*(-10) + 30*T2 = 0 → T2 = 400/30 = 13.333... → FixedPoint 13.33
+        assert_eq!(strs, vec!["cylinder(13.33, 13.33)"]);
+    }
+
+    /// 引数が未束縛のままだと、評価不能エラーが出る。
+    /// 単に黙って通り抜けないことを保証する。
+    #[test]
+    fn assert_eq_fails_when_args_unevaluable() {
+        let mut db = database("test :- assert_eq(X, 5, \"unbound\").").expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let err = execute(&mut db, q).expect_err("unbound arg should fail");
+        assert!(
+            err.error_message().contains("cannot evaluate"),
+            "expected 'cannot evaluate' in: {}",
+            err.error_message()
+        );
     }
 }

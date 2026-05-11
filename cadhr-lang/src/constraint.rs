@@ -113,7 +113,16 @@ fn try_eval(expr: &ArithExpr) -> Option<FixedPoint> {
     }
 }
 
-/// expr = target の形の方程式を解き、変数が1つなら (変数名, 値) を返す
+/// expr = target の形の方程式を解き、変数が1つなら (変数名, 値) を返す。
+///
+/// 除算で完全整除にならないケースでも FixedPoint の丸めを許容する。
+/// 例えば `30 * T2 = 400` で T2 = 13.33 (実際の値 13.333... を 0.01 単位に丸めた値)。
+/// 厳密整除を要求するとこの種の連立方程式が解けなくなり、
+/// 歯車比のような実用的なケースで未束縛変数が下流に流れてしまう。
+///
+/// 矛盾検出は逆算で `candidate * l_val` と `target` の差が `DIVISION_TOLERANCE`
+/// (= 1 単位の小数, つまり 0.01 から l_val を掛けたもの) を超える場合のみ失敗を返す。
+/// これにより本物の矛盾 (例えば `2*X = 7, 3*X = 11`) は依然として捕捉される。
 fn try_solve_for_var(expr: &ArithExpr, target: FixedPoint) -> Option<(String, FixedPoint)> {
     match expr {
         ArithExpr::Var(name) => Some((name.clone(), target)),
@@ -130,7 +139,7 @@ fn try_solve_for_var(expr: &ArithExpr, target: FixedPoint) -> Option<(String, Fi
                                 return None;
                             }
                             let candidate = target / l_val;
-                            if candidate * l_val != target {
+                            if !within_division_tolerance(candidate * l_val, target, l_val) {
                                 return None;
                             }
                             candidate
@@ -140,7 +149,10 @@ fn try_solve_for_var(expr: &ArithExpr, target: FixedPoint) -> Option<(String, Fi
                                 return None;
                             }
                             let candidate = l_val / target;
-                            if l_val / candidate != target {
+                            if candidate == zero {
+                                return None;
+                            }
+                            if !within_division_tolerance(l_val / candidate, target, target) {
                                 return None;
                             }
                             candidate
@@ -158,7 +170,7 @@ fn try_solve_for_var(expr: &ArithExpr, target: FixedPoint) -> Option<(String, Fi
                                 return None;
                             }
                             let candidate = target / r_val;
-                            if candidate * r_val != target {
+                            if !within_division_tolerance(candidate * r_val, target, r_val) {
                                 return None;
                             }
                             candidate
@@ -172,6 +184,19 @@ fn try_solve_for_var(expr: &ArithExpr, target: FixedPoint) -> Option<(String, Fi
         }
         _ => None,
     }
+}
+
+/// 除算の丸めによる誤差を許容するかどうかを判定する。
+///
+/// `back` は逆算で得た値、`target` は本来の目標値、`scale` は係数。
+/// FixedPoint::div は `(self.0 * 100) / rhs.0` の整数除算で 1 単位以内に切り捨てるため、
+/// candidate * scale の逆算では最大 `|scale| / 100` raw 単位 + 切り捨て分 1 の誤差が発生する。
+/// この上限以内の差は丸め誤差として許容し、それを超える差は本物の矛盾とみなす。
+fn within_division_tolerance(back: FixedPoint, target: FixedPoint, scale: FixedPoint) -> bool {
+    let diff_raw = (back.raw() - target.raw()).abs();
+    let scale_raw = scale.raw().abs();
+    let tol_raw = scale_raw / 100 + 1;
+    diff_raw <= tol_raw
 }
 
 fn substitute_in_expr(expr: &ArithExpr, bindings: &HashMap<String, FixedPoint>) -> ArithExpr {
