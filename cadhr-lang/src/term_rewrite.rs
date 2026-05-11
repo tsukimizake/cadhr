@@ -1152,10 +1152,13 @@ fn try_resolve_constraints(
             let mut scoped_env = ScopedEnv::new();
             for (var_name, value) in &result.bindings {
                 if let Some(&scope) = var_scopes.get(var_name) {
-                    scoped_env.insert(scope, var_name.clone(), number(*value));
+                    // Phase 2: Rational を FixedPoint に丸めて Term に格納する。
+                    // Phase 3 で Term::Number も Rational を持てば無損失になる。
+                    let term_value = number(value.to_fixed_point());
+                    scoped_env.insert(scope, var_name.clone(), term_value.clone());
                     // shared_env にも反映: 制約は解消されて消えるので、束縛を共有 env に残さないと
                     // 後続のサブゴール展開で同じ Var を解決できなくなる。
-                    shared_env.insert(scope, var_name.clone(), number(*value));
+                    shared_env.insert(scope, var_name.clone(), term_value);
                 }
             }
             for goal in goals.iter_mut() {
