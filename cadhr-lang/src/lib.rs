@@ -10,6 +10,7 @@ pub mod constraint;
 pub mod manifold_bridge;
 pub mod module;
 pub mod parse;
+pub mod rational;
 pub mod sweep;
 pub mod term_processor;
 pub mod term_rewrite;
