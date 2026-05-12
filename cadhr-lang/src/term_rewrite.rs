@@ -1076,7 +1076,13 @@ fn handle_assert_eq(
     match (left_val, right_val) {
         (Some(l), Some(r)) if l == r => Ok(vec![]),
         (Some(l), Some(r)) => Err(RewriteError {
-            message: format!("{}: expected {}, got {}", label_str, l, r),
+            // 非整除な厳密値 (例 40/3) のときは分数 + 近似 10 進を併記する
+            message: format!(
+                "{}: expected {}, got {}",
+                label_str,
+                l.fmt_exact(),
+                r.fmt_exact()
+            ),
             goal: goal_term,
         }),
         _ => Err(RewriteError {
@@ -2656,6 +2662,25 @@ test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
         // 40*(-10) + 30*T2 = 0 → T2 = 400/30 = 13.333... → FixedPoint 13.33
         assert_eq!(strs, vec!["cylinder(13.33, 13.33)"]);
+    }
+
+    /// assert_eq の不整合エラーが、非整除な値を含む場合に分数表記を併記する。
+    /// 旧 FixedPoint では `13.33` のような丸め値しか表示できず、誤差由来の偽の
+    /// 不整合と本物の不整合の区別が難しかった。Rational + fmt_exact なら
+    /// `40/3 (≈ 13.33)` のように厳密値が見える。
+    #[test]
+    fn assert_eq_error_shows_exact_form_for_non_finite_decimal() {
+        // 40/3 != 14 の不整合。期待値 40/3 (= 13.33...) が分数で表示される。
+        let mut db = database("test :- M = 40, D = 3, assert_eq(M/D, 14, \"ratio\").")
+            .expect("parse db");
+        let q = query("test.").expect("parse query").1;
+        let err = execute(&mut db, q).expect_err("should fail");
+        let msg = err.error_message();
+        assert!(
+            msg.contains("40/3") && msg.contains("13.33"),
+            "expected exact form '40/3 (≈ 13.33)' in: {}",
+            msg
+        );
     }
 
     /// 引数が未束縛のままだと、評価不能エラーが出る。
