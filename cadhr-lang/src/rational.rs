@@ -7,13 +7,10 @@
 //!   エラーメッセージなど厳密値を見せたい文脈では `fmt_exact()` を使い、
 //!   `40/3 (≈ 13.33)` のように分数と近似値を併記する。
 //! - manifold-rs / BOM / UI の境界では `to_f64()` で吸収する。
-//! - 旧 `FixedPoint` (2 桁固定小数) との相互変換も提供 (移行期用)。
 
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
-
-use crate::parse::FixedPoint;
 
 /// 厳密な有理数。
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -32,6 +29,11 @@ impl Rational {
     /// f64 から構築。NaN/Infinity は `Rational::zero()` にフォールバック。
     pub fn from_f64(v: f64) -> Self {
         BigRational::from_f64(v).map(Self).unwrap_or_else(Self::zero)
+    }
+
+    /// 既存の `BigRational` をラップする (内部ユーティリティ)。
+    pub fn from_big_rational(r: BigRational) -> Self {
+        Self(r)
     }
 
     pub fn to_f64(&self) -> f64 {
@@ -65,33 +67,41 @@ impl Rational {
         if self.is_integer() {
             return format!("{}", self.0.numer());
         }
-        // 分母が 2^a * 5^b なら有限 10 進。厳密に分母を判定するのは面倒なので、
-        // 「to_f64 → from_f64 で round-trip して一致するか」で雑に判定…ではなく、
-        // 「to_fixed_point() で 0.01 単位に丸めた値を 100 倍した分数と元が一致」を
-        // 検証する。一致しなければ非有限 10 進とみなして分数併記する。
-        let fp = self.to_fixed_point();
-        let fp_back = Self::from_ratio(fp.raw(), 100);
-        if fp_back == *self {
-            return format!("{}", fp);
+        // 2 桁丸めで round-trip 一致するなら有限 10 進と判定し、丸め値をそのまま返す。
+        // 一致しなければ非有限 10 進 (例 40/3) とみなして分数 + 近似 10 進を併記する。
+        let approx = (self.to_f64() * 100.0).round() / 100.0;
+        if (approx * 100.0).round() as i64
+            == (self.to_f64() * 100.0).round() as i64
+            && BigRational::from_f64(approx).as_ref() == Some(&self.0)
+        {
+            return format!("{}", self);
         }
-        let approx = self.to_fixed_point();
-        format!("{}/{} (≈ {})", self.0.numer(), self.0.denom(), approx)
+        format!("{}/{} (≈ {})", self.0.numer(), self.0.denom(), self)
     }
 
-    /// 0.01 単位の `FixedPoint` への lossy 変換 (四捨五入)。
-    /// 既存の f64 境界 (manifold-rs / BOM) で使う最終出力用。
-    pub fn to_fixed_point(&self) -> FixedPoint {
-        FixedPoint::from_f64(self.to_f64())
-    }
 }
 
 // ─────── Display / Debug ───────
 
 impl std::fmt::Display for Rational {
-    /// 現状 UX を維持するため、`FixedPoint` と同じ「小数 2 桁丸め」で表示する。
-    /// 厳密値が必要な場合は `fmt_exact()` を使う。
+    /// 「小数 2 桁丸め」で表示する。厳密値が必要な場合は `fmt_exact()` を使う。
+    /// 整数なら `5` のように、有限 10 進なら `1.5` のように、それ以外は四捨五入し
+    /// `13.33` のように 2 桁で表示する。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_fixed_point())
+        let v = self.to_f64();
+        if self.is_integer() {
+            return write!(f, "{}", self.0.numer());
+        }
+        // 2 桁四捨五入の文字列化。負値や末尾 0 の扱いを揃える。
+        let rounded = (v * 100.0).round() / 100.0;
+        let formatted = format!("{:.2}", rounded);
+        // 末尾 0 を削る (`3.50` → `3.5`)
+        let trimmed = if formatted.contains('.') {
+            formatted.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            formatted
+        };
+        write!(f, "{}", trimmed)
     }
 }
 
@@ -159,13 +169,6 @@ impl From<i64> for Rational {
     }
 }
 
-impl From<FixedPoint> for Rational {
-    /// `FixedPoint(n)` は `n/100` の有理数を表す。
-    fn from(fp: FixedPoint) -> Self {
-        Self::from_ratio(fp.raw(), 100)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,14 +216,6 @@ mod tests {
     fn fmt_exact_non_finite_decimal() {
         let r = Rational::from_ratio(40, 3);
         assert_eq!(r.fmt_exact(), "40/3 (≈ 13.33)");
-    }
-
-    #[test]
-    fn from_fixed_point_round_trip() {
-        let fp = FixedPoint::from_hundredths(150);
-        let r: Rational = fp.into();
-        assert_eq!(r, Rational::from_ratio(3, 2));
-        assert_eq!(r.to_fixed_point(), fp);
     }
 
     #[test]

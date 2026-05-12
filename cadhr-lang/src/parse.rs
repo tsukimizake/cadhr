@@ -77,114 +77,9 @@ impl FileRegistry {
     }
 }
 
-// ============================================================
-// FixedPoint: 2桁固定小数点数 (hundredths)
-// ============================================================
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FixedPoint(i64);
-
-impl FixedPoint {
-    pub fn from_hundredths(h: i64) -> Self {
-        Self(h)
-    }
-    pub fn from_int(v: i64) -> Self {
-        Self(v * 100)
-    }
-    pub fn from_f64(v: f64) -> Self {
-        Self((v * 100.0).round() as i64)
-    }
-    pub fn to_f64(self) -> f64 {
-        self.0 as f64 / 100.0
-    }
-    pub fn to_i64_checked(self) -> Option<i64> {
-        (self.0 % 100 == 0).then(|| self.0 / 100)
-    }
-    pub fn raw(self) -> i64 {
-        self.0
-    }
-}
-
-impl fmt::Debug for FixedPoint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
-impl fmt::Display for FixedPoint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0 % 100 == 0 {
-            write!(f, "{}", self.0 / 100)
-        } else {
-            let abs = self.0.unsigned_abs();
-            let sign = if self.0 < 0 { "-" } else { "" };
-            let whole = abs / 100;
-            let frac = abs % 100;
-            if frac % 10 == 0 {
-                write!(f, "{}{}.{}", sign, whole, frac / 10)
-            } else {
-                write!(f, "{}{}.{:02}", sign, whole, frac)
-            }
-        }
-    }
-}
-
-impl std::ops::Add for FixedPoint {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        Self(self.0 + rhs.0)
-    }
-}
-
-impl std::ops::Sub for FixedPoint {
-    type Output = Self;
-    fn sub(self, rhs: Self) -> Self {
-        Self(self.0 - rhs.0)
-    }
-}
-
-impl std::ops::Mul for FixedPoint {
-    type Output = Self;
-    fn mul(self, rhs: Self) -> Self {
-        Self(self.0 * rhs.0 / 100)
-    }
-}
-
-impl std::ops::Div for FixedPoint {
-    type Output = Self;
-    fn div(self, rhs: Self) -> Self {
-        Self(self.0 * 100 / rhs.0)
-    }
-}
-
-impl std::ops::Neg for FixedPoint {
-    type Output = Self;
-    fn neg(self) -> Self {
-        Self(-self.0)
-    }
-}
-
-impl PartialOrd for FixedPoint {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for FixedPoint {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-impl From<i64> for FixedPoint {
-    fn from(v: i64) -> Self {
-        Self::from_int(v)
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Bound {
-    pub value: FixedPoint,
+    pub value: crate::rational::Rational,
     pub inclusive: bool,
 }
 
@@ -201,13 +96,13 @@ pub enum Term<Scope = ()> {
     Var {
         name: String,
         scope: Scope,
-        default_value: Option<FixedPoint>,
+        default_value: Option<crate::rational::Rational>,
         min: Option<Bound>,
         max: Option<Bound>,
         span: Option<SrcSpan>,
     },
     Number {
-        value: FixedPoint,
+        value: crate::rational::Rational,
     },
     /// 中置演算子式: left op right (算術演算 or CSG演算)
     InfixExpr {
@@ -241,15 +136,15 @@ pub type ScopeId = usize;
 
 pub type ScopedTerm = Term<ScopeId>;
 
-/// Number または Var(default_value付き) から FixedPoint と SrcSpan を取り出す。
-pub fn term_as_fixed_point<S>(term: &Term<S>) -> Option<(FixedPoint, Option<SrcSpan>)> {
+/// Number または Var(default_value付き) から Rational と SrcSpan を取り出す。
+pub fn term_as_number<S>(term: &Term<S>) -> Option<(crate::rational::Rational, Option<SrcSpan>)> {
     match term {
-        Term::Number { value } => Some((*value, None)),
+        Term::Number { value } => Some((value.clone(), None)),
         Term::Var {
             default_value: Some(value),
             span,
             ..
-        } => Some((*value, *span)),
+        } => Some((value.clone(), *span)),
         _ => None,
     }
 }
@@ -490,7 +385,7 @@ pub fn var_with_span(name: String, span: SrcSpan) -> Term {
     }
 }
 
-pub fn default_var(name: String, value: FixedPoint) -> Term {
+pub fn default_var(name: String, value: crate::rational::Rational) -> Term {
     Term::Var {
         name,
         scope: (),
@@ -501,7 +396,7 @@ pub fn default_var(name: String, value: FixedPoint) -> Term {
     }
 }
 
-pub fn default_var_with_span(name: String, value: FixedPoint, span: SrcSpan) -> Term {
+pub fn default_var_with_span(name: String, value: crate::rational::Rational, span: SrcSpan) -> Term {
     Term::Var {
         name,
         scope: (),
@@ -514,7 +409,7 @@ pub fn default_var_with_span(name: String, value: FixedPoint, span: SrcSpan) -> 
 
 pub fn annotated_var(
     name: String,
-    default_value: Option<FixedPoint>,
+    default_value: Option<crate::rational::Rational>,
     min: Option<Bound>,
     max: Option<Bound>,
     span: Option<SrcSpan>,
@@ -529,13 +424,13 @@ pub fn annotated_var(
     }
 }
 
-pub fn number<S>(value: FixedPoint) -> Term<S> {
+pub fn number<S>(value: crate::rational::Rational) -> Term<S> {
     Term::Number { value }
 }
 
 pub fn number_int<S>(value: i64) -> Term<S> {
     Term::Number {
-        value: FixedPoint::from_int(value),
+        value: crate::rational::Rational::from_integer(value),
     }
 }
 
@@ -688,32 +583,34 @@ fn variable(input: &str) -> PResult<'_, String> {
     .parse(input)
 }
 
-fn fixed_number(input: &str) -> PResult<'_, FixedPoint> {
+/// 数値リテラル parser。`"123"`, `"-3.5"`, `"1.234567"` などを受け入れ、
+/// 厳密な有理数 (`Rational`) を返す。整数 / 小数の桁数に制限はない。
+/// 内部的には「整数部 * 10^n + 小数部」を分子、`10^n` を分母として構築する。
+fn fixed_number(input: &str) -> PResult<'_, crate::rational::Rational> {
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
+    use std::str::FromStr;
+
     map_res(
         recognize((opt(char('-')), digit1, opt(pair(char('.'), digit1)))),
-        |s: &str| -> Result<FixedPoint, String> {
+        |s: &str| -> Result<crate::rational::Rational, String> {
             if let Some(dot_pos) = s.find('.') {
-                let int_part: i64 = s[..dot_pos]
-                    .parse()
-                    .map_err(|e: std::num::ParseIntError| e.to_string())?;
+                let int_part_str = &s[..dot_pos];
                 let frac_str = &s[dot_pos + 1..];
-                let frac_val: i64 = frac_str
-                    .parse()
-                    .map_err(|e: std::num::ParseIntError| e.to_string())?;
-                let frac = match frac_str.len() {
-                    1 => frac_val * 10,
-                    2 => frac_val,
-                    _ => return Err("fractional part must be 1-2 digits".to_string()),
-                };
-                let sign = if s.starts_with('-') { -1 } else { 1 };
-                Ok(FixedPoint::from_hundredths(
-                    sign * (int_part.abs() * 100 + frac),
-                ))
+                let sign_is_neg = int_part_str.starts_with('-');
+                let int_abs_str = if sign_is_neg { &int_part_str[1..] } else { int_part_str };
+                let int_abs = BigInt::from_str(int_abs_str).map_err(|e| e.to_string())?;
+                let frac_val = BigInt::from_str(frac_str).map_err(|e| e.to_string())?;
+                let frac_digits = frac_str.len() as u32;
+                let scale = BigInt::from(10).pow(frac_digits);
+                let numer_abs = &int_abs * &scale + &frac_val;
+                let numer = if sign_is_neg { -numer_abs } else { numer_abs };
+                let r = BigRational::new(numer, scale);
+                Ok(crate::rational::Rational::from_big_rational(r))
             } else {
-                let v: i64 = s
-                    .parse()
-                    .map_err(|e: std::num::ParseIntError| e.to_string())?;
-                Ok(FixedPoint::from_int(v))
+                let v = BigInt::from_str(s).map_err(|e| e.to_string())?;
+                let r = BigRational::from(v);
+                Ok(crate::rational::Rational::from_big_rational(r))
             }
         },
     )
@@ -763,7 +660,7 @@ fn comp_op(input: &str) -> PResult<'_, CompOp> {
     .parse(input)
 }
 
-fn default_value_suffix(input: &str) -> PResult<'_, (FixedPoint, SrcSpan)> {
+fn default_value_suffix(input: &str) -> PResult<'_, (crate::rational::Rational, SrcSpan)> {
     let (input, _) = ws(char('@')).parse(input)?;
     let (input, _) = space_or_comment0(input)?;
     let value_start = input.as_ptr() as usize;
@@ -1212,7 +1109,7 @@ pub struct QueryParam {
     pub name: String,
     pub min: Option<Bound>,
     pub max: Option<Bound>,
-    pub default_value: Option<FixedPoint>,
+    pub default_value: Option<crate::rational::Rational>,
 }
 
 fn collect_query_params_from_term(term: &Term, params: &mut Vec<QueryParam>) {
@@ -1227,9 +1124,9 @@ fn collect_query_params_from_term(term: &Term, params: &mut Vec<QueryParam>) {
             if !params.iter().any(|p| p.name == *name) {
                 params.push(QueryParam {
                     name: name.clone(),
-                    min: *min,
-                    max: *max,
-                    default_value: *default_value,
+                    min: min.clone(),
+                    max: max.clone(),
+                    default_value: default_value.clone(),
                 });
             }
         }
@@ -1281,9 +1178,9 @@ fn substitute_term(term: &Term, values: &std::collections::HashMap<String, f64>)
                 Term::Var {
                     name: name.clone(),
                     scope: (),
-                    default_value: Some(FixedPoint::from_f64(val)),
-                    min: *min,
-                    max: *max,
+                    default_value: Some(crate::rational::Rational::from_f64(val)),
+                    min: min.clone(),
+                    max: max.clone(),
                     span: *span,
                 }
             } else {
@@ -1439,14 +1336,14 @@ mod tests {
                         assert_eq!(
                             *min,
                             Some(Bound {
-                                value: FixedPoint::from_int(0),
+                                value: crate::rational::Rational::from_integer(0),
                                 inclusive: false
                             })
                         );
                         assert_eq!(
                             *max,
                             Some(Bound {
-                                value: FixedPoint::from_int(10),
+                                value: crate::rational::Rational::from_integer(10),
                                 inclusive: false
                             })
                         );
@@ -1467,8 +1364,8 @@ mod tests {
             Clause::Rule { body, .. } => match &body[0] {
                 Term::Var { name, min, max, .. } => {
                     assert_eq!(name, "X");
-                    assert!(min.unwrap().inclusive);
-                    assert!(max.unwrap().inclusive);
+                    assert!(min.as_ref().unwrap().inclusive);
+                    assert!(max.as_ref().unwrap().inclusive);
                 }
                 _ => panic!("Expected Var"),
             },
@@ -1496,7 +1393,7 @@ mod tests {
                         ..
                     } => {
                         assert_eq!(name, "X");
-                        assert_eq!(*default_value, Some(FixedPoint::from_int(25)));
+                        assert_eq!(*default_value, Some(crate::rational::Rational::from_integer(25)));
                     }
                     _ => panic!("Expected Var"),
                 },
@@ -1512,7 +1409,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
             Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
-                Term::Number { value } => assert_eq!(*value, FixedPoint::from_int(42)),
+                Term::Number { value } => assert_eq!(*value, crate::rational::Rational::from_integer(42)),
                 _ => panic!("Expected Number"),
             },
             _ => panic!("Expected Fact"),
@@ -1525,7 +1422,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
             Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
-                Term::Number { value } => assert_eq!(*value, FixedPoint::from_hundredths(10001)),
+                Term::Number { value } => assert_eq!(*value, crate::rational::Rational::from_ratio(10001, 100)),
                 _ => panic!("Expected Number"),
             },
             _ => panic!("Expected Fact"),
@@ -1538,7 +1435,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
             Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
-                Term::Number { value } => assert_eq!(*value, FixedPoint::from_hundredths(-350)),
+                Term::Number { value } => assert_eq!(*value, crate::rational::Rational::from_ratio(-350, 100)),
                 _ => panic!("Expected Number"),
             },
             _ => panic!("Expected Fact"),
@@ -1547,10 +1444,10 @@ mod tests {
 
     #[test]
     fn parse_fixed_point_display() {
-        assert_eq!(format!("{}", FixedPoint::from_int(100)), "100");
-        assert_eq!(format!("{}", FixedPoint::from_hundredths(10001)), "100.01");
-        assert_eq!(format!("{}", FixedPoint::from_hundredths(350)), "3.5");
-        assert_eq!(format!("{}", FixedPoint::from_hundredths(-350)), "-3.5");
+        assert_eq!(format!("{}", crate::rational::Rational::from_integer(100)), "100");
+        assert_eq!(format!("{}", crate::rational::Rational::from_ratio(10001, 100)), "100.01");
+        assert_eq!(format!("{}", crate::rational::Rational::from_ratio(350, 100)), "3.5");
+        assert_eq!(format!("{}", crate::rational::Rational::from_ratio(-350, 100)), "-3.5");
     }
 
     #[test]
@@ -1565,7 +1462,7 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(name, "X");
-                    assert_eq!(*default_value, Some(FixedPoint::from_hundredths(250)));
+                    assert_eq!(*default_value, Some(crate::rational::Rational::from_ratio(250, 100)));
                 }
                 _ => panic!("Expected Var"),
             },
@@ -1685,7 +1582,7 @@ mod tests {
                             ..
                         } => {
                             assert_eq!(name, "X");
-                            assert_eq!(*default_value, Some(FixedPoint::from_int(20)));
+                            assert_eq!(*default_value, Some(crate::rational::Rational::from_integer(20)));
                         }
                         _ => panic!("Expected Var"),
                     },
@@ -1699,14 +1596,14 @@ mod tests {
                         assert_eq!(
                             *min,
                             Some(Bound {
-                                value: FixedPoint::from_int(0),
+                                value: crate::rational::Rational::from_integer(0),
                                 inclusive: false
                             })
                         );
                         assert_eq!(
                             *max,
                             Some(Bound {
-                                value: FixedPoint::from_int(50),
+                                value: crate::rational::Rational::from_integer(50),
                                 inclusive: false
                             })
                         );
@@ -1732,8 +1629,8 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(name, "X");
-                    assert!(min.unwrap().inclusive);
-                    assert!(max.unwrap().inclusive);
+                    assert!(min.as_ref().unwrap().inclusive);
+                    assert!(max.as_ref().unwrap().inclusive);
                 }
                 _ => panic!("Expected Var"),
             },

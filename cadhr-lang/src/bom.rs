@@ -1,4 +1,4 @@
-use crate::parse::{Term, term_as_fixed_point};
+use crate::parse::{Term, term_as_number};
 use crate::term_processor::{BuiltinFunctorSet, TermProcessor};
 
 inventory::submit! {
@@ -101,8 +101,8 @@ fn bom_entry_from_args<S>(args: &[Term<S>]) -> Result<BomEntry, BomError> {
 fn property_from_term<S>(term: &Term<S>) -> Result<(String, BomPropertyValue), BomError> {
     match term {
         Term::Struct { functor, args, .. } if args.len() == 1 => {
-            let value = if let Some((fp, _)) = term_as_fixed_point(&args[0]) {
-                BomPropertyValue::Num(fp.to_f64())
+            let value = if let Some((r, _)) = term_as_number(&args[0]) {
+                BomPropertyValue::Num(r.to_f64())
             } else if let Term::StringLit { value } = &args[0] {
                 BomPropertyValue::Str(value.clone())
             } else {

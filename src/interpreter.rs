@@ -181,7 +181,7 @@ pub fn run_mesh_job(params: MeshJobParams) -> MeshJobResult {
         let mut values = params.query_param_overrides.clone();
         for param in &query_params {
             if !values.contains_key(&param.name) {
-                let default = if let Some(dv) = param.default_value {
+                let default = if let Some(dv) = &param.default_value {
                     dv.to_f64()
                 } else {
                     match (param.min.as_ref(), param.max.as_ref()) {

@@ -3,7 +3,8 @@
 //! Term（書き換え後の項）を Model3D / Model2D 中間表現に変換し、
 //! それを manifold-rs の Manifold オブジェクトに評価する。
 
-use crate::parse::{ArithOp, FixedPoint, SrcSpan, Term, term_as_fixed_point};
+use crate::parse::{ArithOp, SrcSpan, Term, term_as_number};
+use crate::rational::Rational;
 use manifold_rs::{Manifold, Mesh};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -351,19 +352,19 @@ pub struct ControlPoint {
 }
 
 fn term_to_tracked_f64<S>(term: &Term<S>) -> Option<TrackedF64> {
-    if let Some((fp, span)) = term_as_fixed_point(term) {
+    if let Some((r, span)) = term_as_number(term) {
         return Some(TrackedF64 {
-            value: fp.to_f64(),
+            value: r.to_f64(),
             source_span: span,
         });
     }
     match term {
         Term::Var {
-            default_value: Some(fp),
+            default_value: Some(r),
             span,
             ..
         } => Some(TrackedF64 {
-            value: fp.to_f64(),
+            value: r.to_f64(),
             source_span: *span,
         }),
         Term::Var {
@@ -414,7 +415,7 @@ pub fn extract_control_points<S>(
     let mut control_points = Vec::new();
 
     // Var名 → 置換するNumber値 のマッピング
-    let mut var_substitutions: Vec<(String, FixedPoint)> = Vec::new();
+    let mut var_substitutions: Vec<(String, Rational)> = Vec::new();
 
     terms.retain(|term| {
         if let Term::Struct { functor, args, .. } = term {
@@ -447,7 +448,7 @@ pub fn extract_control_points<S>(
                             vnames[idx] = Some(vname.to_string());
                             var_substitutions.push((
                                 vname.to_string(),
-                                FixedPoint::from_hundredths((val * 100.0).round() as i64),
+                                Rational::from_f64(val),
                             ));
                         }
                     }
@@ -476,11 +477,11 @@ pub fn extract_control_points<S>(
     control_points
 }
 
-fn substitute_vars<S>(term: &mut Term<S>, subs: &[(String, FixedPoint)]) {
+fn substitute_vars<S>(term: &mut Term<S>, subs: &[(String, Rational)]) {
     match term {
         Term::Var { name, .. } => {
             if let Some((_, val)) = subs.iter().find(|(n, _)| n == name) {
-                *term = Term::Number { value: *val };
+                *term = Term::Number { value: val.clone() };
             }
         }
         Term::Struct { args, .. } => {
@@ -526,7 +527,7 @@ fn apply_var_overrides_to_term<S>(
         Term::Var { name, .. } => {
             if let Some(&val) = overrides.get(name) {
                 *term = Term::Number {
-                    value: FixedPoint::from_hundredths((val * 100.0).round() as i64),
+                    value: Rational::from_f64(val),
                 };
             }
         }
@@ -570,11 +571,11 @@ impl<'a, S> Args<'a, S> {
     }
 
     fn f64(&self, i: usize) -> Result<f64, ConversionError> {
-        if let Some(fp) = crate::term_rewrite::try_eval_to_number(&self.args[i]) {
-            return Ok(fp.to_f64());
+        if let Some(r) = crate::term_rewrite::try_eval_to_number(&self.args[i]) {
+            return Ok(r.to_f64());
         }
-        if let Some((fp, _)) = term_as_fixed_point(&self.args[i]) {
-            return Ok(fp.to_f64());
+        if let Some((r, _)) = term_as_number(&self.args[i]) {
+            return Ok(r.to_f64());
         }
         match &self.args[i] {
             Term::Var {
@@ -661,11 +662,11 @@ fn extract_polygon_points<S>(
                     Term::Struct {
                         functor: f, args, ..
                     } if f == "p" && args.len() == 2 => {
-                        let x = term_as_fixed_point(&args[0]);
-                        let y = term_as_fixed_point(&args[1]);
+                        let x = term_as_number(&args[0]);
+                        let y = term_as_number(&args[1]);
                         match (x, y) {
-                            (Some((fx, _)), Some((fy, _))) => {
-                                points.push((fx.to_f64(), fy.to_f64()));
+                            (Some((rx, _)), Some((ry, _))) => {
+                                points.push((rx.to_f64(), ry.to_f64()));
                             }
                             _ => {
                                 return Err(ConversionError::TypeMismatch {
@@ -704,7 +705,7 @@ fn extract_point_2d<S>(
         Term::Struct {
             functor: f, args, ..
         } if f == "p" && args.len() == 2 => {
-            let x = term_as_fixed_point(&args[0])
+            let x = term_as_number(&args[0])
                 .ok_or_else(|| ConversionError::TypeMismatch {
                     functor: tag.to_string(),
                     arg_index,
@@ -712,7 +713,7 @@ fn extract_point_2d<S>(
                 })?
                 .0
                 .to_f64();
-            let y = term_as_fixed_point(&args[1])
+            let y = term_as_number(&args[1])
                 .ok_or_else(|| ConversionError::TypeMismatch {
                     functor: tag.to_string(),
                     arg_index,

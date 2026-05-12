@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::constraint::{ArithEq, ArithExpr, solve_constraints};
 use crate::parse::{
-    ArithOp, Bound, Clause, FixedPoint, QueryParam, ScopeId, ScopedTerm, SrcSpan, Term, first_span,
+    ArithOp, Bound, Clause, QueryParam, ScopeId, ScopedTerm, SrcSpan, Term, first_span,
     list, number, struc, var,
 };
 use crate::term_processor::{
@@ -63,9 +63,9 @@ fn resolve_inner(term: &ScopedTerm, env: &ScopedEnv, depth: usize) -> ScopedTerm
                 Some(Term::Number { value: new_val }) if has_annotation => Term::Var {
                     name: name.clone(),
                     scope: *scope,
-                    default_value: Some(*new_val),
-                    min: *min,
-                    max: *max,
+                    default_value: Some(new_val.clone()),
+                    min: min.clone(),
+                    max: max.clone(),
                     span: *span,
                 },
                 Some(val) => resolve_inner(val, env, depth + 1),
@@ -224,7 +224,7 @@ impl CadhrError for RewriteError {
 
 fn collect_default_var_bindings(
     term: &ScopedTerm,
-    bindings: &mut Vec<(String, ScopeId, FixedPoint)>,
+    bindings: &mut Vec<(String, ScopeId, crate::rational::Rational)>,
 ) {
     match term {
         Term::Var {
@@ -233,7 +233,7 @@ fn collect_default_var_bindings(
             default_value: Some(value),
             ..
         } if name != "_" => {
-            bindings.push((name.clone(), *scope, *value));
+            bindings.push((name.clone(), *scope, value.clone()));
         }
         Term::Var { .. } => {}
         Term::StringLit { .. } => {}
@@ -275,6 +275,8 @@ fn apply_default_var_bindings(term: &mut ScopedTerm, goals: &mut Vec<ScopedTerm>
     }
 }
 
+
+
 /// term に含まれる @-default を `targets` の各項に反映させる。
 /// rewrite_term_recursive 内の apply_default_var_bindings は other_goals にしか伝播しないので、
 /// 同じルール本体の未処理 body 項に @-default を波及させたい時はこのヘルパーを使う。
@@ -296,12 +298,16 @@ fn propagate_defaults_to(term: &ScopedTerm, targets: &mut [ScopedTerm]) {
 /// Number と InfixExpr だけで構成された算術式を畳み込む。
 /// Var は処理しない。unify の Var ハンドラが名前ベースの置換を伴って処理するため、
 /// ここで Number に変換すると置換が抜け落ちる。
-fn try_fold_number_literals<S>(term: &Term<S>) -> Option<FixedPoint> {
+fn try_fold_number_literals<S>(term: &Term<S>) -> Option<crate::rational::Rational> {
     match term {
-        Term::Number { value } => Some(*value),
+        Term::Number { value } => Some(value.clone()),
         Term::InfixExpr { op, left, right } => {
             let l = try_fold_number_literals(left)?;
             let r = try_fold_number_literals(right)?;
+            // 0 除算は None で未解決のまま残す
+            if matches!(op, ArithOp::Div) && r.is_zero() {
+                return None;
+            }
             Some(match op {
                 ArithOp::Add => l + r,
                 ArithOp::Sub => l - r,
@@ -319,16 +325,19 @@ fn try_fold_number_literals<S>(term: &Term<S>) -> Option<FixedPoint> {
 
 /// Var の default_value も数値として扱い算術式を評価する。
 /// unify 中では使わず、最終的な数値抽出（メッシュ生成など）で使う。
-pub fn try_eval_to_number<S>(term: &Term<S>) -> Option<FixedPoint> {
+pub fn try_eval_to_number<S>(term: &Term<S>) -> Option<crate::rational::Rational> {
     match term {
-        Term::Number { value } => Some(*value),
+        Term::Number { value } => Some(value.clone()),
         Term::Var {
             default_value: Some(value),
             ..
-        } => Some(*value),
+        } => Some(value.clone()),
         Term::InfixExpr { op, left, right } => {
             let l = try_eval_to_number(left)?;
             let r = try_eval_to_number(right)?;
+            if matches!(op, ArithOp::Div) && r.is_zero() {
+                return None;
+            }
             Some(match op {
                 ArithOp::Add => l + r,
                 ArithOp::Sub => l - r,
@@ -407,19 +416,19 @@ fn occurs_check_scoped(var_name: &str, var_scope: ScopeId, term: &ScopedTerm) ->
 }
 
 /// 2つの下限境界から、より厳しい方を選択
-fn intersect_min(a: Option<Bound>, b: Option<Bound>) -> Option<Bound> {
+fn intersect_min(a: Option<&Bound>, b: Option<&Bound>) -> Option<Bound> {
     match (a, b) {
         (None, None) => None,
-        (Some(x), None) | (None, Some(x)) => Some(x),
+        (Some(x), None) | (None, Some(x)) => Some(x.clone()),
         (Some(a), Some(b)) => {
             if a.value > b.value {
-                Some(a)
+                Some(a.clone())
             } else if b.value > a.value {
-                Some(b)
+                Some(b.clone())
             } else {
                 // 同じ値の場合、exclusiveの方が厳しい
                 Some(Bound {
-                    value: a.value,
+                    value: a.value.clone(),
                     inclusive: a.inclusive && b.inclusive,
                 })
             }
@@ -428,19 +437,19 @@ fn intersect_min(a: Option<Bound>, b: Option<Bound>) -> Option<Bound> {
 }
 
 /// 2つの上限境界から、より厳しい方を選択
-fn intersect_max(a: Option<Bound>, b: Option<Bound>) -> Option<Bound> {
+fn intersect_max(a: Option<&Bound>, b: Option<&Bound>) -> Option<Bound> {
     match (a, b) {
         (None, None) => None,
-        (Some(x), None) | (None, Some(x)) => Some(x),
+        (Some(x), None) | (None, Some(x)) => Some(x.clone()),
         (Some(a), Some(b)) => {
             if a.value < b.value {
-                Some(a)
+                Some(a.clone())
             } else if b.value < a.value {
-                Some(b)
+                Some(b.clone())
             } else {
                 // 同じ値の場合、exclusiveの方が厳しい
                 Some(Bound {
-                    value: a.value,
+                    value: a.value.clone(),
                     inclusive: a.inclusive && b.inclusive,
                 })
             }
@@ -448,23 +457,23 @@ fn intersect_max(a: Option<Bound>, b: Option<Bound>) -> Option<Bound> {
     }
 }
 
-fn bound_add(a: Bound, b: Bound) -> Bound {
+fn bound_add(a: &Bound, b: &Bound) -> Bound {
     Bound {
-        value: FixedPoint::from_f64(a.value.to_f64() + b.value.to_f64()),
+        value: &a.value + &b.value,
         inclusive: a.inclusive && b.inclusive,
     }
 }
 
-fn bound_sub(a: Bound, b: Bound) -> Bound {
+fn bound_sub(a: &Bound, b: &Bound) -> Bound {
     Bound {
-        value: FixedPoint::from_f64(a.value.to_f64() - b.value.to_f64()),
+        value: &a.value - &b.value,
         inclusive: a.inclusive && b.inclusive,
     }
 }
 
-fn bound_mul(a: Bound, b: Bound) -> Bound {
+fn bound_mul(a: &Bound, b: &Bound) -> Bound {
     Bound {
-        value: FixedPoint::from_f64(a.value.to_f64() * b.value.to_f64()),
+        value: &a.value * &b.value,
         inclusive: a.inclusive && b.inclusive,
     }
 }
@@ -475,82 +484,85 @@ fn compute_term_range<S>(term: &Term<S>) -> Result<Range, String> {
     match term {
         Term::Number { value } => Ok((
             Some(Bound {
-                value: *value,
+                value: value.clone(),
                 inclusive: true,
             }),
             Some(Bound {
-                value: *value,
+                value: value.clone(),
                 inclusive: true,
             }),
         )),
-        Term::Var { min, max, .. } => Ok((*min, *max)),
+        Term::Var { min, max, .. } => Ok((min.clone(), max.clone())),
         Term::InfixExpr { op, left, right } => {
             let (l_min, l_max) = compute_term_range(left)?;
             let (r_min, r_max) = compute_term_range(right)?;
             match op {
                 ArithOp::Add => Ok((
-                    l_min.zip(r_min).map(|(a, b)| bound_add(a, b)),
-                    l_max.zip(r_max).map(|(a, b)| bound_add(a, b)),
+                    l_min.zip(r_min).map(|(a, b)| bound_add(&a, &b)),
+                    l_max.zip(r_max).map(|(a, b)| bound_add(&a, &b)),
                 )),
                 ArithOp::Sub => Ok((
-                    l_min.zip(r_max).map(|(a, b)| bound_sub(a, b)),
-                    l_max.zip(r_min).map(|(a, b)| bound_sub(a, b)),
+                    l_min.zip(r_max).map(|(a, b)| bound_sub(&a, &b)),
+                    l_max.zip(r_min).map(|(a, b)| bound_sub(&a, &b)),
                 )),
                 ArithOp::Mul => match (l_min, l_max, r_min, r_max) {
                     (Some(l_lo), Some(l_hi), Some(r_lo), Some(r_hi)) => {
                         let products = [
-                            bound_mul(l_lo, r_lo),
-                            bound_mul(l_lo, r_hi),
-                            bound_mul(l_hi, r_lo),
-                            bound_mul(l_hi, r_hi),
+                            bound_mul(&l_lo, &r_lo),
+                            bound_mul(&l_lo, &r_hi),
+                            bound_mul(&l_hi, &r_lo),
+                            bound_mul(&l_hi, &r_hi),
                         ];
                         let min = products
                             .iter()
-                            .copied()
                             .min_by(|a, b| a.value.cmp(&b.value))
-                            .unwrap();
+                            .unwrap()
+                            .clone();
                         let max = products
                             .iter()
-                            .copied()
                             .max_by(|a, b| a.value.cmp(&b.value))
-                            .unwrap();
+                            .unwrap()
+                            .clone();
                         Ok((Some(min), Some(max)))
                     }
                     _ => Ok((None, None)),
                 },
                 ArithOp::Div => match (r_min, r_max) {
                     (Some(r_lo), Some(r_hi)) => {
-                        let r_lo_f = r_lo.value.to_f64();
-                        let r_hi_f = r_hi.value.to_f64();
-                        if (r_lo_f <= 0.0 && r_hi_f >= 0.0) || (r_lo_f >= 0.0 && r_hi_f <= 0.0) {
+                        if r_lo.value.is_zero()
+                            || r_hi.value.is_zero()
+                            || (r_lo.value.to_f64() <= 0.0 && r_hi.value.to_f64() >= 0.0)
+                            || (r_lo.value.to_f64() >= 0.0 && r_hi.value.to_f64() <= 0.0)
+                        {
                             return Err("Division by zero: divisor range includes zero".to_string());
                         }
+                        let one = crate::rational::Rational::from_integer(1);
                         let inv_lo = Bound {
-                            value: FixedPoint::from_f64(1.0 / r_hi_f),
+                            value: &one / &r_hi.value,
                             inclusive: r_hi.inclusive,
                         };
                         let inv_hi = Bound {
-                            value: FixedPoint::from_f64(1.0 / r_lo_f),
+                            value: &one / &r_lo.value,
                             inclusive: r_lo.inclusive,
                         };
                         match (l_min, l_max) {
                             (Some(l_lo), Some(l_hi)) => {
                                 let products = [
-                                    bound_mul(l_lo, inv_lo),
-                                    bound_mul(l_lo, inv_hi),
-                                    bound_mul(l_hi, inv_lo),
-                                    bound_mul(l_hi, inv_hi),
+                                    bound_mul(&l_lo, &inv_lo),
+                                    bound_mul(&l_lo, &inv_hi),
+                                    bound_mul(&l_hi, &inv_lo),
+                                    bound_mul(&l_hi, &inv_hi),
                                 ];
                                 let min = products
                                     .iter()
-                                    .copied()
                                     .min_by(|a, b| a.value.cmp(&b.value))
-                                    .unwrap();
+                                    .unwrap()
+                                    .clone();
                                 let max = products
                                     .iter()
-                                    .copied()
                                     .max_by(|a, b| a.value.cmp(&b.value))
-                                    .unwrap();
+                                    .unwrap()
+                                    .clone();
                                 Ok((Some(min), Some(max)))
                             }
                             _ => Ok((None, None)),
@@ -580,8 +592,8 @@ fn collect_ranges_from_body_term(
     match term {
         Term::Var { name, min, max, .. } if name != "_" && (min.is_some() || max.is_some()) => {
             let entry = ranges.entry(name.clone()).or_insert((None, None));
-            entry.0 = intersect_min(entry.0, *min);
-            entry.1 = intersect_max(entry.1, *max);
+            entry.0 = intersect_min(entry.0.as_ref(), min.as_ref());
+            entry.1 = intersect_max(entry.1.as_ref(), max.as_ref());
         }
         Term::Struct { args, .. } => {
             for arg in args {
@@ -646,8 +658,14 @@ pub fn infer_query_param_ranges(
                                     if let Some((r_min, r_max)) = body_ranges.get(h_name) {
                                         for param in params.iter_mut() {
                                             if &param.name == q_name {
-                                                param.min = intersect_min(param.min, *r_min);
-                                                param.max = intersect_max(param.max, *r_max);
+                                                param.min = intersect_min(
+                                                    param.min.as_ref(),
+                                                    r_min.as_ref(),
+                                                );
+                                                param.max = intersect_max(
+                                                    param.max.as_ref(),
+                                                    r_max.as_ref(),
+                                                );
                                             }
                                         }
                                     }
@@ -660,8 +678,14 @@ pub fn infer_query_param_ranges(
                                     let (range_min, range_max) = compute_term_range(&patched)?;
                                     for param in params.iter_mut() {
                                         if &param.name == q_name {
-                                            param.min = intersect_min(param.min, range_min);
-                                            param.max = intersect_max(param.max, range_max);
+                                            param.min = intersect_min(
+                                                param.min.as_ref(),
+                                                range_min.as_ref(),
+                                            );
+                                            param.max = intersect_max(
+                                                param.max.as_ref(),
+                                                range_max.as_ref(),
+                                            );
                                         }
                                     }
                                 }
@@ -682,8 +706,8 @@ fn apply_body_ranges_to_term(
     match term {
         Term::Var { name, min, max, .. } if name != "_" => {
             if let Some((r_min, r_max)) = ranges.get(name) {
-                *min = intersect_min(*min, *r_min);
-                *max = intersect_max(*max, *r_max);
+                *min = intersect_min(min.as_ref(), r_min.as_ref());
+                *max = intersect_max(max.as_ref(), r_max.as_ref());
             }
         }
         Term::InfixExpr { left, right, .. } => {
@@ -695,16 +719,20 @@ fn apply_body_ranges_to_term(
 }
 
 /// 値が範囲内にあるかチェック
-fn value_in_range(value: FixedPoint, min: Option<Bound>, max: Option<Bound>) -> bool {
+fn value_in_range(
+    value: &crate::rational::Rational,
+    min: Option<&Bound>,
+    max: Option<&Bound>,
+) -> bool {
     let min_ok = match min {
         None => true,
-        Some(b) if b.inclusive => value >= b.value,
-        Some(b) => value > b.value,
+        Some(b) if b.inclusive => *value >= b.value,
+        Some(b) => *value > b.value,
     };
     let max_ok = match max {
         None => true,
-        Some(b) if b.inclusive => value <= b.value,
-        Some(b) => value < b.value,
+        Some(b) if b.inclusive => *value <= b.value,
+        Some(b) => *value < b.value,
     };
     min_ok && max_ok
 }
@@ -743,9 +771,9 @@ pub fn unify(
         } = &t1
         {
             if name != "_" {
-                env.insert(*scope, name.clone(), number(*value));
+                env.insert(*scope, name.clone(), number(value.clone()));
             }
-            t1 = number(*value);
+            t1 = number(value.clone());
         }
         if let Term::Var {
             name,
@@ -755,9 +783,9 @@ pub fn unify(
         } = &t2
         {
             if name != "_" {
-                env.insert(*scope, name.clone(), number(*value));
+                env.insert(*scope, name.clone(), number(value.clone()));
             }
-            t2 = number(*value);
+            t2 = number(value.clone());
         }
 
         if let Some(val) = try_fold_number_literals(&t1) {
@@ -1152,9 +1180,8 @@ fn try_resolve_constraints(
             let mut scoped_env = ScopedEnv::new();
             for (var_name, value) in &result.bindings {
                 if let Some(&scope) = var_scopes.get(var_name) {
-                    // Phase 2: Rational を FixedPoint に丸めて Term に格納する。
-                    // Phase 3 で Term::Number も Rational を持てば無損失になる。
-                    let term_value = number(value.to_fixed_point());
+                    // Phase 3: Term::Number も Rational を持つので無損失で格納できる。
+                    let term_value = number(value.clone());
                     scoped_env.insert(scope, var_name.clone(), term_value.clone());
                     // shared_env にも反映: 制約は解消されて消えるので、束縛を共有 env に残さないと
                     // 後続のサブゴール展開で同じ Var を解決できなくなる。
@@ -1301,7 +1328,7 @@ fn rewrite_term_recursive(
     {
         if min.is_some() || max.is_some() {
             if let Some(dv) = default_value {
-                if !value_in_range(*dv, *min, *max) {
+                if !value_in_range(dv, min.as_ref(), max.as_ref()) {
                     return Err(RewriteError {
                         message: format!("value {} is out of range", dv),
                         goal: term,
@@ -1416,10 +1443,10 @@ fn rewrite_term_recursive(
                     goal: Term::InfixExpr {
                         op,
                         left: Box::new(left_shapes.into_iter().next().unwrap_or(Term::Number {
-                            value: FixedPoint::from_int(0),
+                            value: crate::rational::Rational::zero(),
                         })),
                         right: Box::new(right_shapes.into_iter().next().unwrap_or(Term::Number {
-                            value: FixedPoint::from_int(0),
+                            value: crate::rational::Rational::zero(),
                         })),
                     },
                 });
@@ -1544,7 +1571,7 @@ fn resolve_builtin_arg(
                 return Err(RewriteError {
                     message: "builtin argument resolved to multiple terms".to_string(),
                     goal: resolved.into_iter().next().unwrap_or(Term::Number {
-                        value: FixedPoint::from_int(0),
+                        value: crate::rational::Rational::zero(),
                     }),
                 });
             }
@@ -1621,7 +1648,8 @@ pub fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::{FixedPoint, arith_expr, database, query, struc, var};
+    use crate::parse::{arith_expr, database, query, struc, var};
+    use crate::rational::Rational;
 
     fn var_with_range(name: &str, min: Option<Bound>, max: Option<Bound>) -> Term {
         Term::Var {
@@ -1721,7 +1749,8 @@ mod tests {
         use crate::parse::{number, number_int};
         let expr =
             crate::parse::arith_expr(crate::parse::ArithOp::Div, number_int(10), number_int(3));
-        let n = number(FixedPoint::from_hundredths(333)); // 10/3 = 3.33 in fixed point
+        // 10/3 は厳密な有理数として表現される
+        let n = number(crate::rational::Rational::from_ratio(10, 3));
         assert!(unify(scoped(expr), scoped(n), &mut ScopedEnv::new()).is_ok());
     }
 
@@ -2219,29 +2248,29 @@ mod tests {
             var_with_range(
                 "X",
                 Some(Bound {
-                    value: FixedPoint::from_int(0),
+                    value: crate::rational::Rational::from_integer(0),
                     inclusive: false,
                 }),
                 Some(Bound {
-                    value: FixedPoint::from_int(10),
+                    value: crate::rational::Rational::from_integer(10),
                     inclusive: false,
                 }),
             ),
             var_with_range(
                 "Y",
                 Some(Bound {
-                    value: FixedPoint::from_int(0),
+                    value: crate::rational::Rational::from_integer(0),
                     inclusive: false,
                 }),
                 Some(Bound {
-                    value: FixedPoint::from_int(5),
+                    value: crate::rational::Rational::from_integer(5),
                     inclusive: false,
                 }),
             ),
         );
         let (min, max) = compute_term_range(&term).unwrap();
-        assert_eq!(min.unwrap().value, FixedPoint::from_int(0));
-        assert_eq!(max.unwrap().value, FixedPoint::from_int(15));
+        assert_eq!(min.unwrap().value, crate::rational::Rational::from_integer(0));
+        assert_eq!(max.unwrap().value, crate::rational::Rational::from_integer(15));
     }
 
     #[test]
@@ -2252,29 +2281,29 @@ mod tests {
             var_with_range(
                 "X",
                 Some(Bound {
-                    value: FixedPoint::from_int(0),
+                    value: crate::rational::Rational::from_integer(0),
                     inclusive: false,
                 }),
                 Some(Bound {
-                    value: FixedPoint::from_int(10),
+                    value: crate::rational::Rational::from_integer(10),
                     inclusive: false,
                 }),
             ),
             var_with_range(
                 "Y",
                 Some(Bound {
-                    value: FixedPoint::from_int(0),
+                    value: crate::rational::Rational::from_integer(0),
                     inclusive: false,
                 }),
                 Some(Bound {
-                    value: FixedPoint::from_int(5),
+                    value: crate::rational::Rational::from_integer(5),
                     inclusive: false,
                 }),
             ),
         );
         let (min, max) = compute_term_range(&term).unwrap();
-        assert_eq!(min.unwrap().value, FixedPoint::from_int(-5));
-        assert_eq!(max.unwrap().value, FixedPoint::from_int(10));
+        assert_eq!(min.unwrap().value, crate::rational::Rational::from_integer(-5));
+        assert_eq!(max.unwrap().value, crate::rational::Rational::from_integer(10));
     }
 
     #[test]
@@ -2288,16 +2317,16 @@ mod tests {
         assert_eq!(params.len(), 1);
         infer_query_param_ranges(&query_terms, &db, &mut params).unwrap();
         assert_eq!(
-            params[0].min.unwrap(),
+            params[0].min.clone().unwrap(),
             Bound {
-                value: FixedPoint::from_int(0),
+                value: crate::rational::Rational::from_integer(0),
                 inclusive: false
             }
         );
         assert_eq!(
-            params[0].max.unwrap(),
+            params[0].max.clone().unwrap(),
             Bound {
-                value: FixedPoint::from_int(100),
+                value: crate::rational::Rational::from_integer(100),
                 inclusive: false
             }
         );
@@ -2314,16 +2343,16 @@ mod tests {
         assert_eq!(params.len(), 1);
         infer_query_param_ranges(&query_terms, &db, &mut params).unwrap();
         assert_eq!(
-            params[0].min.unwrap(),
+            params[0].min.clone().unwrap(),
             Bound {
-                value: FixedPoint::from_int(0),
+                value: crate::rational::Rational::from_integer(0),
                 inclusive: false
             }
         );
         assert_eq!(
-            params[0].max.unwrap(),
+            params[0].max.clone().unwrap(),
             Bound {
-                value: FixedPoint::from_int(15),
+                value: crate::rational::Rational::from_integer(15),
                 inclusive: false
             }
         );
@@ -2374,16 +2403,16 @@ wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(X, Y, H).\n\
         assert!(params[0].min.is_none());
         infer_query_param_ranges(&query_terms, &db, &mut params).unwrap();
         assert_eq!(
-            params[0].min.unwrap(),
+            params[0].min.clone().unwrap(),
             Bound {
-                value: FixedPoint::from_int(0),
+                value: crate::rational::Rational::from_integer(0),
                 inclusive: false,
             }
         );
         assert_eq!(
-            params[0].max.unwrap(),
+            params[0].max.clone().unwrap(),
             Bound {
-                value: FixedPoint::from_int(10),
+                value: crate::rational::Rational::from_integer(10),
                 inclusive: false,
             }
         );

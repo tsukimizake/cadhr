@@ -333,21 +333,20 @@ pub struct ConversionError {
 impl ArithExpr {
     /// Term から ArithExpr への変換を試みる
     /// Struct や List など算術式でないものは Err を返す。
-    /// `Term::Number` の `FixedPoint` は無損失で `Rational` に拡張される。
     pub fn try_from_term<S>(term: &Term<S>) -> Result<Self, ConversionError> {
         match term {
             Term::Var { default_value: Some(value), .. } => {
-                Ok(ArithExpr::Num(Rational::from(*value)))
+                Ok(ArithExpr::Num(value.clone()))
             }
             Term::Var { name, min, max, .. } if min.is_some() || max.is_some() => {
                 Ok(ArithExpr::RangeVar {
                     name: name.clone(),
-                    min: *min,
-                    max: *max,
+                    min: min.clone(),
+                    max: max.clone(),
                 })
             }
             Term::Var { name, .. } => Ok(ArithExpr::Var(name.clone())),
-            Term::Number { value } => Ok(ArithExpr::Num(Rational::from(*value))),
+            Term::Number { value } => Ok(ArithExpr::Num(value.clone())),
             Term::InfixExpr { op, left, right } => {
                 let left = ArithExpr::try_from_term(left)?;
                 let right = ArithExpr::try_from_term(right)?;
@@ -375,16 +374,15 @@ impl ArithExpr {
         }
     }
 
-    /// ArithExpr を Term に変換。
-    /// Phase 2 では `Term::Number` がまだ `FixedPoint` を持つため、
-    /// 数値は `to_fixed_point()` で 0.01 単位に丸めて格納する。
-    /// Phase 3 で `Term::Number` も `Rational` に切り替わると無損失化される。
+    /// ArithExpr を Term に変換。`Term::Number` も `Rational` を持つため無損失。
     pub fn to_term(&self) -> Term {
         use crate::parse::{arith_expr, number, range_var, var};
         match self {
             ArithExpr::Var(name) => var(name.clone()),
-            ArithExpr::RangeVar { name, min, max } => range_var(name.clone(), *min, *max),
-            ArithExpr::Num(value) => number(value.to_fixed_point()),
+            ArithExpr::RangeVar { name, min, max } => {
+                range_var(name.clone(), min.clone(), max.clone())
+            }
+            ArithExpr::Num(value) => number(value.clone()),
             ArithExpr::BinOp { op, left, right } => {
                 arith_expr(*op, left.to_term(), right.to_term())
             }

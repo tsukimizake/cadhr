@@ -553,6 +553,7 @@ pub fn view(p: &Preview, index: usize, total: usize) -> Element<'_, Msg> {
             .copied()
             .unwrap_or_else(|| {
                 qp.default_value
+                    .as_ref()
                     .map(|dv| dv.to_f64())
                     .unwrap_or((min_val + max_val) / 2.0)
             });
