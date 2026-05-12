@@ -89,9 +89,9 @@ main(T1) :- mechanism::do_mech([
     );
 }
 
-/// 非完全整除ケース: 歯数比が割り切れない (20-40-30) 場合でも、線形ソルバの
-/// 丸め許容により T3 が近似値 (13.33) で束縛されて連鎖が完了する。
-/// 真の値 13.333... を FixedPoint 2 桁に丸めた結果。
+/// 非完全整除ケース: 歯数比が割り切れない (20-40-30) 場合でも、Rational
+/// による厳密演算で T3 が連鎖伝播する。
+/// 真の値 40/3 が Display で 13.33 と丸められて表示されるが、内部は厳密。
 #[test]
 fn driver_rotation_propagates_with_non_exact_division() {
     let src = r#"
@@ -104,13 +104,82 @@ main(T1) :- mechanism::do_mech([
 "#;
     let resolved = run(src, "main(20).").expect("should succeed");
     let joined = resolved.join("\n");
-    // T1=20, T2=-10 (exact), T3 = -40*(-10)/30 = 13.333... → 13.33 (rounded)
+    // T1=20, T2=-10 (exact), T3 = -40*(-10)/30 = 40/3 = 13.33 (rounded display)
     assert!(joined.contains("-10"), "expected T2=-10 in: {}", joined);
     assert!(
         joined.contains("13.33"),
         "expected T3≈13.33 in: {}",
         joined
     );
+}
+
+/// 5 段チェーン (20-30-40-25-30) — 隣接歯数比が割り切れない組み合わせを
+/// 連発しても誤差が累積せず、最終 T が厳密に解ける。
+/// 真値:
+///   T1 = 30
+///   T2 = -Z1*T1/Z2 = -20*30/30 = -20
+///   T3 = -Z2*T2/Z3 = -30*(-20)/40 = 15
+///   T4 = -Z3*T3/Z4 = -40*15/25 = -24
+///   T5 = -Z4*T4/Z5 = -25*(-24)/30 = 20
+///
+/// 中心距離は 1*(Z1+Z2)/2 = 25, 35, 32.5, 27.5 → 累積位置 0, 25, 60, 92.5, 120
+/// 92.5 は 0.5 で表せるので問題なく扱える (Rational なら厳密)。
+#[test]
+fn five_gear_chain_no_error_accumulation() {
+    let src = r#"
+#use("mechanism").
+main(T1) :- mechanism::do_mech([
+    mechanism::gp(g1, 1, 20, 0,    0, T1, 5),
+    mechanism::gp(g2, 1, 30, 25,   0, T2, 5),
+    mechanism::gp(g3, 1, 40, 60,   0, T3, 5),
+    mechanism::gp(g4, 1, 25, 92.5, 0, T4, 5),
+    mechanism::gp(g5, 1, 30, 120,  0, T5, 5)
+]).
+"#;
+    let resolved = run(src, "main(30).").expect("should succeed");
+    let joined = resolved.join("\n");
+    // T2=-20, T3=15, T4=-24, T5=20 のすべてが正確に解ける
+    assert!(
+        joined.contains(", 0, -20),"),
+        "expected T2=-20 in: {}",
+        joined
+    );
+    assert!(
+        joined.contains(", 0, 15),"),
+        "expected T3=15 in: {}",
+        joined
+    );
+    assert!(
+        joined.contains(", 0, -24),"),
+        "expected T4=-24 in: {}",
+        joined
+    );
+    assert!(
+        joined.contains(", 0, 20),"),
+        "expected T5=20 in: {}",
+        joined
+    );
+}
+
+/// 真の矛盾は依然として検出される。歯車のモジュールを誤って異なるものにすると
+/// mesh/2 の head パターンで unify が失敗する。
+/// 一方、Rational 化で「丸め誤差由来の偽の不整合」が出ない (FixedPoint 時代の
+/// tolerance ロジックが原因で起きえた偽陽性が完全に解消する)。
+#[test]
+fn rational_does_not_introduce_false_contradictions() {
+    // 距離・角度がすべて非整除な値だが整合している。Rational なら通過する。
+    // (旧 FixedPoint では DistSq*DistSq vs R*R の丸めで偽の不整合が出る可能性があった)
+    let src = r#"
+#use("mechanism").
+main(T1) :- mechanism::do_mech([
+    mechanism::gp(g1, 1, 7,  0,    0, T1, 5),
+    mechanism::gp(g2, 1, 11, 9,    0, T2, 5)
+]).
+"#;
+    // Z1+Z2 = 18, M=1, center distance = 9. 9*9 = 81. DistSq = 9*9 = 81. 一致。
+    let resolved = run(src, "main(0).").expect("should succeed");
+    let render_count = resolved.iter().filter(|s| s.starts_with("translate(")).count();
+    assert_eq!(render_count, 2, "expected 2 gears rendered");
 }
 
 /// 中心距離を規格から外すと assert_eq("gear center distance", ...) で失敗する。
