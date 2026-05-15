@@ -44,6 +44,8 @@ pub fn resolve(term: &ScopedTerm, env: &ScopedEnv) -> ScopedTerm {
 /// resolve 経由で別 Var に解決された場合、元 Var の annotation を新 Var にマージする。
 /// 同 scope 内で同名 Var が unify されたとき (例: 渡された CENTER と inner の CENTER head)、
 /// 注釈付き側の min/max/default を unify 先の bare Var が引き継ぐようにする。
+/// `base` が Var でない場合 (Number/Struct/List 等に解決された場合) は base をそのまま返す:
+/// 数値や複合 term は min/max を直接持てないため、annotation はその時点で破棄される。
 fn merge_var_annotations(
     base: ScopedTerm,
     orig_default: &Option<crate::rational::Rational>,

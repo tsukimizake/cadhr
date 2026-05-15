@@ -515,7 +515,8 @@ pub fn extract_control_points<S: Clone>(
         // `control2d(-100<CENTER<100)` → 各 axis Var が range -100..100 を継承
         // 各 fresh Var には bare Var の annotation (default/min/max) を伝搬し、range のみ
         // 指定された場合は midpoint を default に補う(center2d 等の strict 評価先で値が
-        // 必要になるため)。
+        // 必要になるため)。軸名 `<bare>.<axis>` の `.` はパーサが識別子に許容しない
+        // (is_id_continue 参照) ためユーザ Var との衝突は起きない。
         if let Term::Var {
             name: bare_name,
             scope: bare_scope,
@@ -958,8 +959,6 @@ fn extract_point_3d<S>(
     }
     Ok((out[0], out[1], out[2]))
 }
-
-
 
 fn extract_path_points<S>(
     start_term: &Term<S>,
