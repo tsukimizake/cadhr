@@ -168,9 +168,9 @@ pub const BUILTIN_FUNCTORS: &[(&str, &[usize])] = &[
     ("bezier_to", &[2, 3]),
     ("path", &[2]),
     ("sweep_extrude", &[2]),
-    ("control", &[3, 4]),
-    ("center3d", &[4]),
-    ("center2d", &[3]),
+    ("control", &[1, 2]),
+    ("center3d", &[2]),
+    ("center2d", &[2]),
 ];
 
 inventory::submit! {
@@ -451,7 +451,7 @@ fn var_name<S>(term: &Term<S>) -> Option<&str> {
     }
 }
 
-/// control(X,Y,Z) / control(X,Y,Z,Name) のTermを抽出し、残りのTermを返す。
+/// control(p(X,Y,Z)) / control(p(X,Y,Z), Name) のTermを抽出し、残りのTermを返す。
 /// control座標がVarの場合、同名の変数を残りのtermsからも置換する。
 pub fn extract_control_points<S>(
     terms: &mut Vec<Term<S>>,
@@ -464,12 +464,15 @@ pub fn extract_control_points<S>(
 
     terms.retain(|term| {
         if let Term::Struct { functor, args, .. } = term {
-            if functor == "control" && (args.len() == 3 || args.len() == 4) {
-                let x = term_to_tracked_f64(&args[0]);
-                let y = term_to_tracked_f64(&args[1]);
-                let z = term_to_tracked_f64(&args[2]);
-                let name = if args.len() == 4 {
-                    match &args[3] {
+            if functor == "control" && (args.len() == 1 || args.len() == 2) {
+                let Some(point_args) = point_3d_args(&args[0]) else {
+                    return true;
+                };
+                let x = term_to_tracked_f64(&point_args[0]);
+                let y = term_to_tracked_f64(&point_args[1]);
+                let z = term_to_tracked_f64(&point_args[2]);
+                let name = if args.len() == 2 {
+                    match &args[1] {
                         Term::StringLit { value } => Some(value.clone()),
                         Term::Struct { functor, args, .. } if args.is_empty() => {
                             Some(functor.clone())
@@ -482,7 +485,7 @@ pub fn extract_control_points<S>(
                 if let (Some(mut x), Some(mut y), Some(mut z)) = (x, y, z) {
                     let mut vnames: [Option<String>; 3] = [None, None, None];
                     let tracked = [&mut x, &mut y, &mut z];
-                    for (idx, arg) in [&args[0], &args[1], &args[2]].iter().enumerate() {
+                    for (idx, arg) in point_args.iter().enumerate() {
                         if let Some(vname) = var_name(arg) {
                             // overrideがあればその値を使い、なければデフォルト値を使う
                             let val = overrides
@@ -781,47 +784,42 @@ fn extract_point_2d<S>(
     }
 }
 
+/// `p(A, B, C)` 形式の Term から内部 3 引数を借用で取り出す。
+/// 構造マッチに集中させ、各 sub-term をどう値化するかは呼び出し側に委ねる。
+/// （control は TrackedF64 + Var 追跡が必要、center3d/translate は単純な f64 が必要、と
+///  要求が異なるため。）
+fn point_3d_args<S>(term: &Term<S>) -> Option<&[Term<S>; 3]> {
+    if let Term::Struct {
+        functor: f, args, ..
+    } = term
+    {
+        if f == "p" && args.len() == 3 {
+            return args.as_slice().try_into().ok();
+        }
+    }
+    None
+}
+
 fn extract_point_3d<S>(
     term: &Term<S>,
     tag: FunctorTag,
     arg_index: usize,
 ) -> Result<(f64, f64, f64), ConversionError> {
-    match term {
-        Term::Struct {
-            functor: f, args, ..
-        } if f == "p" && args.len() == 3 => {
-            let x = term_as_number(&args[0])
-                .ok_or_else(|| ConversionError::TypeMismatch {
-                    functor: tag.to_string(),
-                    arg_index,
-                    expected: "p(number, number, number)",
-                })?
-                .0
-                .to_f64();
-            let y = term_as_number(&args[1])
-                .ok_or_else(|| ConversionError::TypeMismatch {
-                    functor: tag.to_string(),
-                    arg_index,
-                    expected: "p(number, number, number)",
-                })?
-                .0
-                .to_f64();
-            let z = term_as_number(&args[2])
-                .ok_or_else(|| ConversionError::TypeMismatch {
-                    functor: tag.to_string(),
-                    arg_index,
-                    expected: "p(number, number, number)",
-                })?
-                .0
-                .to_f64();
-            Ok((x, y, z))
-        }
-        _ => Err(ConversionError::TypeMismatch {
+    let args = point_3d_args(term).ok_or_else(|| ConversionError::TypeMismatch {
+        functor: tag.to_string(),
+        arg_index,
+        expected: "p(x, y, z)",
+    })?;
+    let mut out = [0.0; 3];
+    for (i, a) in args.iter().enumerate() {
+        let (r, _) = term_as_number(a).ok_or_else(|| ConversionError::TypeMismatch {
             functor: tag.to_string(),
             arg_index,
-            expected: "p(x, y, z)",
-        }),
+            expected: "p(number, number, number)",
+        })?;
+        out[i] = r.to_f64();
     }
+    Ok((out[0], out[1], out[2]))
 }
 
 fn extract_path_points<S>(
@@ -971,15 +969,16 @@ impl Model2D {
                 Ok(Model2D::Intersection(Box::new(l), Box::new(r)))
             }
 
-            FunctorTag::Center2D if a.len() == 3 => {
+            FunctorTag::Center2D if a.len() == 2 => {
                 let profile = Model2D::parse_2d_op_arg(&a.args[0], "center2d")?;
+                let (x, y) = extract_point_2d(&a.args[1], FunctorTag::Center2D, 1)?;
                 Ok(Model2D::Center2D {
                     profile: Box::new(profile),
-                    x: a.f64(1)?,
-                    y: a.f64(2)?,
+                    x,
+                    y,
                 })
             }
-            FunctorTag::Center2D => Err(a.arity_error("3")),
+            FunctorTag::Center2D => Err(a.arity_error("2")),
 
             _ => Err(ConversionError::UnknownPrimitive(format!(
                 "expected 2D profile, got {}",
@@ -1383,13 +1382,17 @@ impl Model3D {
                     functor
                 )))
             }
-            FunctorTag::Center3D if a.len() == 4 => Ok(Model3D::Center3D {
-                model: Box::new(a.term_3d(0)?),
-                x: a.f64(1)?,
-                y: a.f64(2)?,
-                z: a.f64(3)?,
-            }),
-            FunctorTag::Center3D => Err(a.arity_error("4")),
+            FunctorTag::Center3D if a.len() == 2 => {
+                let model = a.term_3d(0)?;
+                let (x, y, z) = extract_point_3d(a.raw(1), FunctorTag::Center3D, 1)?;
+                Ok(Model3D::Center3D {
+                    model: Box::new(model),
+                    x,
+                    y,
+                    z,
+                })
+            }
+            FunctorTag::Center3D => Err(a.arity_error("2")),
 
             FunctorTag::Center2D => Err(ConversionError::UnknownPrimitive(
                 "center2d is a 2D-only operation; wrap with linear_extrude/revolve before using as 3D".to_string(),
@@ -2254,14 +2257,18 @@ mod tests {
         );
         let cp1 = struc(
             "control".into(),
-            vec![number_int(1), number_int(2), number_int(3)],
+            vec![struc(
+                "p".into(),
+                vec![number_int(1), number_int(2), number_int(3)],
+            )],
         );
         let cp2 = struc(
             "control".into(),
             vec![
-                number_int(4),
-                number_int(5),
-                number_int(6),
+                struc(
+                    "p".into(),
+                    vec![number_int(4), number_int(5), number_int(6)],
+                ),
                 string_lit("origin".into()),
             ],
         );
@@ -2285,7 +2292,10 @@ mod tests {
         );
         let cp = struc(
             "control".into(),
-            vec![var("X".into()), number_int(0), number_int(0)],
+            vec![struc(
+                "p".into(),
+                vec![var("X".into()), number_int(0), number_int(0)],
+            )],
         );
         let mut terms = vec![cube, cp];
         let cps = extract_control_points(&mut terms, &Default::default());
@@ -2303,7 +2313,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- linear_extrude(rotateToXY(sketch([p(0, 0), p(0, 40), p(30, 0)])), X@10), control(X, 0, 0, \"width\")."
+            "main :- linear_extrude(rotateToXY(sketch([p(0, 0), p(0, 40), p(30, 0)])), X@10), control(p(X, 0, 0), \"width\")."
         ).unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (mut resolved, _) = execute(&mut db, q).unwrap();
@@ -2326,7 +2336,7 @@ mod tests {
 
         // X=なし: controlのVar座標が0にフォールバックし、extrude側にも0が代入される
         let mut db = database(
-            "main :- linear_extrude(rotateToXY(sketch([p(0, 0), p(0, 40), p(30, 0)])), X), control(X, -10, -10).",
+            "main :- linear_extrude(rotateToXY(sketch([p(0, 0), p(0, 40), p(30, 0)])), X), control(p(X, -10, -10)).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -2348,7 +2358,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- sketch([p(0,0), p(0,40), p(30,0)]) |> rotateToXY |> linear_extrude(X+1), control(X, -10, -10).",
+            "main :- sketch([p(0,0), p(0,40), p(30,0)]) |> rotateToXY |> linear_extrude(X+1), control(p(X, -10, -10)).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -2365,7 +2375,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let src = "main :- sketch([p(0,0), p(0,40), p(30,0)]) |> rotateToXY |> linear_extrude(X+1), control(X, -10, -10).";
+        let src = "main :- sketch([p(0,0), p(0,40), p(30,0)]) |> rotateToXY |> linear_extrude(X+1), control(p(X, -10, -10)).";
         let mut db = database(src).unwrap();
         let (_, q) = parse_query("main.").unwrap();
 
@@ -2403,22 +2413,24 @@ mod tests {
 
         // クエリの変数名を確認
         let mut db =
-            database("box(X) :- cube(X, X, X).\nmain :- box(10), box(20), control(X, 0, 0).")
+            database("box(X) :- cube(X, X, X).\nmain :- box(10), box(20), control(p(X, 0, 0)).")
                 .unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (resolved, _) = execute(&mut db, q).unwrap();
         eprintln!("case1: {:?}", resolved);
 
         // 2つのcontrolが同じ変数名Xを使うケース
-        let mut db2 =
-            database("main :- cube(X+Y, 20, 30), control(X, 0, 0), control(Y, 0, 0).").unwrap();
+        let mut db2 = database(
+            "main :- cube(X+Y, 20, 30), control(p(X, 0, 0)), control(p(Y, 0, 0)).",
+        )
+        .unwrap();
         let (_, q2) = parse_query("main.").unwrap();
         let (resolved2, _) = execute(&mut db2, q2).unwrap();
         eprintln!("case2: {:?}", resolved2);
 
         // ルール経由で同名変数が複数スコープに存在するケース
         let mut db3 = database(
-            "helper(X) :- cube(X, X, X), control(X, 0, 0).\nmain :- helper(10), helper(20).",
+            "helper(X) :- cube(X, X, X), control(p(X, 0, 0)).\nmain :- helper(10), helper(20).",
         )
         .unwrap();
         let (_, q3) = parse_query("main.").unwrap();
@@ -2432,7 +2444,7 @@ mod tests {
         use crate::term_rewrite::execute;
         use std::collections::HashMap;
 
-        let mut db = database("main :- cube(X+10, 20, 30), control(X, 0, 0).").unwrap();
+        let mut db = database("main :- cube(X+10, 20, 30), control(p(X, 0, 0)).").unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (mut resolved, _) = execute(&mut db, q).unwrap();
 
@@ -2457,7 +2469,7 @@ mod tests {
         // box(X)が2回使われ、control(X,0,0)のXはクエリ由来
         // overrideはcontrolのXのみに影響し、box(10),box(20)は変わらないはず
         let mut db =
-            database("box(X) :- cube(X, X, X).\nmain :- box(10), box(20), control(X, 0, 0).")
+            database("box(X) :- cube(X, X, X).\nmain :- box(10), box(20), control(p(X, 0, 0)).")
                 .unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (mut resolved, _) = execute(&mut db, q).unwrap();
@@ -2655,7 +2667,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- cube(10,10,10) |> translate(p(0,0,0), p(5,0,0)) |> center3d(0,0,0).",
+            "main :- cube(10,10,10) |> translate(p(0,0,0), p(5,0,0)) |> center3d(p(0,0,0)).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -2679,9 +2691,10 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let mut db =
-            database("main :- control(X@0, Y@0, Z@0), cube(10,10,10) |> center3d(X, Y, Z).")
-                .unwrap();
+        let mut db = database(
+            "main :- control(p(X@0, Y@0, Z@0)), cube(10,10,10) |> center3d(p(X, Y, Z)).",
+        )
+        .unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (mut resolved, _) = execute(&mut db, q).unwrap();
         let cps = extract_control_points(&mut resolved, &Default::default());
@@ -2708,9 +2721,10 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let mut db =
-            database("main :- circle(5) |> center2d(10, 20) |> rotateToXY |> linear_extrude(2).")
-                .unwrap();
+        let mut db = database(
+            "main :- circle(5) |> center2d(p(10, 20)) |> rotateToXY |> linear_extrude(2).",
+        )
+        .unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (resolved, _) = execute(&mut db, q).unwrap();
         let exprs: Vec<Model3D> = resolved
@@ -2733,7 +2747,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- sketch([p(10,20), p(20,20), p(20,30), p(10,30)]) |> center2d(0, 0) |> rotateToYZ |> linear_extrude(2).",
+            "main :- sketch([p(10,20), p(20,20), p(20,30), p(10,30)]) |> center2d(p(0, 0)) |> rotateToYZ |> linear_extrude(2).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -2763,7 +2777,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- sketch([p(0,0), p(10,0), p(10,4), p(0,4)]) |> center2d(0, 0) |> rotateToXY |> linear_extrude(1).",
+            "main :- sketch([p(0,0), p(10,0), p(10,4), p(0,4)]) |> center2d(p(0, 0)) |> rotateToXY |> linear_extrude(1).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -2952,7 +2966,7 @@ mod tests {
     #[test]
     fn test_center2d_after_rotate_errors() {
         expect_sealed(
-            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ |> center2d(0, 0) |> linear_extrude(1).",
+            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ |> center2d(p(0, 0)) |> linear_extrude(1).",
             "center2d",
         );
     }
@@ -2970,9 +2984,9 @@ mod tests {
         let src = "\
 main :- battery_box.
 battery_box :-
-  (sketch([p(0,0), p(20,0), p(20,58), p(0,58)]) |> center2d(0,0))
+  (sketch([p(0,0), p(20,0), p(20,58), p(0,58)]) |> center2d(p(0,0)))
   - honi |> rotateToYZ |> linear_extrude(20).
-honi :- sketch([p(0,0), p(14.6,0), p(14.6,49.8), p(0,49.8)]) |> center2d(0,0).
+honi :- sketch([p(0,0), p(14.6,0), p(14.6,49.8), p(0,49.8)]) |> center2d(p(0,0)).
 ";
         let mut db = database(src).unwrap();
         let (_, q) = parse_query("main.").unwrap();

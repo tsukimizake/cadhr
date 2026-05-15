@@ -2165,7 +2165,7 @@ mod tests {
     #[test]
     fn builtin_arg_rule_with_control_separation() {
         let resolved = run_success(
-            "blade_cut :- path(p(0, 0), [line_to(p(10, 0)), line_to(p(10, 20))]), control(X@0, Y@20, 0). main :- linear_extrude(blade_cut, 100).",
+            "blade_cut :- path(p(0, 0), [line_to(p(10, 0)), line_to(p(10, 20))]), control(p(X@0, Y@20, 0)). main :- linear_extrude(blade_cut, 100).",
             "main.",
         );
         assert_eq!(resolved.len(), 2);
