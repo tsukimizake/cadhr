@@ -1,4 +1,9 @@
-% mechanism: 平歯車 (spur gear) の機構記述ライブラリ
+% mechanism: 平歯車 (spur gear) の機構記述
+%
+% NOTE: この .cadhr は cadhr-lang/tests/mechanism_integration.rs に include_str!
+%   され、テスト走行時に db_src 先頭に連結される。ライブラリとして配布する目的
+%   ではなく、新しい translate API (点ベース) と connecting-rod 系制約のテスト
+%   フィクスチャ。
 %
 % 部品レコード:
 %   gp(Name, Module, Teeth, X, Y, Theta, Thickness)
@@ -9,19 +14,12 @@
 %     - Theta     : 回転角 (degree)
 %     - Thickness : 軸方向の厚み
 %
-% 使い方の概略:
-%   #use("mechanism").
-%   main :- mechanism::do_mech([
-%       mechanism::gp(g1, 1, 20, 0,  0, T1@0, 5),
-%       mechanism::gp(g2, 1, 40, 30, 0, T2,    5),
-%       mechanism::gp(g3, 1, 20, 60, 0, T3,    5)
+% 使い方:
+%   main :- do_mech([
+%       gp(g1, 1, 20, 0,  0, T1@0, 5),
+%       gp(g2, 1, 40, 30, 0, T2,    5),
+%       gp(g3, 1, 20, 60, 0, T3,    5)
 %   ]).
-%
-% NOTE: 現在の cadhr-lang では `expose([...])` で alias 節を作っても、
-%   alias の body 内で参照される内部ヘルパー (mesh/2, render_part/1) や
-%   データ記録子 (gp/7) も自動展開されない。そのためライブラリ呼び出しは
-%   `mechanism::` 前置詞をフルに付ける必要がある。
-%   (将来 module システム改修で expose を改善予定。)
 %
 % NOTE on tooth counts:
 %   cadhr-lang は 2 桁固定小数点 + 完全整除を要求する線形ソルバを使うため、
@@ -35,11 +33,14 @@
 % ─────── 歯車の描画 ───────
 % 歯車本体はピッチ円半径の円柱で代用する (歯形は今のところ非表示)。
 % 隣接歯車同士は規格通りに配置されればちょうど接触する。
+%
+% translate(Shape, SrcPoint, DstPoint): 歯車中心 (ローカル原点 = p(0,0,0)) を
+% ワールド上の (X, Y, 0) に運ぶ。
 render_part(gp(_, M, Z, X, Y, T, Th)) :-
     R = M*Z/2,
     cylinder(R, Th)
         |> rotate(0, 0, T)
-        |> translate(X, Y, 0).
+        |> translate(p(0, 0, 0), p(X, Y, 0)).
 
 % ─────── 噛み合い制約 ───────
 % 隣接する 2 つの平歯車の噛み合いを表現する。

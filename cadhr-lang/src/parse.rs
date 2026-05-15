@@ -1473,14 +1473,14 @@ mod tests {
     #[test]
     fn parse_pipe_operator_chain() {
         // a |> b |> c should become c(b(a))
-        let src = "cube(1,1,1) |> scale(2) |> translate(5,5,5).";
+        let src = "cube(1,1,1) |> scale(2) |> translate(p(0,0,0), p(5,5,5)).";
         let (_, clause) = clause_parser(src).unwrap();
 
         match clause {
             Clause::Fact(term) => match &term {
                 Term::Struct { functor, args, .. } => {
                     assert_eq!(functor, "translate");
-                    assert_eq!(args.len(), 4);
+                    assert_eq!(args.len(), 3);
                     // First arg should be scale(cube(1,1,1), 2)
                     match &args[0] {
                         Term::Struct { functor, args, .. } => {
@@ -1505,20 +1505,20 @@ mod tests {
 
     #[test]
     fn parse_pipe_with_parentheses() {
-        // (cube(10,20,30) |> translate(10,0,0)) + cube(100,1,1)
-        // should become: union(translate(cube(10,20,30), 10,0,0), cube(100,1,1))
-        let src = "(cube(10,20,30) |> translate(10,0,0)) + cube(100,1,1).";
+        // (cube(10,20,30) |> translate(p(0,0,0), p(10,0,0))) + cube(100,1,1)
+        // should become: union(translate(cube(10,20,30), p(0,0,0), p(10,0,0)), cube(100,1,1))
+        let src = "(cube(10,20,30) |> translate(p(0,0,0), p(10,0,0))) + cube(100,1,1).";
         let (_, clause) = clause_parser(src).unwrap();
 
         match clause {
             Clause::Fact(term) => match &term {
                 Term::InfixExpr { op, left, right } => {
                     assert_eq!(*op, ArithOp::Add);
-                    // left should be translate(cube(10,20,30), 10, 0, 0)
+                    // left should be translate(cube(10,20,30), p(0,0,0), p(10,0,0))
                     match left.as_ref() {
                         Term::Struct { functor, args, .. } => {
                             assert_eq!(functor, "translate");
-                            assert_eq!(args.len(), 4);
+                            assert_eq!(args.len(), 3);
                             match &args[0] {
                                 Term::Struct { functor, .. } => {
                                     assert_eq!(functor, "cube");
@@ -1545,12 +1545,12 @@ mod tests {
 
     #[test]
     fn parse_pipe_without_parentheses() {
-        // cube(10,20,30) |> translate(10,0,0) + cube(100,1,1)
+        // cube(10,20,30) |> translate(p(0,0,0), p(10,0,0)) + cube(100,1,1)
         // Without parentheses, + binds tighter, so this becomes:
-        // cube(10,20,30) |> (translate(10,0,0) + cube(100,1,1))
-        // which is apply(translate(10,0,0) + cube(100,1,1), cube(10,20,30))
+        // cube(10,20,30) |> (translate(p(0,0,0), p(10,0,0)) + cube(100,1,1))
+        // which is apply(translate(p(0,0,0), p(10,0,0)) + cube(100,1,1), cube(10,20,30))
         // But since translate + cube is ArithExpr not Struct, it wraps with "apply"
-        let src = "cube(10,20,30) |> translate(10,0,0) + cube(100,1,1).";
+        let src = "cube(10,20,30) |> translate(p(0,0,0), p(10,0,0)) + cube(100,1,1).";
         let (_, clause) = clause_parser(src).unwrap();
 
         match clause {

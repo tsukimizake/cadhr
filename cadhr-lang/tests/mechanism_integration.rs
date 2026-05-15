@@ -1,27 +1,17 @@
-//! mechanism ライブラリの統合テスト。
+//! mechanism 統合テスト。
 //!
-//! `cadhr-lang/library/mechanism/db.cadhr` を `#use` で読み込み、平歯車の連鎖を
-//! validate + render するワークフローを通しでチェックする。
+//! `cadhr-lang/tests/mechanism.cadhr` を include_str! で取り込み、平歯車の連鎖を
+//! validate + render するワークフローを通しでチェックする。元々は library/ 配下の
+//! 配布対象だったが、機能が限定的すぎるためテスト専用フィクスチャに移した。
 
-use std::collections::HashSet;
-use std::path::PathBuf;
-
-use cadhr_lang::parse::{FileRegistry, database, query};
-use cadhr_lang::module::resolve_modules;
+use cadhr_lang::parse::{database, query};
 use cadhr_lang::term_rewrite::execute;
 
-fn library_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("library")
-}
+const MECHANISM_SRC: &str = include_str!("mechanism.cadhr");
 
-fn run(db_src: &str, query_src: &str) -> Result<Vec<String>, String> {
-    let clauses = database(db_src).map_err(|e| format!("parse db: {:?}", e))?;
-    let mut visited = HashSet::new();
-    let mut registry = FileRegistry::new();
-    let resolved_clauses =
-        resolve_modules(clauses, &[library_root()], &mut visited, &mut registry)
-            .map_err(|e| format!("resolve modules: {}", e))?;
-    let mut db = resolved_clauses;
+fn run(extra_db: &str, query_src: &str) -> Result<Vec<String>, String> {
+    let full_db = format!("{}\n{}", MECHANISM_SRC, extra_db);
+    let mut db = database(&full_db).map_err(|e| format!("parse db: {:?}", e))?;
     let q = query(query_src).map_err(|e| format!("parse query: {:?}", e))?.1;
     let (resolved, _) = execute(&mut db, q).map_err(|e| format!("execute: {}", e))?;
     Ok(resolved.iter().map(|t| format!("{:?}", t)).collect())
@@ -33,16 +23,18 @@ fn run(db_src: &str, query_src: &str) -> Result<Vec<String>, String> {
 #[test]
 fn three_gear_chain_validates_and_renders() {
     let src = r#"
-#use("mechanism").
-main :- mechanism::do_mech([
-    mechanism::gp(g1, 1, 20, 0,  0, 0,  5),
-    mechanism::gp(g2, 1, 40, 30, 0, T2, 5),
-    mechanism::gp(g3, 1, 20, 60, 0, T3, 5)
+main :- do_mech([
+    gp(g1, 1, 20, 0,  0, 0,  5),
+    gp(g2, 1, 40, 30, 0, T2, 5),
+    gp(g3, 1, 20, 60, 0, T3, 5)
 ]).
 "#;
     let resolved = run(src, "main.").expect("should succeed");
-    // 各歯車が translate(rotate(cylinder(...), ...), x, y, 0) として 3 個描画される
-    let render_count = resolved.iter().filter(|s| s.starts_with("translate(")).count();
+    // 各歯車が translate(rotate(cylinder(...), ...), p(0,0,0), p(x, y, 0)) として 3 個描画される
+    let render_count = resolved
+        .iter()
+        .filter(|s| s.starts_with("translate("))
+        .count();
     assert_eq!(
         render_count, 3,
         "expected 3 translated cylinders, got {:#?}",
@@ -54,10 +46,9 @@ main :- mechanism::do_mech([
 #[test]
 fn driver_rotation_propagates_to_first_pair() {
     let src = r#"
-#use("mechanism").
-main(T1) :- mechanism::do_mech([
-    mechanism::gp(g1, 1, 20, 0,  0, T1, 5),
-    mechanism::gp(g2, 1, 40, 30, 0, T2, 5)
+main(T1) :- do_mech([
+    gp(g1, 1, 20, 0,  0, T1, 5),
+    gp(g2, 1, 40, 30, 0, T2, 5)
 ]).
 "#;
     let resolved = run(src, "main(20).").expect("should succeed");
@@ -72,11 +63,10 @@ main(T1) :- mechanism::do_mech([
 #[test]
 fn driver_rotation_propagates_through_three_gear_chain() {
     let src = r#"
-#use("mechanism").
-main(T1) :- mechanism::do_mech([
-    mechanism::gp(g1, 1, 20, 0,  0, T1, 5),
-    mechanism::gp(g2, 1, 40, 30, 0, T2, 5),
-    mechanism::gp(g3, 1, 20, 60, 0, T3, 5)
+main(T1) :- do_mech([
+    gp(g1, 1, 20, 0,  0, T1, 5),
+    gp(g2, 1, 40, 30, 0, T2, 5),
+    gp(g3, 1, 20, 60, 0, T3, 5)
 ]).
 "#;
     let resolved = run(src, "main(20).").expect("should succeed");
@@ -95,11 +85,10 @@ main(T1) :- mechanism::do_mech([
 #[test]
 fn driver_rotation_propagates_with_non_exact_division() {
     let src = r#"
-#use("mechanism").
-main(T1) :- mechanism::do_mech([
-    mechanism::gp(g1, 1, 20, 0,  0, T1, 5),
-    mechanism::gp(g2, 1, 40, 30, 0, T2, 5),
-    mechanism::gp(g3, 1, 30, 65, 0, T3, 5)
+main(T1) :- do_mech([
+    gp(g1, 1, 20, 0,  0, T1, 5),
+    gp(g2, 1, 40, 30, 0, T2, 5),
+    gp(g3, 1, 30, 65, 0, T3, 5)
 ]).
 "#;
     let resolved = run(src, "main(20).").expect("should succeed");
@@ -127,13 +116,12 @@ main(T1) :- mechanism::do_mech([
 #[test]
 fn five_gear_chain_no_error_accumulation() {
     let src = r#"
-#use("mechanism").
-main(T1) :- mechanism::do_mech([
-    mechanism::gp(g1, 1, 20, 0,    0, T1, 5),
-    mechanism::gp(g2, 1, 30, 25,   0, T2, 5),
-    mechanism::gp(g3, 1, 40, 60,   0, T3, 5),
-    mechanism::gp(g4, 1, 25, 92.5, 0, T4, 5),
-    mechanism::gp(g5, 1, 30, 120,  0, T5, 5)
+main(T1) :- do_mech([
+    gp(g1, 1, 20, 0,    0, T1, 5),
+    gp(g2, 1, 30, 25,   0, T2, 5),
+    gp(g3, 1, 40, 60,   0, T3, 5),
+    gp(g4, 1, 25, 92.5, 0, T4, 5),
+    gp(g5, 1, 30, 120,  0, T5, 5)
 ]).
 "#;
     let resolved = run(src, "main(30).").expect("should succeed");
@@ -170,15 +158,17 @@ fn rational_does_not_introduce_false_contradictions() {
     // 距離・角度がすべて非整除な値だが整合している。Rational なら通過する。
     // (旧 FixedPoint では DistSq*DistSq vs R*R の丸めで偽の不整合が出る可能性があった)
     let src = r#"
-#use("mechanism").
-main(T1) :- mechanism::do_mech([
-    mechanism::gp(g1, 1, 7,  0,    0, T1, 5),
-    mechanism::gp(g2, 1, 11, 9,    0, T2, 5)
+main(T1) :- do_mech([
+    gp(g1, 1, 7,  0,    0, T1, 5),
+    gp(g2, 1, 11, 9,    0, T2, 5)
 ]).
 "#;
     // Z1+Z2 = 18, M=1, center distance = 9. 9*9 = 81. DistSq = 9*9 = 81. 一致。
     let resolved = run(src, "main(0).").expect("should succeed");
-    let render_count = resolved.iter().filter(|s| s.starts_with("translate(")).count();
+    let render_count = resolved
+        .iter()
+        .filter(|s| s.starts_with("translate("))
+        .count();
     assert_eq!(render_count, 2, "expected 2 gears rendered");
 }
 
@@ -187,10 +177,9 @@ main(T1) :- mechanism::do_mech([
 #[test]
 fn distance_mismatch_reports_labeled_error() {
     let src = r#"
-#use("mechanism").
-main :- mechanism::do_mech([
-    mechanism::gp(g1, 1, 20, 0,  0, 0,  5),
-    mechanism::gp(g2, 1, 40, 31, 0, T2, 5)
+main :- do_mech([
+    gp(g1, 1, 20, 0,  0, 0,  5),
+    gp(g2, 1, 40, 31, 0, T2, 5)
 ]).
 "#;
     let err = run(src, "main.").expect_err("distance mismatch should fail");
@@ -212,10 +201,9 @@ main :- mechanism::do_mech([
 #[test]
 fn module_mismatch_fails_to_unify_mesh_head() {
     let src = r#"
-#use("mechanism").
-main :- mechanism::do_mech([
-    mechanism::gp(g1, 1, 20, 0,  0, 0,  5),
-    mechanism::gp(g2, 2, 20, 30, 0, T2, 5)
+main :- do_mech([
+    gp(g1, 1, 20, 0,  0, 0,  5),
+    gp(g2, 2, 20, 30, 0, T2, 5)
 ]).
 "#;
     let err = run(src, "main.").expect_err("module mismatch should fail");

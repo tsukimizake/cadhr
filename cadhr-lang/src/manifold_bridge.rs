@@ -70,18 +70,18 @@ pub enum Model3D {
         z: f64,
     },
     LinearExtrude {
-        profile: Model2D,
+        profile: PlacedSketch,
         height: f64,
     },
     ComplexExtrude {
-        profile: Model2D,
+        profile: PlacedSketch,
         height: f64,
         twist: f64,
         scale_x: f64,
         scale_y: f64,
     },
     Revolve {
-        profile: Model2D,
+        profile: PlacedSketch,
         degrees: f64,
     },
     Stl {
@@ -99,11 +99,17 @@ pub enum Model3D {
     },
 }
 
+/// 平面非依存の2Dプロファイル。
+/// rotateTo* は含まれないため、Union/Difference/Intersection/Center2D を自由に組み合わせて良い。
+/// 3D操作 (linear_extrude等) は `PlacedSketch` を要求し、その内部で `Model2D` が使われる。
 #[derive(Debug, Clone)]
 pub enum Model2D {
-    SketchXY(Plane2D),
-    SketchYZ(Plane2D),
-    SketchXZ(Plane2D),
+    Sketch {
+        points: Vec<(f64, f64)>,
+    },
+    Circle {
+        radius: f64,
+    },
     Path {
         points: Vec<(f64, f64)>,
     },
@@ -117,10 +123,21 @@ pub enum Model2D {
     },
 }
 
+/// 3D空間内のいずれかの平面に配置された2Dプロファイル。
+/// linear_extrude / complex_extrude / revolve はこの型を受け取る。
+/// プロファイル自身 (`Model2D`) は rotateTo* を含まないので「rotate後のスケッチに2D操作」は
+/// 構築不可能 (型エラー) になる。
 #[derive(Debug, Clone)]
-pub enum Plane2D {
-    Sketch { points: Vec<(f64, f64)> },
-    Circle { radius: f64 },
+pub struct PlacedSketch {
+    pub plane: Plane3D,
+    pub profile: Model2D,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plane3D {
+    XY,
+    YZ,
+    XZ,
 }
 
 const DEFAULT_SEGMENTS: u32 = 32;
@@ -134,13 +151,14 @@ pub const BUILTIN_FUNCTORS: &[(&str, &[usize])] = &[
     ("difference", &[2]),
     ("intersection", &[2]),
     ("hull", &[2]),
-    ("translate", &[4]),
+    ("translate", &[3]),
     ("scale", &[4]),
     ("rotate", &[4]),
     ("p", &[2, 3]),
-    ("sketchXY", &[1]),
-    ("sketchYZ", &[1]),
-    ("sketchXZ", &[1]),
+    ("sketch", &[1]),
+    ("rotateToXY", &[1]),
+    ("rotateToYZ", &[1]),
+    ("rotateToXZ", &[1]),
     ("circle", &[1, 2]),
     ("linear_extrude", &[2]),
     ("complex_extrude", &[5]),
@@ -176,9 +194,10 @@ enum FunctorTag {
     Scale,
     Rotate,
     Point,
-    SketchXY,
-    SketchYZ,
-    SketchXZ,
+    Sketch,
+    RotateToXY,
+    RotateToYZ,
+    RotateToXZ,
     Circle,
     LinearExtrude,
     ComplexExtrude,
@@ -209,9 +228,10 @@ impl FromStr for FunctorTag {
             "scale" => Ok(FunctorTag::Scale),
             "rotate" => Ok(FunctorTag::Rotate),
             "p" => Ok(FunctorTag::Point),
-            "sketchXY" => Ok(FunctorTag::SketchXY),
-            "sketchYZ" => Ok(FunctorTag::SketchYZ),
-            "sketchXZ" => Ok(FunctorTag::SketchXZ),
+            "sketch" => Ok(FunctorTag::Sketch),
+            "rotateToXY" => Ok(FunctorTag::RotateToXY),
+            "rotateToYZ" => Ok(FunctorTag::RotateToYZ),
+            "rotateToXZ" => Ok(FunctorTag::RotateToXZ),
             "circle" => Ok(FunctorTag::Circle),
             "linear_extrude" => Ok(FunctorTag::LinearExtrude),
             "complex_extrude" => Ok(FunctorTag::ComplexExtrude),
@@ -244,9 +264,10 @@ impl fmt::Display for FunctorTag {
             FunctorTag::Scale => "scale",
             FunctorTag::Rotate => "rotate",
             FunctorTag::Point => "p",
-            FunctorTag::SketchXY => "sketchXY",
-            FunctorTag::SketchYZ => "sketchYZ",
-            FunctorTag::SketchXZ => "sketchXZ",
+            FunctorTag::Sketch => "sketch",
+            FunctorTag::RotateToXY => "rotateToXY",
+            FunctorTag::RotateToYZ => "rotateToYZ",
+            FunctorTag::RotateToXZ => "rotateToXZ",
             FunctorTag::Circle => "circle",
             FunctorTag::LinearExtrude => "linear_extrude",
             FunctorTag::ComplexExtrude => "complex_extrude",
@@ -286,6 +307,16 @@ pub enum ConversionError {
         functor: String,
         message: String,
     },
+    /// rotateTo* でラップされた 2D プロファイルに対して、さらに 2D 操作 (boolean / center2d / rotateTo*) を
+    /// 適用しようとした場合に発生する。
+    RotatedSketchSealed {
+        op: &'static str,
+    },
+    /// linear_extrude / complex_extrude / revolve などの3D操作のプロファイル引数に、
+    /// rotateToXY/YZ/XZ で平面を明示していない 2D プロファイルが渡された場合のエラー。
+    MissingPlaneSpecification {
+        functor: String,
+    },
 }
 
 impl fmt::Display for ConversionError {
@@ -321,6 +352,20 @@ impl fmt::Display for ConversionError {
             }
             ConversionError::IoError { functor, message } => {
                 write!(f, "I/O error in {}: {}", functor, message)
+            }
+            ConversionError::RotatedSketchSealed { op } => {
+                write!(
+                    f,
+                    "rotated 2D profile is sealed; cannot apply `{}`. rotateTo* must be the outermost 2D operation; combine sketches first, then rotate.",
+                    op
+                )
+            }
+            ConversionError::MissingPlaneSpecification { functor } => {
+                write!(
+                    f,
+                    "{} requires an explicit plane placement on its profile; wrap the 2D profile with rotateToXY / rotateToYZ / rotateToXZ.",
+                    functor
+                )
             }
         }
     }
@@ -446,10 +491,7 @@ pub fn extract_control_points<S>(
                                 .unwrap_or(tracked[idx].value);
                             tracked[idx].value = val;
                             vnames[idx] = Some(vname.to_string());
-                            var_substitutions.push((
-                                vname.to_string(),
-                                Rational::from_f64(val),
-                            ));
+                            var_substitutions.push((vname.to_string(), Rational::from_f64(val)));
                         }
                     }
                     control_points.push(ControlPoint {
@@ -615,8 +657,16 @@ impl<'a, S> Args<'a, S> {
         Model3D::from_term(&self.args[i])
     }
 
+    fn raw(&self, i: usize) -> &Term<S> {
+        &self.args[i]
+    }
+
     fn term_2d(&self, i: usize) -> Result<Model2D, ConversionError> {
         Model2D::from_term(&self.args[i])
+    }
+
+    fn term_placed(&self, i: usize) -> Result<PlacedSketch, ConversionError> {
+        PlacedSketch::from_term(&self.args[i], self.functor)
     }
 
     fn arity_error(&self, expected: &str) -> ConversionError {
@@ -731,6 +781,49 @@ fn extract_point_2d<S>(
     }
 }
 
+fn extract_point_3d<S>(
+    term: &Term<S>,
+    tag: FunctorTag,
+    arg_index: usize,
+) -> Result<(f64, f64, f64), ConversionError> {
+    match term {
+        Term::Struct {
+            functor: f, args, ..
+        } if f == "p" && args.len() == 3 => {
+            let x = term_as_number(&args[0])
+                .ok_or_else(|| ConversionError::TypeMismatch {
+                    functor: tag.to_string(),
+                    arg_index,
+                    expected: "p(number, number, number)",
+                })?
+                .0
+                .to_f64();
+            let y = term_as_number(&args[1])
+                .ok_or_else(|| ConversionError::TypeMismatch {
+                    functor: tag.to_string(),
+                    arg_index,
+                    expected: "p(number, number, number)",
+                })?
+                .0
+                .to_f64();
+            let z = term_as_number(&args[2])
+                .ok_or_else(|| ConversionError::TypeMismatch {
+                    functor: tag.to_string(),
+                    arg_index,
+                    expected: "p(number, number, number)",
+                })?
+                .0
+                .to_f64();
+            Ok((x, y, z))
+        }
+        _ => Err(ConversionError::TypeMismatch {
+            functor: tag.to_string(),
+            arg_index,
+            expected: "p(x, y, z)",
+        }),
+    }
+}
+
 fn extract_path_points<S>(
     start_term: &Term<S>,
     segments_term: &Term<S>,
@@ -817,15 +910,23 @@ impl Model2D {
         left: &Term<S>,
         right: &Term<S>,
     ) -> Result<Self, ConversionError> {
-        let left_expr = Box::new(Self::from_term(left)?);
-        let right_expr = Box::new(Self::from_term(right)?);
+        let op_str = match op {
+            ArithOp::Add => "+",
+            ArithOp::Sub => "-",
+            ArithOp::Mul => "*",
+            ArithOp::Div => {
+                return Err(ConversionError::UnknownPrimitive(
+                    "division operator (/) is not supported for CAD operations".to_string(),
+                ));
+            }
+        };
+        let left = Box::new(Self::parse_2d_op_arg(left, op_str)?);
+        let right = Box::new(Self::parse_2d_op_arg(right, op_str)?);
         match op {
-            ArithOp::Add => Ok(Model2D::Union(left_expr, right_expr)),
-            ArithOp::Sub => Ok(Model2D::Difference(left_expr, right_expr)),
-            ArithOp::Mul => Ok(Model2D::Intersection(left_expr, right_expr)),
-            ArithOp::Div => Err(ConversionError::UnknownPrimitive(
-                "division operator (/) is not supported for CAD operations".to_string(),
-            )),
+            ArithOp::Add => Ok(Model2D::Union(left, right)),
+            ArithOp::Sub => Ok(Model2D::Difference(left, right)),
+            ArithOp::Mul => Ok(Model2D::Intersection(left, right)),
+            ArithOp::Div => unreachable!(),
         }
     }
 
@@ -835,34 +936,16 @@ impl Model2D {
             .map_err(|_| ConversionError::UnknownPrimitive(functor.to_string()))?;
 
         match tag {
-            FunctorTag::SketchXY if a.len() == 1 => {
+            FunctorTag::Sketch if a.len() == 1 => {
                 let points = extract_polygon_points(&a.args[0], a.functor)?;
-                Ok(Model2D::SketchXY(Plane2D::Sketch { points }))
+                Ok(Model2D::Sketch { points })
             }
-            FunctorTag::SketchXY => Err(a.arity_error("1")),
+            FunctorTag::Sketch => Err(a.arity_error("1")),
 
-            FunctorTag::SketchYZ if a.len() == 1 => {
-                let points = extract_polygon_points(&a.args[0], a.functor)?;
-                Ok(Model2D::SketchYZ(Plane2D::Sketch { points }))
-            }
-            FunctorTag::SketchYZ => Err(a.arity_error("1")),
-
-            FunctorTag::SketchXZ if a.len() == 1 => {
-                let mut points = extract_polygon_points(&a.args[0], a.functor)?;
-                // Rx(-90°)で+Y押し出しにするため、第2座標(Z)を反転
-                for p in points.iter_mut() {
-                    p.1 = -p.1;
-                }
-                Ok(Model2D::SketchXZ(Plane2D::Sketch { points }))
-            }
-            FunctorTag::SketchXZ => Err(a.arity_error("1")),
-
-            FunctorTag::Circle if a.len() == 1 => {
-                Ok(Model2D::SketchXY(Plane2D::Circle { radius: a.f64(0)? }))
-            }
+            FunctorTag::Circle if a.len() == 1 => Ok(Model2D::Circle { radius: a.f64(0)? }),
             FunctorTag::Circle if a.len() == 2 => {
                 // segments引数は無視（常にDEFAULT_SEGMENTS）
-                Ok(Model2D::SketchXY(Plane2D::Circle { radius: a.f64(0)? }))
+                Ok(Model2D::Circle { radius: a.f64(0)? })
             }
             FunctorTag::Circle => Err(a.arity_error("1 or 2")),
 
@@ -872,24 +955,30 @@ impl Model2D {
             }
             FunctorTag::Path => Err(a.arity_error("2")),
 
-            FunctorTag::Union if a.len() == 2 => Ok(Model2D::Union(
-                Box::new(Model2D::from_term(&a.args[0])?),
-                Box::new(Model2D::from_term(&a.args[1])?),
-            )),
-            FunctorTag::Difference if a.len() == 2 => Ok(Model2D::Difference(
-                Box::new(Model2D::from_term(&a.args[0])?),
-                Box::new(Model2D::from_term(&a.args[1])?),
-            )),
-            FunctorTag::Intersection if a.len() == 2 => Ok(Model2D::Intersection(
-                Box::new(Model2D::from_term(&a.args[0])?),
-                Box::new(Model2D::from_term(&a.args[1])?),
-            )),
+            FunctorTag::Union if a.len() == 2 => {
+                let l = Model2D::parse_2d_op_arg(&a.args[0], "union")?;
+                let r = Model2D::parse_2d_op_arg(&a.args[1], "union")?;
+                Ok(Model2D::Union(Box::new(l), Box::new(r)))
+            }
+            FunctorTag::Difference if a.len() == 2 => {
+                let l = Model2D::parse_2d_op_arg(&a.args[0], "difference")?;
+                let r = Model2D::parse_2d_op_arg(&a.args[1], "difference")?;
+                Ok(Model2D::Difference(Box::new(l), Box::new(r)))
+            }
+            FunctorTag::Intersection if a.len() == 2 => {
+                let l = Model2D::parse_2d_op_arg(&a.args[0], "intersection")?;
+                let r = Model2D::parse_2d_op_arg(&a.args[1], "intersection")?;
+                Ok(Model2D::Intersection(Box::new(l), Box::new(r)))
+            }
 
-            FunctorTag::Center2D if a.len() == 3 => Ok(Model2D::Center2D {
-                profile: Box::new(Model2D::from_term(&a.args[0])?),
-                x: a.f64(1)?,
-                y: a.f64(2)?,
-            }),
+            FunctorTag::Center2D if a.len() == 3 => {
+                let profile = Model2D::parse_2d_op_arg(&a.args[0], "center2d")?;
+                Ok(Model2D::Center2D {
+                    profile: Box::new(profile),
+                    x: a.f64(1)?,
+                    y: a.f64(2)?,
+                })
+            }
             FunctorTag::Center2D => Err(a.arity_error("3")),
 
             _ => Err(ConversionError::UnknownPrimitive(format!(
@@ -899,19 +988,30 @@ impl Model2D {
         }
     }
 
+    /// 2D操作 (union / difference / intersection / center2d / +,-,*) の引数として与えられた項を
+    /// パースする。トップレベルが rotateTo* だった場合は親演算名 `parent_op` を含めたエラーを返す。
+    /// 内部の Model2D::from_term は rotateTo* を含まない型に対してのみ成功するため、深く
+    /// ネストした場合も型システムによって自然に弾かれる。
+    fn parse_2d_op_arg<S>(
+        term: &Term<S>,
+        parent_op: &'static str,
+    ) -> Result<Self, ConversionError> {
+        if let Term::Struct { functor, .. } = term {
+            if matches!(functor.as_str(), "rotateToXY" | "rotateToYZ" | "rotateToXZ") {
+                return Err(ConversionError::RotatedSketchSealed { op: parent_op });
+            }
+        }
+        Self::from_term(term)
+    }
+
     fn to_polygon_rings(&self) -> Option<Vec<Vec<f64>>> {
         match self {
-            Model2D::SketchXY(Plane2D::Sketch { points })
-            | Model2D::SketchYZ(Plane2D::Sketch { points })
-            | Model2D::SketchXZ(Plane2D::Sketch { points })
-            | Model2D::Path { points } => {
+            Model2D::Sketch { points } | Model2D::Path { points } => {
                 let mut pts = points.clone();
                 ensure_ccw(&mut pts);
                 Some(vec![pairs_to_flat(&pts)])
             }
-            Model2D::SketchXY(Plane2D::Circle { radius })
-            | Model2D::SketchYZ(Plane2D::Circle { radius })
-            | Model2D::SketchXZ(Plane2D::Circle { radius }) => {
+            Model2D::Circle { radius } => {
                 let points: Vec<f64> = (0..DEFAULT_SEGMENTS)
                     .flat_map(|i| {
                         let angle =
@@ -960,14 +1060,72 @@ impl Model2D {
             }
         }
     }
+}
 
-    /// スケッチ平面に応じた回転角度 (rx, ry, rz) を返す
+impl PlacedSketch {
+    /// 3D操作 (linear_extrude / complex_extrude / revolve) のプロファイル引数のパース。
+    /// 外側が rotateToXY/YZ/XZ である必要があり、無ければ `MissingPlaneSpecification` エラー。
+    /// ただし2D操作の中に rotateTo* が紛れ込んでいる場合は (より具体的な)
+    /// `RotatedSketchSealed` を優先して返す。
+    /// `consumer` には呼び出し元の3D操作名 (例: "linear_extrude") を渡す。
+    fn from_term<S>(term: &Term<S>, consumer: &str) -> Result<Self, ConversionError> {
+        if let Term::Struct { functor, args, .. } = term {
+            let plane = match functor.as_str() {
+                "rotateToXY" => Some(Plane3D::XY),
+                "rotateToYZ" => Some(Plane3D::YZ),
+                "rotateToXZ" => Some(Plane3D::XZ),
+                _ => None,
+            };
+            if let Some(plane) = plane {
+                if args.len() != 1 {
+                    return Err(ConversionError::ArityMismatch {
+                        functor: functor.to_string(),
+                        expected: "1".to_string(),
+                        got: args.len(),
+                    });
+                }
+                let outer_op = match plane {
+                    Plane3D::XY => "rotateToXY",
+                    Plane3D::YZ => "rotateToYZ",
+                    Plane3D::XZ => "rotateToXZ",
+                };
+                // rotateTo* をネストすると同じエラーで弾く
+                let profile = Model2D::parse_2d_op_arg(&args[0], outer_op)?;
+                return Ok(PlacedSketch { plane, profile });
+            }
+        }
+        // ここに来るのは「最外殻が rotateTo* でない」ケース。
+        // 中に rotateTo* が紛れ込んでいるかは Model2D::from_term の seal 検査で判明する。
+        // 紛れ込んでいたら、ユーザーに直接「rotateTo* が 2D 操作内にある」と伝える方が親切。
+        match Model2D::from_term(term) {
+            Err(e @ ConversionError::RotatedSketchSealed { .. }) => Err(e),
+            _ => Err(ConversionError::MissingPlaneSpecification {
+                functor: consumer.to_string(),
+            }),
+        }
+    }
+
+    /// 押し出し後の3Dソリッドに適用する回転角度 (rx, ry, rz) を返す。
     fn plane_rotation(&self) -> Option<(f64, f64, f64)> {
-        match self {
-            Model2D::SketchYZ(_) => Some((90.0, 0.0, 90.0)),
-            Model2D::SketchXZ(_) => Some((-90.0, 0.0, 0.0)),
-            Model2D::Center2D { profile, .. } => profile.plane_rotation(),
-            _ => None,
+        match self.plane {
+            Plane3D::XY => None,
+            Plane3D::YZ => Some((90.0, 0.0, 90.0)),
+            Plane3D::XZ => Some((-90.0, 0.0, 0.0)),
+        }
+    }
+
+    fn to_polygon_rings(&self) -> Option<Vec<Vec<f64>>> {
+        let rings = self.profile.to_polygon_rings()?;
+        // XZ平面はRx(-90°)で+Y方向に押し出すため、ローカルY座標を反転して回転後の+Y方向に合わせる。
+        if self.plane == Plane3D::XZ {
+            Some(
+                rings
+                    .into_iter()
+                    .map(|ring| ring.chunks_exact(2).flat_map(|c| [c[0], -c[1]]).collect())
+                    .collect(),
+            )
+        } else {
+            Some(rings)
         }
     }
 }
@@ -994,8 +1152,21 @@ fn polygon_boolean_2d(
     Some(rings)
 }
 
-fn polygon_rings_or_err(
+fn polygon_rings_or_err_model2d(
     profile: &Model2D,
+    functor: &str,
+) -> Result<Vec<Vec<f64>>, ConversionError> {
+    profile
+        .to_polygon_rings()
+        .ok_or_else(|| ConversionError::TypeMismatch {
+            functor: functor.to_string(),
+            arg_index: 0,
+            expected: "polygon data",
+        })
+}
+
+fn polygon_rings_or_err(
+    profile: &PlacedSketch,
     functor: &str,
 ) -> Result<Vec<Vec<f64>>, ConversionError> {
     profile
@@ -1011,7 +1182,7 @@ fn flat_to_pairs(flat: &[f64]) -> Vec<(f64, f64)> {
     flat.chunks_exact(2).map(|c| (c[0], c[1])).collect()
 }
 
-fn apply_plane_rotation(m: Manifold, profile: &Model2D) -> Manifold {
+fn apply_plane_rotation(m: Manifold, profile: &PlacedSketch) -> Manifold {
     match profile.plane_rotation() {
         Some((rx, ry, rz)) => m.rotate(rx, ry, rz),
         None => m,
@@ -1117,13 +1288,20 @@ impl Model3D {
             )),
             FunctorTag::Hull => Err(a.arity_error("2")),
 
-            FunctorTag::Translate if a.len() == 4 => Ok(Model3D::Translate {
-                model: Box::new(a.term_3d(0)?),
-                x: a.f64(1)?,
-                y: a.f64(2)?,
-                z: a.f64(3)?,
-            }),
-            FunctorTag::Translate => Err(a.arity_error("4")),
+            FunctorTag::Translate if a.len() == 3 => {
+                let model = a.term_3d(0)?;
+                let (sx, sy, sz) =
+                    extract_point_3d(a.raw(1), FunctorTag::Translate, 1)?;
+                let (dx, dy, dz) =
+                    extract_point_3d(a.raw(2), FunctorTag::Translate, 2)?;
+                Ok(Model3D::Translate {
+                    model: Box::new(model),
+                    x: dx - sx,
+                    y: dy - sy,
+                    z: dz - sz,
+                })
+            }
+            FunctorTag::Translate => Err(a.arity_error("3")),
 
             FunctorTag::Scale if a.len() == 4 => Ok(Model3D::Scale {
                 model: Box::new(a.term_3d(0)?),
@@ -1142,13 +1320,13 @@ impl Model3D {
             FunctorTag::Rotate => Err(a.arity_error("4")),
 
             FunctorTag::LinearExtrude if a.len() == 2 => Ok(Model3D::LinearExtrude {
-                profile: a.term_2d(0)?,
+                profile: a.term_placed(0)?,
                 height: a.f64(1)?,
             }),
             FunctorTag::LinearExtrude => Err(a.arity_error("2")),
 
             FunctorTag::ComplexExtrude if a.len() == 5 => Ok(Model3D::ComplexExtrude {
-                profile: a.term_2d(0)?,
+                profile: a.term_placed(0)?,
                 height: a.f64(1)?,
                 twist: a.f64(2)?,
                 scale_x: a.f64(3)?,
@@ -1157,13 +1335,13 @@ impl Model3D {
             FunctorTag::ComplexExtrude => Err(a.arity_error("5")),
 
             FunctorTag::Revolve if a.len() == 2 => Ok(Model3D::Revolve {
-                profile: a.term_2d(0)?,
+                profile: a.term_placed(0)?,
                 degrees: a.f64(1)?,
             }),
             FunctorTag::Revolve if a.len() == 3 => {
                 // segments引数は無視（常にDEFAULT_SEGMENTS）
                 Ok(Model3D::Revolve {
-                    profile: a.term_2d(0)?,
+                    profile: a.term_placed(0)?,
                     degrees: a.f64(1)?,
                 })
             }
@@ -1178,7 +1356,7 @@ impl Model3D {
             FunctorTag::SweepExtrude if a.len() == 2 => {
                 let profile_2d = a.term_2d(0)?;
                 let path_2d = a.term_2d(1)?;
-                let profile_rings = polygon_rings_or_err(&profile_2d, "sweep_extrude")?;
+                let profile_rings = polygon_rings_or_err_model2d(&profile_2d, "sweep_extrude")?;
                 let path_rings =
                     path_2d
                         .to_polygon_rings()
@@ -1221,17 +1399,27 @@ impl Model3D {
                 "control is a data constructor, not a shape primitive".to_string(),
             )),
 
-            // 2D functors used as top-level 3D: wrap as thin extrude
-            FunctorTag::SketchXY
-            | FunctorTag::SketchYZ
-            | FunctorTag::SketchXZ
-            | FunctorTag::Circle
-            | FunctorTag::Path => {
-                // 2Dプロファイルを薄いextrudeとして3D化
-                let profile = Model2D::from_struct(functor, args)?;
+            // 2Dプロファイルがそのまま3Dコンテキストに置かれた場合、薄いextrudeとして3D化する。
+            // ただし平面の指定が必須なので rotateTo* で明示的にラップされている場合のみ受け付ける。
+            FunctorTag::RotateToXY | FunctorTag::RotateToYZ | FunctorTag::RotateToXZ => {
+                if a.len() != 1 {
+                    return Err(a.arity_error("1"));
+                }
+                let (plane, inner_op) = match tag {
+                    FunctorTag::RotateToXY => (Plane3D::XY, "rotateToXY"),
+                    FunctorTag::RotateToYZ => (Plane3D::YZ, "rotateToYZ"),
+                    FunctorTag::RotateToXZ => (Plane3D::XZ, "rotateToXZ"),
+                    _ => unreachable!(),
+                };
+                let profile = Model2D::parse_2d_op_arg(&a.args[0], inner_op)?;
                 Ok(Model3D::LinearExtrude {
-                    profile,
+                    profile: PlacedSketch { plane, profile },
                     height: 0.001,
+                })
+            }
+            FunctorTag::Sketch | FunctorTag::Circle | FunctorTag::Path => {
+                Err(ConversionError::MissingPlaneSpecification {
+                    functor: functor.to_string(),
                 })
             }
         }
@@ -1565,14 +1753,21 @@ mod tests {
 
     #[test]
     fn test_translate_conversion() {
+        // 新 API: translate(Shape, SrcPoint, DstPoint) で SrcPoint を DstPoint に運ぶ。
+        // 内部表現は DstPoint - SrcPoint の差分。
         let cube: Term = struc(
             "cube".into(),
             vec![number_int(1), number_int(1), number_int(1)],
         );
-        let translated = struc(
-            "translate".into(),
-            vec![cube, number_int(5), number_int(10), number_int(15)],
+        let src = struc(
+            "p".into(),
+            vec![number_int(0), number_int(0), number_int(0)],
         );
+        let dst = struc(
+            "p".into(),
+            vec![number_int(5), number_int(10), number_int(15)],
+        );
+        let translated = struc("translate".into(), vec![cube, src, dst]);
         let expr = Model3D::from_term(&translated).unwrap();
         match expr {
             Model3D::Translate { x, y, z, .. } => {
@@ -1582,6 +1777,63 @@ mod tests {
             }
             _ => panic!("Expected Translate"),
         }
+    }
+
+    #[test]
+    fn test_translate_point_based_nonzero_src() {
+        // SrcPoint が原点でない場合: 差分が translate 量になる。
+        let cube: Term = struc(
+            "cube".into(),
+            vec![number_int(2), number_int(2), number_int(2)],
+        );
+        let src = struc(
+            "p".into(),
+            vec![number_int(1), number_int(2), number_int(3)],
+        );
+        let dst = struc(
+            "p".into(),
+            vec![number_int(10), number_int(20), number_int(30)],
+        );
+        let translated = struc("translate".into(), vec![cube, src, dst]);
+        let expr = Model3D::from_term(&translated).unwrap();
+        match expr {
+            Model3D::Translate { x, y, z, .. } => {
+                assert_eq!(x, 9.0);
+                assert_eq!(y, 18.0);
+                assert_eq!(z, 27.0);
+            }
+            _ => panic!("Expected Translate"),
+        }
+    }
+
+    #[test]
+    fn test_translate_wrong_arity() {
+        // 旧 API arity 4 は arity error になる。
+        let cube: Term = struc(
+            "cube".into(),
+            vec![number_int(1), number_int(1), number_int(1)],
+        );
+        let translated = struc(
+            "translate".into(),
+            vec![cube, number_int(5), number_int(10), number_int(15)],
+        );
+        let result = Model3D::from_term(&translated);
+        assert!(matches!(result, Err(ConversionError::ArityMismatch { .. })));
+    }
+
+    #[test]
+    fn test_translate_non_point_arg() {
+        // SrcPoint/DstPoint に p(...) 以外を渡すと TypeMismatch。
+        let cube: Term = struc(
+            "cube".into(),
+            vec![number_int(1), number_int(1), number_int(1)],
+        );
+        let translated = struc(
+            "translate".into(),
+            vec![cube, number_int(0), number_int(5)],
+        );
+        let result = Model3D::from_term(&translated);
+        assert!(matches!(result, Err(ConversionError::TypeMismatch { .. })));
     }
 
     #[test]
@@ -1725,7 +1977,7 @@ mod tests {
             .into_iter()
             .map(|(x, y)| struc("p".into(), vec![number_int(x), number_int(y)]))
             .collect();
-        struc("sketchXY".into(), vec![crate::parse::list(points, None)])
+        struc("sketch".into(), vec![crate::parse::list(points, None)])
     }
 
     #[test]
@@ -1733,10 +1985,10 @@ mod tests {
         let term = make_polygon_term(vec![(1, 0), (0, 0), (0, 1), (1, 1)]);
         let expr = Model2D::from_term(&term).unwrap();
         match expr {
-            Model2D::SketchXY(Plane2D::Sketch { points }) => {
+            Model2D::Sketch { points } => {
                 assert_eq!(points, vec![(1.0, 0.0), (0.0, 0.0), (0.0, 1.0), (1.0, 1.0)]);
             }
-            _ => panic!("Expected SketchXY(Sketch)"),
+            _ => panic!("Expected Sketch"),
         }
     }
 
@@ -1745,21 +1997,26 @@ mod tests {
         let term: Term = struc("circle".into(), vec![number_int(5)]);
         let expr = Model2D::from_term(&term).unwrap();
         match expr {
-            Model2D::SketchXY(Plane2D::Circle { radius }) => {
+            Model2D::Circle { radius } => {
                 assert_eq!(radius, 5.0);
             }
-            _ => panic!("Expected SketchXY(Circle)"),
+            _ => panic!("Expected Circle"),
         }
+    }
+
+    fn xy(t: Term) -> Term {
+        struc("rotateToXY".into(), vec![t])
     }
 
     #[test]
     fn test_extrude_polygon() {
-        let polygon = make_polygon_term(vec![(1, 0), (0, 0), (0, 1), (1, 1)]);
+        let polygon = xy(make_polygon_term(vec![(1, 0), (0, 0), (0, 1), (1, 1)]));
         let term = struc("linear_extrude".into(), vec![polygon, number_int(3)]);
         let expr = Model3D::from_term(&term).unwrap();
         match expr {
             Model3D::LinearExtrude { profile, height } => {
-                assert!(matches!(profile, Model2D::SketchXY(Plane2D::Sketch { .. })));
+                assert_eq!(profile.plane, Plane3D::XY);
+                assert!(matches!(profile.profile, Model2D::Sketch { .. }));
                 assert_eq!(height, 3.0);
             }
             _ => panic!("Expected LinearExtrude"),
@@ -1768,12 +2025,12 @@ mod tests {
 
     #[test]
     fn test_revolve_circle() {
-        let circle: Term = struc("circle".into(), vec![number_int(5)]);
+        let circle: Term = xy(struc("circle".into(), vec![number_int(5)]));
         let term = struc("revolve".into(), vec![circle, number_int(360)]);
         let expr = Model3D::from_term(&term).unwrap();
         match expr {
             Model3D::Revolve { profile, degrees } => {
-                assert!(matches!(profile, Model2D::SketchXY(Plane2D::Circle { .. })));
+                assert!(matches!(profile.profile, Model2D::Circle { .. }));
                 assert_eq!(degrees, 360.0);
             }
             _ => panic!("Expected Revolve"),
@@ -1782,12 +2039,12 @@ mod tests {
 
     #[test]
     fn test_extrude_circle() {
-        let circle: Term = struc("circle".into(), vec![number_int(5)]);
+        let circle: Term = xy(struc("circle".into(), vec![number_int(5)]));
         let term = struc("linear_extrude".into(), vec![circle, number_int(10)]);
         let expr = Model3D::from_term(&term).unwrap();
         match expr {
             Model3D::LinearExtrude { profile, height } => {
-                assert!(matches!(profile, Model2D::SketchXY(Plane2D::Circle { .. })));
+                assert!(matches!(profile.profile, Model2D::Circle { .. }));
                 assert_eq!(height, 10.0);
             }
             _ => panic!("Expected LinearExtrude"),
@@ -1796,16 +2053,28 @@ mod tests {
 
     #[test]
     fn test_polygon_standalone_evaluate() {
-        let term = make_polygon_term(vec![(1, 0), (0, 0), (0, 1), (1, 1)]);
-        // 2Dプロファイルをトップレベルで3Dとして使うと薄いextrudeになる
+        // 2Dプロファイルをトップレベルで3Dとして使う (薄いextrudeになる) には
+        // 平面指定 (rotateToXY/YZ/XZ) で明示的にラップする必要がある。
+        let term = xy(make_polygon_term(vec![(1, 0), (0, 0), (0, 1), (1, 1)]));
         let expr = Model3D::from_term(&term).unwrap();
         let mesh = expr.to_mesh(&[]).unwrap();
         assert!(mesh.vertices().len() > 0);
     }
 
     #[test]
+    fn test_polygon_standalone_without_plane_errors() {
+        // 平面指定なしで2Dプロファイルを3Dコンテキストに置くとエラーになる
+        let term = make_polygon_term(vec![(1, 0), (0, 0), (0, 1), (1, 1)]);
+        let err = Model3D::from_term(&term).unwrap_err();
+        assert!(matches!(
+            err,
+            ConversionError::MissingPlaneSpecification { .. }
+        ));
+    }
+
+    #[test]
     fn test_extrude_evaluate() {
-        let polygon = make_polygon_term(vec![(1, 0), (0, 0), (0, 1), (1, 1)]);
+        let polygon = xy(make_polygon_term(vec![(1, 0), (0, 0), (0, 1), (1, 1)]));
         let term = struc("linear_extrude".into(), vec![polygon, number_int(3)]);
         let expr = Model3D::from_term(&term).unwrap();
         let mesh = expr.to_mesh(&[]).unwrap();
@@ -1814,7 +2083,7 @@ mod tests {
 
     #[test]
     fn test_polygon_union_to_polygon_rings() {
-        // 2つの重なるsketchXYのunionがpolygon ringsを返す
+        // 2つの重なるsketchのunionがpolygon ringsを返す
         let poly_a = make_polygon_term(vec![(0, 0), (2, 0), (2, 2), (0, 2)]);
         let poly_b = make_polygon_term(vec![(1, 1), (3, 1), (3, 3), (1, 3)]);
         let union_term = struc("union".into(), vec![poly_a, poly_b]);
@@ -1890,11 +2159,14 @@ mod tests {
 
     #[test]
     fn test_extrude_polygon_boolean() {
-        // linear_extrude(sketchXY(...) + circle(...), height) が動作する
+        // linear_extrude(sketch(...) + circle(...), height) が動作する
         let poly = make_polygon_term(vec![(0, 0), (5, 0), (5, 5), (0, 5)]);
         let circle: Term = struc("circle".into(), vec![number_int(3)]);
         let union_term: Term = struc("union".into(), vec![poly, circle]);
-        let extrude_term = struc("linear_extrude".into(), vec![union_term, number_int(10)]);
+        let extrude_term = struc(
+            "linear_extrude".into(),
+            vec![xy(union_term), number_int(10)],
+        );
         let expr = Model3D::from_term(&extrude_term).unwrap();
         let mesh = expr.to_mesh(&[]).unwrap();
         assert!(mesh.vertices().len() > 0);
@@ -1907,7 +2179,7 @@ mod tests {
         let poly_b = make_polygon_term(vec![(-6, -6), (6, -6), (6, 6), (-6, 6)]);
         let poly_c = make_polygon_term(vec![(-10, -3), (10, -3), (10, 3), (-10, 3)]);
         let diff1 = struc("difference".into(), vec![poly_a, poly_b]);
-        let diff2 = struc("difference".into(), vec![diff1, poly_c]);
+        let diff2 = xy(struc("difference".into(), vec![diff1, poly_c]));
         let extrude = struc("linear_extrude".into(), vec![diff2, number_int(50)]);
         let expr = Model3D::from_term(&extrude).unwrap();
         let mesh = expr.to_mesh(&[]).unwrap();
@@ -2031,7 +2303,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- linear_extrude(sketchXY([p(0, 0), p(0, 40), p(30, 0)]), X@10), control(X, 0, 0, \"width\")."
+            "main :- linear_extrude(rotateToXY(sketch([p(0, 0), p(0, 40), p(30, 0)])), X@10), control(X, 0, 0, \"width\")."
         ).unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (mut resolved, _) = execute(&mut db, q).unwrap();
@@ -2054,7 +2326,7 @@ mod tests {
 
         // X=なし: controlのVar座標が0にフォールバックし、extrude側にも0が代入される
         let mut db = database(
-            "main :- linear_extrude(sketchXY([p(0, 0), p(0, 40), p(30, 0)]), X), control(X, -10, -10).",
+            "main :- linear_extrude(rotateToXY(sketch([p(0, 0), p(0, 40), p(30, 0)])), X), control(X, -10, -10).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -2076,7 +2348,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- sketchXY([p(0,0), p(0,40), p(30,0)]) |> linear_extrude(X+1), control(X, -10, -10).",
+            "main :- sketch([p(0,0), p(0,40), p(30,0)]) |> rotateToXY |> linear_extrude(X+1), control(X, -10, -10).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -2093,7 +2365,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let src = "main :- sketchXY([p(0,0), p(0,40), p(30,0)]) |> linear_extrude(X+1), control(X, -10, -10).";
+        let src = "main :- sketch([p(0,0), p(0,40), p(30,0)]) |> rotateToXY |> linear_extrude(X+1), control(X, -10, -10).";
         let mut db = database(src).unwrap();
         let (_, q) = parse_query("main.").unwrap();
 
@@ -2113,7 +2385,7 @@ mod tests {
         assert_eq!(cps2.len(), 1);
         assert_eq!(cps2[0].var_names[0], Some("X".to_string()));
         assert_eq!(cps2[0].x.value, 5.0);
-        // 残りのtermsでextrude(sketchXY(...), 6)になっていること
+        // 残りのtermsでextrude(sketch(...), 6)になっていること
         assert_eq!(resolved2.len(), 1);
         let (mesh, _) = generate_mesh_and_tree_from_terms(&resolved2, &[]).unwrap();
         assert!(mesh.vertices().len() > 0);
@@ -2316,15 +2588,15 @@ mod tests {
 
     #[test]
     fn test_path_evaluate() {
-        let term = make_path_term(
+        // pathを3Dとして評価する (薄いextrude) にも平面指定が必要
+        let term = xy(make_path_term(
             (0, 0),
             vec![
                 line_to_term(10, 0),
                 bezier_to_quad_term((15, 5), (10, 10)),
                 line_to_term(0, 10),
             ],
-        );
-        // pathを3Dとして評価すると薄いextrudeになる
+        ));
         let expr = Model3D::from_term(&term).unwrap();
         let mesh = expr.to_mesh(&[]).unwrap();
         assert!(mesh.vertices().len() > 0);
@@ -2332,19 +2604,19 @@ mod tests {
 
     #[test]
     fn test_path_extrude() {
-        let path = make_path_term(
+        let path = xy(make_path_term(
             (0, 0),
             vec![
                 line_to_term(10, 0),
                 line_to_term(10, 10),
                 line_to_term(0, 10),
             ],
-        );
+        ));
         let term = struc("linear_extrude".into(), vec![path, number_int(5)]);
         let expr = Model3D::from_term(&term).unwrap();
         match &expr {
             Model3D::LinearExtrude { profile, height } => {
-                assert!(matches!(profile, Model2D::Path { .. }));
+                assert!(matches!(profile.profile, Model2D::Path { .. }));
                 assert_eq!(*height, 5.0);
             }
             _ => panic!("Expected LinearExtrude"),
@@ -2382,8 +2654,10 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let mut db =
-            database("main :- cube(10,10,10) |> translate(5,0,0) |> center3d(0,0,0).").unwrap();
+        let mut db = database(
+            "main :- cube(10,10,10) |> translate(p(0,0,0), p(5,0,0)) |> center3d(0,0,0).",
+        )
+        .unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (resolved, _) = execute(&mut db, q).unwrap();
         let exprs: Vec<Model3D> = resolved
@@ -2435,7 +2709,8 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db =
-            database("main :- circle(5) |> center2d(10, 20) |> linear_extrude(2).").unwrap();
+            database("main :- circle(5) |> center2d(10, 20) |> rotateToXY |> linear_extrude(2).")
+                .unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (resolved, _) = execute(&mut db, q).unwrap();
         let exprs: Vec<Model3D> = resolved
@@ -2451,12 +2726,14 @@ mod tests {
     }
 
     #[test]
-    fn test_center2d_with_sketch_yz() {
+    fn test_center2d_then_rotate_to_yz() {
+        // center2d を先に行ってから rotateToYZ する新スタイル。
+        // 旧 sketchYZ([...]) |> center2d(0,0) と同じ AABB になる。
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- sketchYZ([p(10,20), p(20,20), p(20,30), p(10,30)]) |> center2d(0, 0) |> linear_extrude(2).",
+            "main :- sketch([p(10,20), p(20,20), p(20,30), p(10,30)]) |> center2d(0, 0) |> rotateToYZ |> linear_extrude(2).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -2486,7 +2763,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- sketchXY([p(0,0), p(10,0), p(10,4), p(0,4)]) |> center2d(0, 0) |> linear_extrude(1).",
+            "main :- sketch([p(0,0), p(10,0), p(10,4), p(0,4)]) |> center2d(0, 0) |> rotateToXY |> linear_extrude(1).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -2501,5 +2778,234 @@ mod tests {
         assert_close!(node.aabb_max[0], 5.0);
         assert_close!(node.aabb_min[1], -2.0);
         assert_close!(node.aabb_max[1], 2.0);
+    }
+
+    // ============================================================
+    // rotateToXY/YZ/XZ + seal-error tests
+    // ============================================================
+
+    fn run_main(src: &str) -> Result<Vec<Model3D>, ConversionError> {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let mut db = database(src).unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let (resolved, _) = execute(&mut db, q).unwrap();
+        resolved
+            .iter()
+            .map(|t| Model3D::from_term(t))
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    #[test]
+    fn test_rotate_to_yz_basic() {
+        // 10x10の正方形をrotateToYZしてZ方向(=push後の+X)に2押し出し
+        let exprs = run_main(
+            "main :- sketch([p(0,0), p(10,0), p(10,10), p(0,10)]) |> rotateToYZ |> linear_extrude(2).",
+        )
+        .unwrap();
+        assert_eq!(exprs.len(), 1);
+        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
+        let x_extent = node.aabb_max[0] - node.aabb_min[0];
+        let y_extent = node.aabb_max[1] - node.aabb_min[1];
+        let z_extent = node.aabb_max[2] - node.aabb_min[2];
+        assert_close!(x_extent, 2.0);
+        assert_close!(y_extent, 10.0);
+        assert_close!(z_extent, 10.0);
+    }
+
+    #[test]
+    fn test_rotate_to_xz_basic() {
+        // 10x10の正方形をrotateToXZ → 押し出しは+Y方向に2
+        let exprs = run_main(
+            "main :- sketch([p(0,0), p(10,0), p(10,10), p(0,10)]) |> rotateToXZ |> linear_extrude(2).",
+        )
+        .unwrap();
+        assert_eq!(exprs.len(), 1);
+        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
+        let x_extent = node.aabb_max[0] - node.aabb_min[0];
+        let y_extent = node.aabb_max[1] - node.aabb_min[1];
+        let z_extent = node.aabb_max[2] - node.aabb_min[2];
+        assert_close!(x_extent, 10.0);
+        assert_close!(y_extent, 2.0);
+        assert_close!(z_extent, 10.0);
+    }
+
+    #[test]
+    fn test_rotate_to_xy_places_on_xy() {
+        // rotateToXY を明示すると XY 平面の押し出し (押し出し方向は +Z)
+        let exprs = run_main(
+            "main :- sketch([p(0,0), p(4,0), p(4,3), p(0,3)]) |> rotateToXY |> linear_extrude(2).",
+        )
+        .unwrap();
+        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
+        let x_extent = node.aabb_max[0] - node.aabb_min[0];
+        let y_extent = node.aabb_max[1] - node.aabb_min[1];
+        let z_extent = node.aabb_max[2] - node.aabb_min[2];
+        assert_close!(x_extent, 4.0);
+        assert_close!(y_extent, 3.0);
+        assert_close!(z_extent, 2.0);
+    }
+
+    #[test]
+    fn test_linear_extrude_requires_plane() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let mut db =
+            database("main :- sketch([p(0,0), p(4,0), p(4,3), p(0,3)]) |> linear_extrude(2).")
+                .unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let (resolved, _) = execute(&mut db, q).unwrap();
+        let err = resolved
+            .iter()
+            .map(|t| Model3D::from_term(t))
+            .find_map(|r| r.err())
+            .expect("expected MissingPlaneSpecification");
+        assert!(matches!(
+            err,
+            ConversionError::MissingPlaneSpecification { ref functor } if functor == "linear_extrude"
+        ));
+    }
+
+    #[test]
+    fn test_boolean_then_rotate_to_yz() {
+        // (a - b) |> rotateToYZ |> linear_extrude
+        // 今回の battery_case のバグ再現ケースが正しく動くこと
+        let exprs = run_main(
+            "main :- (sketch([p(0,0), p(20,0), p(20,58), p(0,58)]) - sketch([p(2.7,4.1), p(17.3,4.1), p(17.3,53.9), p(2.7,53.9)])) |> rotateToYZ |> linear_extrude(20).",
+        )
+        .unwrap();
+        assert_eq!(exprs.len(), 1);
+        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
+        // YZ平面の押し出しなので押し出し方向は+X
+        let x_extent = node.aabb_max[0] - node.aabb_min[0];
+        let y_extent = node.aabb_max[1] - node.aabb_min[1];
+        let z_extent = node.aabb_max[2] - node.aabb_min[2];
+        assert_close!(x_extent, 20.0);
+        assert_close!(y_extent, 20.0);
+        assert_close!(z_extent, 58.0);
+    }
+
+    #[test]
+    fn test_circle_rotate_to_yz() {
+        // circle(r) |> rotateToYZ |> linear_extrude が YZ 平面の円柱になる
+        let exprs = run_main("main :- circle(5) |> rotateToYZ |> linear_extrude(3).").unwrap();
+        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
+        let x_extent = node.aabb_max[0] - node.aabb_min[0];
+        let y_extent = node.aabb_max[1] - node.aabb_min[1];
+        let z_extent = node.aabb_max[2] - node.aabb_min[2];
+        assert_close!(x_extent, 3.0);
+        // 円の直径=10, 32分割で僅かに小さくなるので緩めに
+        assert!((y_extent - 10.0).abs() < 0.2);
+        assert!((z_extent - 10.0).abs() < 0.2);
+    }
+
+    fn expect_sealed(src: &str, expected_op: &str) {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let mut db = database(src).unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let (resolved, _) = execute(&mut db, q).unwrap();
+        let err = resolved
+            .iter()
+            .map(|t| Model3D::from_term(t))
+            .find_map(|r| r.err())
+            .unwrap_or_else(|| panic!("expected RotatedSketchSealed error for src: {}", src));
+        match err {
+            ConversionError::RotatedSketchSealed { op } => {
+                assert_eq!(op, expected_op, "src: {}", src);
+            }
+            other => panic!("expected RotatedSketchSealed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_boolean_after_rotate_errors() {
+        expect_sealed(
+            "main :- (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) + sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> linear_extrude(1).",
+            "+",
+        );
+        expect_sealed(
+            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) + (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) |> linear_extrude(1).",
+            "+",
+        );
+        expect_sealed(
+            "main :- (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) + (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) |> linear_extrude(1).",
+            "+",
+        );
+        expect_sealed(
+            "main :- (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) + (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToXZ) |> linear_extrude(1).",
+            "+",
+        );
+    }
+
+    #[test]
+    fn test_difference_after_rotate_errors() {
+        expect_sealed(
+            "main :- (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) - sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> linear_extrude(1).",
+            "-",
+        );
+    }
+
+    #[test]
+    fn test_center2d_after_rotate_errors() {
+        expect_sealed(
+            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ |> center2d(0, 0) |> linear_extrude(1).",
+            "center2d",
+        );
+    }
+
+    #[test]
+    fn test_battery_case_style_with_user_defined_inner() {
+        // ユーザープロジェクト battery_case と同等の構造:
+        // - 外側 boolean に user-defined predicate (honi) が含まれている
+        // - boolean の結果を rotateToYZ で平面に置いてから linear_extrude
+        // rotateTo* が is_builtin_functor として正しく登録され、term_rewrite で
+        // 既定ファンクタとして扱われることをこの統合テストで確認する。
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let src = "\
+main :- battery_box.
+battery_box :-
+  (sketch([p(0,0), p(20,0), p(20,58), p(0,58)]) |> center2d(0,0))
+  - honi |> rotateToYZ |> linear_extrude(20).
+honi :- sketch([p(0,0), p(14.6,0), p(14.6,49.8), p(0,49.8)]) |> center2d(0,0).
+";
+        let mut db = database(src).unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let (resolved, _) = execute(&mut db, q).unwrap();
+        let exprs: Vec<Model3D> = resolved
+            .iter()
+            .map(|t| Model3D::from_term(t))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(exprs.len(), 1);
+        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
+        let x_extent = node.aabb_max[0] - node.aabb_min[0];
+        let y_extent = node.aabb_max[1] - node.aabb_min[1];
+        let z_extent = node.aabb_max[2] - node.aabb_min[2];
+        // YZ平面に押し出した薄板形状: 押し出し方向は+X
+        assert_close!(x_extent, 20.0);
+        assert_close!(y_extent, 20.0);
+        assert_close!(z_extent, 58.0);
+    }
+
+    #[test]
+    fn test_double_rotate_errors() {
+        expect_sealed(
+            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ |> rotateToXZ |> linear_extrude(1).",
+            "rotateToXZ",
+        );
+        expect_sealed(
+            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ |> rotateToYZ |> linear_extrude(1).",
+            "rotateToYZ",
+        );
+        expect_sealed(
+            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ |> rotateToXY |> linear_extrude(1).",
+            "rotateToXY",
+        );
     }
 }

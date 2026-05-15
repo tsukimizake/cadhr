@@ -1822,12 +1822,14 @@ mod tests {
     #[test]
     fn default_var_propagates_within_rule_body() {
         let resolved = run_success(
-            "cut(W) :- cube(W, 50, 260). main :- cube(X@25, 50, 300) - (cut(W@5) |> translate(X / 2 - W, 0, 0)).",
+            "cut(W) :- cube(W, 50, 260). main :- cube(X@25, 50, 300) - (cut(W@5) |> translate(p(0, 0, 0), p(X / 2 - W, 0, 0))).",
             "main.",
         );
         assert_eq!(
             resolved,
-            vec!["(cube(X@25, 50, 300) - translate(cube(5, 50, 260), 7.5, 0, 0))"]
+            vec![
+                "(cube(X@25, 50, 300) - translate(cube(5, 50, 260), p(0, 0, 0), p(7.5, 0, 0)))"
+            ]
         );
     }
 
@@ -2135,14 +2137,16 @@ mod tests {
 
     #[test]
     fn arith_with_pipe_and_rule() {
-        // ob :- cube(1,1,1) |> translate(10,0,0). main :- ob + cube(2,2,2).
+        // ob :- cube(1,1,1) |> translate(p(0,0,0), p(10,0,0)). main :- ob + cube(2,2,2).
         let resolved = run_success(
-            "ob :- cube(1,1,1) |> translate(10,0,0). main :- ob + cube(2,2,2).",
+            "ob :- cube(1,1,1) |> translate(p(0,0,0), p(10,0,0)). main :- ob + cube(2,2,2).",
             "main.",
         );
         assert_eq!(
             resolved,
-            vec!["(translate(cube(1, 1, 1), 10, 0, 0) + cube(2, 2, 2))"]
+            vec![
+                "(translate(cube(1, 1, 1), p(0, 0, 0), p(10, 0, 0)) + cube(2, 2, 2))"
+            ]
         );
     }
 
@@ -2172,7 +2176,7 @@ mod tests {
     #[test]
     fn builtin_arg_rule_with_bom_separation() {
         let resolved = run_success(
-            "part(X) :- cube(X, 10, 10), bom(\"cube\", []). main :- translate(part(5), 10, 0, 0).",
+            "part(X) :- cube(X, 10, 10), bom(\"cube\", []). main :- translate(part(5), p(0, 0, 0), p(10, 0, 0)).",
             "main.",
         );
         assert_eq!(resolved.len(), 2);
@@ -2194,7 +2198,7 @@ mod tests {
     #[test]
     fn pipe_with_bom_separation() {
         let resolved = run_success(
-            "part(X) :- cube(X, 10, 10), bom(\"cube\", []). main :- part(5) |> translate(10, 0, 0).",
+            "part(X) :- cube(X, 10, 10), bom(\"cube\", []). main :- part(5) |> translate(p(0, 0, 0), p(10, 0, 0)).",
             "main.",
         );
         assert_eq!(resolved.len(), 2);
@@ -2225,12 +2229,12 @@ mod tests {
     #[test]
     fn body_eq_constraint_with_rule() {
         let resolved = run_success(
-            "cut(SLIT, W, H) :- X=(W-SLIT)/2, sketchXY([p(X, 0), p(SLIT+W, 0), p(SLIT+W, H-20), p(X, H-20)]).",
+            "cut(SLIT, W, H) :- X=(W-SLIT)/2, sketch([p(X, 0), p(SLIT+W, 0), p(SLIT+W, H-20), p(X, H-20)]).",
             "cut(18, 40, 120).",
         );
         assert_eq!(
             resolved,
-            vec!["sketchXY([p(11, 0), p(58, 0), p(58, 100), p(11, 100)])"]
+            vec!["sketch([p(11, 0), p(58, 0), p(58, 100), p(11, 100)])"]
         );
     }
 
@@ -2375,9 +2379,9 @@ main :- battery_box.\n\
 battery_box :- ((cube(X@20, Y@18, OUTLEN@58)\n\
                 - wire_hole(X/2, WH_Y1, 0)\n\
                 - wire_hole(X/2, WH_Y2, 0)\n\
-                ) |> translate(0-X/2, 0-Y/2, 0)),\n\
+                ) |> translate(p(0, 0, 0), p(0-X/2, 0-Y/2, 0))),\n\
                 WH_Y1 = Y/4, WH_Y2 = Y*3/4.\n\
-wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(X, Y, H).\n\
+wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(p(0, 0, 0), p(X, Y, H)).\n\
 ";
         let mut db = database(db_src).expect("failed to parse db");
         let (_, query_terms) = query("main.").expect("failed to parse query");
