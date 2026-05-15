@@ -451,13 +451,6 @@ fn term_to_tracked_f64<S>(term: &Term<S>) -> Option<TrackedF64> {
     }
 }
 
-fn var_name<S>(term: &Term<S>) -> Option<&str> {
-    match term {
-        Term::Var { name, .. } => Some(name),
-        _ => None,
-    }
-}
-
 /// 2 つの Bound から Rational の midpoint を計算する。
 fn midpoint(lo: &Bound, hi: &Bound) -> Rational {
     Rational::from_f64((lo.value.to_f64() + hi.value.to_f64()) / 2.0)
@@ -479,13 +472,15 @@ fn point_2d_args<S>(term: &Term<S>) -> Option<&[Term<S>; 2]> {
 /// control2d(p(X,Y)[, Name]) / control3d(p(X,Y,Z)[, Name]) の Term を抽出し、
 /// 残りの Term を返す。各軸の Var に対する override を適用し、同名 Var の他の参照箇所も
 /// 数値に置換する。control2d は z=0 固定、var_names[2]=None。
-pub fn extract_control_points<S: Clone>(
+pub fn extract_control_points<S: Clone + PartialEq + fmt::Debug>(
     terms: &mut Vec<Term<S>>,
     overrides: &std::collections::HashMap<String, f64>,
 ) -> Vec<ControlPoint> {
     let mut control_points = Vec::new();
 
-    let mut var_substitutions: Vec<(String, Term<S>)> = Vec::new();
+    // Var substitution は (名前, スコープ, 値) の三つ組で識別する。スコープを含めることで
+    // 別スコープに同名 Var があっても巻き込まない。
+    let mut var_substitutions: Vec<(String, S, Term<S>)> = Vec::new();
 
     terms.retain(|term| {
         let Term::Struct { functor, args, .. } = term else {
@@ -548,8 +543,14 @@ pub fn extract_control_points<S: Clone>(
                 None
             };
 
+            // 軸名は `<bare>.<axis>#<scope>` 形式。`#` はパーサが識別子に許容しない
+            // (is_id_continue 参照) ため、ユーザ Var との衝突は起きない。スコープ ID を
+            // 含めることで、別 predicate で同名 (例 CENTER) を control2d/3d で unify した
+            // とき、それぞれ独立した override map キーになり drag が混ざらない。
+            let scope_suffix = format!("{:?}", bare_scope);
             for i in 0..axis_count {
-                let axis_name = format!("{}.{}", bare_name, axis_labels[i]);
+                let axis_name =
+                    format!("{}.{}#{}", bare_name, axis_labels[i], scope_suffix);
                 let fresh = Term::Var {
                     name: axis_name.clone(),
                     scope: bare_scope.clone(),
@@ -578,7 +579,7 @@ pub fn extract_control_points<S: Clone>(
                 args: p_args,
                 span: None,
             };
-            var_substitutions.push((bare_name.clone(), p_term));
+            var_substitutions.push((bare_name.clone(), bare_scope.clone(), p_term));
 
             let z = if is_2d {
                 TrackedF64 { value: 0.0, source_span: None }
@@ -625,15 +626,22 @@ pub fn extract_control_points<S: Clone>(
             {
                 axis_ranges[idx] = Some((lo.value.to_f64(), hi.value.to_f64()));
             }
-            if let Some(vname) = var_name(arg) {
+            if let Term::Var {
+                name: vname,
+                scope: vscope,
+                ..
+            } = arg
+                && vname != "_"
+            {
                 let val = overrides
-                    .get(&vname.to_string())
+                    .get(vname)
                     .copied()
                     .unwrap_or(tracked_axes[idx].value);
                 tracked_axes[idx].value = val;
-                vnames[idx] = Some(vname.to_string());
+                vnames[idx] = Some(vname.clone());
                 var_substitutions.push((
-                    vname.to_string(),
+                    vname.clone(),
+                    vscope.clone(),
                     Term::Number {
                         value: Rational::from_f64(val),
                     },
@@ -673,11 +681,12 @@ pub fn extract_control_points<S: Clone>(
     control_points
 }
 
-/// Var を任意の Term で substitute する。
-fn substitute_vars<S: Clone>(term: &mut Term<S>, subs: &[(String, Term<S>)]) {
+/// Var を任意の Term で substitute する。名前 + スコープの両方でマッチさせ、別スコープに
+/// 同名 Var があっても巻き込まないようにする。
+fn substitute_vars<S: Clone + PartialEq>(term: &mut Term<S>, subs: &[(String, S, Term<S>)]) {
     match term {
-        Term::Var { name, .. } => {
-            if let Some((_, val)) = subs.iter().find(|(n, _)| n == name) {
+        Term::Var { name, scope, .. } => {
+            if let Some((_, _, val)) = subs.iter().find(|(n, s, _)| n == name && s == scope) {
                 *term = val.clone();
             }
         }
@@ -2631,8 +2640,10 @@ mod tests {
         let (mut resolved, _) = execute(&mut db, q).unwrap();
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
-        assert_eq!(cps[0].var_names[0].as_deref(), Some("CENTER.x"));
-        assert_eq!(cps[0].var_names[1].as_deref(), Some("CENTER.y"));
+        // axis 名は `<bare>.<axis>#<scope>` 形式。スコープ ID 部分は内部実装に依存するので
+        // prefix だけ確認する。
+        assert!(cps[0].var_names[0].as_deref().unwrap().starts_with("CENTER.x#"));
+        assert!(cps[0].var_names[1].as_deref().unwrap().starts_with("CENTER.y#"));
         assert_eq!(cps[0].axis_ranges[0], Some((-100.0, 100.0)));
         assert_eq!(cps[0].axis_ranges[1], Some((-100.0, 100.0)));
         // midpoint = 0
@@ -2669,6 +2680,81 @@ mod tests {
              is referenced as bare Var elsewhere"
         );
         assert_eq!(cps[0].axis_ranges[1], Some((-100.0, 100.0)));
+    }
+
+    /// 異なるスコープで同名 (POS) を別目的に使うケース。bare-Var unify の substitute は
+    /// 同一名・同一スコープに限定されるべき (別スコープの POS を巻き込まない)。
+    /// foo は POS@(0,0,0) を control3d で unify、bar は別の POS をそのまま translate に
+    /// 渡す。bar の POS は明示的に別の値で bind される。
+    #[test]
+    fn test_control_3d_bare_unify_does_not_cross_scopes() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let mut db = database(
+            "main :- foo + bar.
+             foo :- cube(1, 1, 1), control3d(POS).
+             bar :- cube(2, 2, 2) |> translate(p(0,0,0), POS),
+               POS = p(5, 0, 0).",
+        )
+        .unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let cps = extract_control_points(&mut resolved, &Default::default());
+        assert_eq!(cps.len(), 1);
+        // foo の control3d は POS を p(POS.x#<scope>, POS.y#<scope>, POS.z#<scope>) に unify
+        assert!(cps[0].var_names[0].as_deref().unwrap().starts_with("POS.x#"));
+        // bar 側の POS は CENTER = p(5, 0, 0) で別の値に bind されている。
+        // 変換が通れば(エラーなく Model3D になれば) cross-scope 干渉していない。
+        let _exprs: Vec<Model3D> = resolved
+            .iter()
+            .map(|t| Model3D::from_term(t))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|e| panic!("Model3D conversion should not fail: {:?}", e));
+    }
+
+    /// 別スコープで同名の CENTER がそれぞれ独立に bare-Var unify される場合、ControlPoint
+    /// および axis var 名・axis_ranges がスコープごとに別であるべき。同名衝突で drag が
+    /// 巻き込まれたり range が混在したりしてはいけない。
+    #[test]
+    fn test_control_2d_distinct_scopes_with_same_name() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let mut db = database(
+            "main :- foo + bar.
+             foo :- cube(1, 1, 1), control2d(-100<CENTER<100).
+             bar :- cube(2, 2, 2), control2d(0<CENTER<50).",
+        )
+        .unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let cps = extract_control_points(&mut resolved, &Default::default());
+        assert_eq!(cps.len(), 2, "両方の control2d がそれぞれ独立に抽出されるべき");
+
+        let ranges: Vec<_> = cps.iter().map(|c| c.axis_ranges[0]).collect();
+        assert!(
+            ranges.contains(&Some((-100.0, 100.0))),
+            "foo's range should be present"
+        );
+        assert!(
+            ranges.contains(&Some((0.0, 50.0))),
+            "bar's range should be present"
+        );
+
+        // 各 ControlPoint の axis var 名はスコープ間で衝突してはならない。
+        // 同名なら GUI override map のキー (例 "CENTER.x") が共有されて、片方の drag が
+        // もう片方に伝播してしまう。
+        let names: Vec<_> = cps
+            .iter()
+            .map(|c| c.var_names[0].clone().unwrap_or_default())
+            .collect();
+        assert_ne!(
+            names[0], names[1],
+            "axis var names must be distinct across scopes (got both '{}'). \
+             Otherwise GUI override-map keys collide and dragging one CP also moves the other.",
+            names[0]
+        );
     }
 
     /// 明示形 `p(0<X<100, 50<Y<150)` で軸ごとに異なる range が axis_ranges に入る。
