@@ -125,7 +125,7 @@ fn try_eval(expr: &ArithExpr) -> Option<Rational> {
 /// expr = target の形の方程式を解き、変数が1つなら (変数名, 値) を返す。
 ///
 /// `Rational` で厳密に逆算するため、`30 * T2 = 400` のような非整除な式でも
-/// `T2 = 40/3` を厳密に得られる (旧 FixedPoint 版で必要だった tolerance チェックは不要)。
+/// `T2 = 40/3` を厳密に得られる。
 fn try_solve_for_var(expr: &ArithExpr, target: &Rational) -> Option<(String, Rational)> {
     match expr {
         ArithExpr::Var(name) => Some((name.clone(), target.clone())),

@@ -591,13 +591,16 @@ pub fn view(p: &Preview, index: usize, total: usize) -> Element<'_, Msg> {
                     cp.var_names[axis_idx].as_ref().map(|var_name| {
                         let vn = var_name.clone();
                         let source_span = tracked.source_span;
-                        let range_half = (val.abs() + 50.0).max(50.0);
-                        let mut sl =
-                            slider((val - range_half)..=(val + range_half), val, move |v| {
-                                Msg::CpOverrideChanged(vn.clone(), v)
-                            })
-                            .step(0.5)
-                            .width(80);
+                        // 軸 Var に range 注釈があればそれを使う(`0<X<100` などで指定された範囲)。
+                        // 無ければ広めの固定範囲 -1000..1000 を使う(よくある CAD スケールを
+                        // カバーしつつ、注釈が無いユーザにも一定の操作性を提供)。
+                        let (slider_lo, slider_hi) =
+                            cp.axis_ranges[axis_idx].unwrap_or((-1000.0, 1000.0));
+                        let mut sl = slider(slider_lo..=slider_hi, val, move |v| {
+                            Msg::CpOverrideChanged(vn.clone(), v)
+                        })
+                        .step(0.5)
+                        .width(80);
                         if let Some(span) = source_span.filter(|s| s.file_id == 0) {
                             let vn2 = var_name.clone();
                             sl = sl.on_release(Msg::CpSourceEdit(vn2, span));

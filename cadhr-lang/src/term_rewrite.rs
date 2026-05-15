@@ -41,6 +41,38 @@ pub fn resolve(term: &ScopedTerm, env: &ScopedEnv) -> ScopedTerm {
     resolve_inner(term, env, 0)
 }
 
+/// resolve 経由で別 Var に解決された場合、元 Var の annotation を新 Var にマージする。
+/// 同 scope 内で同名 Var が unify されたとき (例: 渡された CENTER と inner の CENTER head)、
+/// 注釈付き側の min/max/default を unify 先の bare Var が引き継ぐようにする。
+fn merge_var_annotations(
+    base: ScopedTerm,
+    orig_default: &Option<crate::rational::Rational>,
+    orig_min: &Option<Bound>,
+    orig_max: &Option<Bound>,
+    orig_span: Option<SrcSpan>,
+) -> ScopedTerm {
+    if let Term::Var {
+        name,
+        scope,
+        default_value,
+        min,
+        max,
+        span,
+    } = base
+    {
+        Term::Var {
+            name,
+            scope,
+            default_value: default_value.or_else(|| orig_default.clone()),
+            min: min.or_else(|| orig_min.clone()),
+            max: max.or_else(|| orig_max.clone()),
+            span: span.or(orig_span),
+        }
+    } else {
+        base
+    }
+}
+
 fn resolve_inner(term: &ScopedTerm, env: &ScopedEnv, depth: usize) -> ScopedTerm {
     if depth > RESOLVE_DEPTH_LIMIT {
         panic!(
@@ -68,7 +100,14 @@ fn resolve_inner(term: &ScopedTerm, env: &ScopedEnv, depth: usize) -> ScopedTerm
                     max: max.clone(),
                     span: *span,
                 },
-                Some(val) => resolve_inner(val, env, depth + 1),
+                Some(val) => {
+                    let resolved = resolve_inner(val, env, depth + 1);
+                    if has_annotation {
+                        merge_var_annotations(resolved, default_value, min, max, *span)
+                    } else {
+                        resolved
+                    }
+                }
                 None => term.clone(),
             }
         }
@@ -147,6 +186,11 @@ fn is_builtin_term<S>(term: &Term<S>) -> bool {
 fn is_metadata_term<S>(term: &Term<S>) -> bool {
     matches!(term, Term::Struct { functor, .. }
         if is_builtin_functor(functor) && !should_resolve_args(functor))
+}
+
+/// control2d / control3d のいずれかかどうか
+fn is_control_term<S>(term: &Term<S>) -> bool {
+    matches!(term, Term::Struct { functor, .. } if functor == "control2d" || functor == "control3d")
 }
 
 fn builtin_fact(functor: &str, arity: usize) -> Clause {
@@ -1428,16 +1472,14 @@ fn rewrite_term_recursive(
             let new_right_terms =
                 rewrite_term_recursive(db, clause_counter, *right, other_goals, shared_env)?;
 
-            // メタデータ(bom等)やcontrolをother_goalsへ分離し、シェイプだけ残す
+            // メタデータ(bom等)やcontrol2d/control3dをother_goalsへ分離し、シェイプだけ残す
             let (left_shapes, left_meta): (Vec<_>, Vec<_>) =
                 new_left_terms.into_iter().partition(|t| {
-                    !is_metadata_term(t)
-                        && !matches!(t, Term::Struct { functor, .. } if functor == "control")
+                    !is_metadata_term(t) && !is_control_term(t)
                 });
             let (right_shapes, right_meta): (Vec<_>, Vec<_>) =
                 new_right_terms.into_iter().partition(|t| {
-                    !is_metadata_term(t)
-                        && !matches!(t, Term::Struct { functor, .. } if functor == "control")
+                    !is_metadata_term(t) && !is_control_term(t)
                 });
 
             other_goals.extend(left_meta);
@@ -1563,8 +1605,7 @@ fn resolve_builtin_arg(
             if resolved.len() > 1 {
                 let mut shape = Vec::new();
                 for t in resolved {
-                    if matches!(&t, Term::Struct { functor, .. } if functor == "control")
-                        || is_metadata_term(&t)
+                    if is_control_term(&t) || is_metadata_term(&t)
                     {
                         other_goals.push(t);
                     } else {
@@ -2165,12 +2206,12 @@ mod tests {
     #[test]
     fn builtin_arg_rule_with_control_separation() {
         let resolved = run_success(
-            "blade_cut :- path(p(0, 0), [line_to(p(10, 0)), line_to(p(10, 20))]), control(p(X@0, Y@20, 0)). main :- linear_extrude(blade_cut, 100).",
+            "blade_cut :- path(p(0, 0), [line_to(p(10, 0)), line_to(p(10, 20))]), control3d(p(X@0, Y@20, 0)). main :- linear_extrude(blade_cut, 100).",
             "main.",
         );
         assert_eq!(resolved.len(), 2);
         assert!(resolved[0].starts_with("linear_extrude(path("));
-        assert!(resolved[1].starts_with("control("));
+        assert!(resolved[1].starts_with("control3d("));
     }
 
     #[test]
@@ -2370,10 +2411,8 @@ mod tests {
 
     #[test]
     fn rule_body_with_constraints_does_not_panic() {
-        // 再帰中の制約解消で temp_other_goals が縮むケース。以前は drain(0..remaining_body.len())
-        // が out-of-range で panic していた。また、本体内のサブゴール展開時に @-default が
-        // constraint に伝播するが、その後 try_resolve_constraints が呼ばれず Var が未解決のまま
-        // メッシュ生成に渡って "Unbound variable" エラーになっていた。
+        // 再帰中の制約解消で temp_other_goals が縮むケース + 本体内サブゴール展開時に
+        // @-default が constraint に伝播するケースをまとめてカバーする。
         let db_src = "\
 main :- battery_box.\n\
 battery_box :- ((cube(X@20, Y@18, OUTLEN@58)\n\

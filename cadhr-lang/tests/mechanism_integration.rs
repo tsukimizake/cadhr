@@ -1,8 +1,7 @@
 //! mechanism 統合テスト。
 //!
 //! `cadhr-lang/tests/mechanism.cadhr` を include_str! で取り込み、平歯車の連鎖を
-//! validate + render するワークフローを通しでチェックする。元々は library/ 配下の
-//! 配布対象だったが、機能が限定的すぎるためテスト専用フィクスチャに移した。
+//! validate + render するワークフローを通しでチェックする。
 
 use cadhr_lang::parse::{database, query};
 use cadhr_lang::term_rewrite::execute;
