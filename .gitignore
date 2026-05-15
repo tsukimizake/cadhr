@@ -33,3 +33,6 @@ pkg/
 # Added by cargo
 
 /target
+
+# Local-only utility examples (not tracked because they hard-code personal paths)
+cadhr-lang/examples/
