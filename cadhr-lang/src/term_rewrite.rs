@@ -5,7 +5,7 @@ use std::fmt;
 use crate::constraint::{ArithEq, ArithExpr, solve_constraints};
 use crate::parse::{
     ArithOp, Bound, Clause, QueryParam, ScopeId, ScopedTerm, SrcSpan, Term, VarAnnotation,
-    VarAnnotations, first_span, list, number, struc, var,
+    first_span, list, number, struc, var,
 };
 use crate::term_processor::{
     all_builtin_functors, is_builtin_functor, is_builtin_functor_with_arity, should_resolve_args,
@@ -13,30 +13,114 @@ use crate::term_processor::{
 
 pub type Env = HashMap<String, ScopedTerm>;
 
+/// 1 つの論理変数 (= UF の同一同値類) に紐付く情報。canonical な entry のみが意味を持ち、
+/// 非 canonical な entry は parent pointer 経由で root に解決する。
+#[derive(Debug, Clone, Default)]
+pub struct VarInfo {
+    pub value: Option<ScopedTerm>,
+    pub annotation: VarAnnotation,
+}
+
+/// (scope, name) を key とする Union-Find ベースの環境。
+/// `insert(scope, name, term)`:
+///   - term が Var なら union (同値類を merge)
+///   - term が非 Var なら canonical の value にセット
+/// `get(scope, name)`: canonical の value (Option<&ScopedTerm>)
+/// `merge_annotation(scope, name, ann)` / `get_annotation`: canonical の annotation
 #[derive(Debug, Clone)]
 pub struct ScopedEnv {
-    scopes: HashMap<ScopeId, HashMap<String, ScopedTerm>>,
-    /// 同一論理変数 (= (scope, name)) の annotation を集約する Union-Find。
-    /// unify 時に `annotations.union(s1, n1, s2, n2)` で merge し、resolve / lookup 時に
-    /// canonical annotation を読み取る。Term::Var インスタンスごとに持つフィールドではなく
-    /// この副 env が source of truth。
-    pub annotations: VarAnnotations,
+    parent: HashMap<(ScopeId, String), (ScopeId, String)>,
+    info: HashMap<(ScopeId, String), VarInfo>,
 }
 
 impl ScopedEnv {
     pub fn new() -> Self {
         Self {
-            scopes: HashMap::new(),
-            annotations: VarAnnotations::new(),
+            parent: HashMap::new(),
+            info: HashMap::new(),
         }
     }
 
-    pub fn insert(&mut self, scope: ScopeId, name: String, term: ScopedTerm) {
-        self.scopes.entry(scope).or_default().insert(name, term);
+    fn find_mut(&mut self, scope: ScopeId, name: &str) -> (ScopeId, String) {
+        let mut current = (scope, name.to_string());
+        let mut path = Vec::new();
+        while let Some(p) = self.parent.get(&current) {
+            if p == &current {
+                break;
+            }
+            path.push(current.clone());
+            current = p.clone();
+        }
+        for k in path {
+            self.parent.insert(k, current.clone());
+        }
+        current
     }
 
+    fn find_immutable(&self, scope: ScopeId, name: &str) -> (ScopeId, String) {
+        let mut current = (scope, name.to_string());
+        while let Some(p) = self.parent.get(&current) {
+            if p == &current {
+                break;
+            }
+            current = p.clone();
+        }
+        current
+    }
+
+    /// (scope, name) の同値類に term をバインドする。
+    /// term が Var なら union、それ以外なら canonical の value にセット。
+    pub fn insert(&mut self, scope: ScopeId, name: String, term: ScopedTerm) {
+        if let Term::Var {
+            name: n2,
+            scope: s2,
+            ..
+        } = &term
+            && n2 != "_"
+        {
+            self.union(scope, &name, *s2, n2);
+            return;
+        }
+        let root = self.find_mut(scope, &name);
+        self.info.entry(root).or_default().value = Some(term);
+    }
+
+    /// canonical の value を返す (チェーン解決済み)。binding が無ければ None。
     pub fn get(&self, scope: ScopeId, name: &str) -> Option<&ScopedTerm> {
-        self.scopes.get(&scope)?.get(name)
+        let root = self.find_immutable(scope, name);
+        self.info.get(&root).and_then(|i| i.value.as_ref())
+    }
+
+    /// canonical の annotation に merge (self 優先)。
+    pub fn merge_annotation(&mut self, scope: ScopeId, name: &str, value: VarAnnotation) {
+        let root = self.find_mut(scope, name);
+        self.info.entry(root).or_default().annotation.absorb(&value);
+    }
+
+    /// canonical の annotation を読み取る (path compression なし、`&self` で使える)。
+    pub fn get_annotation(&self, scope: ScopeId, name: &str) -> VarAnnotation {
+        let root = self.find_immutable(scope, name);
+        self.info
+            .get(&root)
+            .map(|i| i.annotation.clone())
+            .unwrap_or_default()
+    }
+
+    /// 2 つの同値類を結合し、value と annotation を merge する。
+    pub fn union(&mut self, s1: ScopeId, n1: &str, s2: ScopeId, n2: &str) {
+        let r1 = self.find_mut(s1, n1);
+        let r2 = self.find_mut(s2, n2);
+        if r1 == r2 {
+            return;
+        }
+        let info2 = self.info.remove(&r2).unwrap_or_default();
+        let entry = self.info.entry(r1.clone()).or_default();
+        // value: r1 を優先、無ければ r2 のを取る
+        if entry.value.is_none() {
+            entry.value = info2.value;
+        }
+        entry.annotation.absorb(&info2.annotation);
+        self.parent.insert(r2, r1);
     }
 }
 
@@ -47,9 +131,9 @@ pub fn resolve(term: &ScopedTerm, env: &ScopedEnv) -> ScopedTerm {
     resolve_inner(term, env, 0)
 }
 
-/// `base` が Var なら、副 env (VarAnnotations) から canonical な annotation を取り出して
-/// Term::Var フィールドに反映する。Term::Var が source of truth ではなく、`VarAnnotations`
-/// が同一論理変数の集約された annotation を保持しているため、resolve のたびにここで同期する。
+/// `base` が Var なら、ScopedEnv (Union-Find) から canonical な annotation を取り出して
+/// Term::Var フィールドに反映する。Term::Var が source of truth ではなく、UF env が
+/// 同一論理変数の集約された annotation を保持するため、resolve のたびにここで同期する。
 fn apply_canonical_annotation(base: ScopedTerm, env: &ScopedEnv) -> ScopedTerm {
     if let Term::Var {
         name,
@@ -60,7 +144,7 @@ fn apply_canonical_annotation(base: ScopedTerm, env: &ScopedEnv) -> ScopedTerm {
         span,
     } = base
     {
-        let canon = env.annotations.get_immutable(scope, &name);
+        let canon = env.get_annotation(scope, &name);
         Term::Var {
             default_value: default_value.or(canon.default_value),
             min: min.or(canon.min),
@@ -896,7 +980,7 @@ pub fn unify(
                 } = &t2
                     && n2 != "_"
                 {
-                    env.annotations.union(*scope, name, *s2, n2);
+                    env.union(*scope, name, *s2, n2);
                 }
                 env.insert(*scope, name.clone(), t2.clone());
             }
@@ -1265,26 +1349,22 @@ fn try_resolve_constraints(
 fn assign_scope_to_clause(
     clause: Clause,
     scope_id: ScopeId,
-    annotations: &mut VarAnnotations,
+    env: &mut ScopedEnv,
 ) -> Clause<ScopeId> {
     match clause {
-        Clause::Fact(term) => Clause::Fact(assign_scope_to_term(term, scope_id, annotations)),
+        Clause::Fact(term) => Clause::Fact(assign_scope_to_term(term, scope_id, env)),
         Clause::Rule { head, body } => Clause::Rule {
-            head: assign_scope_to_term(head, scope_id, annotations),
+            head: assign_scope_to_term(head, scope_id, env),
             body: body
                 .into_iter()
-                .map(|t| assign_scope_to_term(t, scope_id, annotations))
+                .map(|t| assign_scope_to_term(t, scope_id, env))
                 .collect(),
         },
         Clause::Use { path, expose, span } => Clause::Use { path, expose, span },
     }
 }
 
-fn assign_scope_to_term(
-    term: Term,
-    scope_id: ScopeId,
-    annotations: &mut VarAnnotations,
-) -> ScopedTerm {
+fn assign_scope_to_term(term: Term, scope_id: ScopeId, env: &mut ScopedEnv) -> ScopedTerm {
     match term {
         Term::Var {
             name,
@@ -1294,10 +1374,10 @@ fn assign_scope_to_term(
             span,
             ..
         } => {
-            // (scope, name) ごとの annotation を VarAnnotations に集約する。複数 instance が
-            // 同一論理変数なら順次 merge され、副 env が source of truth になる。
+            // (scope, name) ごとの annotation を env に集約する。複数 instance が
+            // 同一論理変数なら順次 merge され、UF env が source of truth になる。
             if default_value.is_some() || min.is_some() || max.is_some() || span.is_some() {
-                annotations.merge(
+                env.merge_annotation(
                     scope_id,
                     &name,
                     VarAnnotation {
@@ -1320,8 +1400,8 @@ fn assign_scope_to_term(
         Term::Number { value } => Term::Number { value },
         Term::InfixExpr { op, left, right } => Term::InfixExpr {
             op,
-            left: Box::new(assign_scope_to_term(*left, scope_id, annotations)),
-            right: Box::new(assign_scope_to_term(*right, scope_id, annotations)),
+            left: Box::new(assign_scope_to_term(*left, scope_id, env)),
+            right: Box::new(assign_scope_to_term(*right, scope_id, env)),
         },
         Term::Struct {
             functor,
@@ -1331,21 +1411,21 @@ fn assign_scope_to_term(
             functor,
             args: args
                 .into_iter()
-                .map(|a| assign_scope_to_term(a, scope_id, annotations))
+                .map(|a| assign_scope_to_term(a, scope_id, env))
                 .collect(),
             span,
         },
         Term::List { items, tail } => Term::List {
             items: items
                 .into_iter()
-                .map(|i| assign_scope_to_term(i, scope_id, annotations))
+                .map(|i| assign_scope_to_term(i, scope_id, env))
                 .collect(),
-            tail: tail.map(|t| Box::new(assign_scope_to_term(*t, scope_id, annotations))),
+            tail: tail.map(|t| Box::new(assign_scope_to_term(*t, scope_id, env))),
         },
         Term::StringLit { value } => Term::StringLit { value },
         Term::Constraint { left, right } => Term::Constraint {
-            left: Box::new(assign_scope_to_term(*left, scope_id, annotations)),
-            right: Box::new(assign_scope_to_term(*right, scope_id, annotations)),
+            left: Box::new(assign_scope_to_term(*left, scope_id, env)),
+            right: Box::new(assign_scope_to_term(*right, scope_id, env)),
         },
     }
 }
@@ -1362,7 +1442,7 @@ fn try_rewrite_single_with_result(
     for clause in db.iter() {
         *clause_counter += 1;
         let scoped =
-            assign_scope_to_clause(clause.clone(), *clause_counter, &mut shared_env.annotations);
+            assign_scope_to_clause(clause.clone(), *clause_counter, shared_env);
         let (head, body) = match scoped {
             Clause::Fact(t) => (t, vec![]),
             Clause::Rule { head, body } => (head, body),
@@ -1707,7 +1787,7 @@ pub fn execute(
 
     let scoped_query: Vec<ScopedTerm> = query
         .into_iter()
-        .map(|t| assign_scope_to_term(t, 0, &mut shared_env.annotations))
+        .map(|t| assign_scope_to_term(t, 0, &mut shared_env))
         .collect();
 
     for term in scoped_query {
@@ -1751,8 +1831,8 @@ mod tests {
 
     /// テスト用: unscoped Term → scope 0 の ScopedTerm に変換
     fn scoped(term: Term) -> ScopedTerm {
-        let mut anns = VarAnnotations::new();
-        assign_scope_to_term(term, 0, &mut anns)
+        let mut env = ScopedEnv::new();
+        assign_scope_to_term(term, 0, &mut env)
     }
 
     fn run_success(db_src: &str, query_src: &str) -> Vec<String> {

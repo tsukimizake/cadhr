@@ -137,7 +137,7 @@ pub type ScopeId = usize;
 pub type ScopedTerm = Term<ScopeId>;
 
 /// Var に紐づく注釈 (default / min / max / source span)。同じ論理変数の全 Term::Var インスタンスは
-/// `VarAnnotations` に正規化された 1 つの値を共有する。
+/// `ScopedEnv` の Union-Find で正規化された 1 つの値を共有する。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VarAnnotation {
     pub default_value: Option<crate::rational::Rational>,
@@ -165,86 +165,6 @@ impl VarAnnotation {
 
     pub fn has_any(&self) -> bool {
         self.default_value.is_some() || self.min.is_some() || self.max.is_some()
-    }
-}
-
-/// 同論理変数 (= (ScopeId, name) で識別) の annotation を Union-Find で集約する。
-/// unify 時に `union(s1, n1, s2, n2)` で 2 つの annotation を merge し、以降どちらの key から
-/// lookup しても merged 形が得られる。
-#[derive(Clone, Debug, Default)]
-pub struct VarAnnotations {
-    parent: std::collections::HashMap<(ScopeId, String), (ScopeId, String)>,
-    /// canonical id のみに annotation を保存。非 canonical id からの lookup は find() 経由。
-    annotation: std::collections::HashMap<(ScopeId, String), VarAnnotation>,
-}
-
-impl VarAnnotations {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// (scope, name) の representative key を返す。path compression する。
-    fn find(&mut self, scope: ScopeId, name: &str) -> (ScopeId, String) {
-        let mut current = (scope, name.to_string());
-        // 経路を辿りながら path compression のための一時保持。
-        let mut path = Vec::new();
-        while let Some(p) = self.parent.get(&current) {
-            if p == &current {
-                break;
-            }
-            path.push(current.clone());
-            current = p.clone();
-        }
-        // path 全てを root に直結。
-        for k in path {
-            self.parent.insert(k, current.clone());
-        }
-        current
-    }
-
-    /// path compression なしで representative を取得する。`&self` で動くため resolve 等の
-    /// 不変な呼び出し側で使う。
-    fn find_immutable(&self, scope: ScopeId, name: &str) -> (ScopeId, String) {
-        let mut current = (scope, name.to_string());
-        while let Some(p) = self.parent.get(&current) {
-            if p == &current {
-                break;
-            }
-            current = p.clone();
-        }
-        current
-    }
-
-    /// canonical 経由で annotation を読み取る。未登録ならデフォルト値を返す。
-    pub fn get(&mut self, scope: ScopeId, name: &str) -> VarAnnotation {
-        let root = self.find(scope, name);
-        self.annotation.get(&root).cloned().unwrap_or_default()
-    }
-
-    /// path compression なしで annotation を読み取る。
-    pub fn get_immutable(&self, scope: ScopeId, name: &str) -> VarAnnotation {
-        let root = self.find_immutable(scope, name);
-        self.annotation.get(&root).cloned().unwrap_or_default()
-    }
-
-    /// (scope, name) の annotation に `value` を merge (self 優先)。
-    pub fn merge(&mut self, scope: ScopeId, name: &str, value: VarAnnotation) {
-        let root = self.find(scope, name);
-        let entry = self.annotation.entry(root).or_default();
-        entry.absorb(&value);
-    }
-
-    /// 2 つの logical variable を結合し、annotation を merge する。
-    pub fn union(&mut self, s1: ScopeId, n1: &str, s2: ScopeId, n2: &str) {
-        let r1 = self.find(s1, n1);
-        let r2 = self.find(s2, n2);
-        if r1 == r2 {
-            return;
-        }
-        let a2 = self.annotation.remove(&r2).unwrap_or_default();
-        let entry = self.annotation.entry(r1.clone()).or_default();
-        entry.absorb(&a2);
-        self.parent.insert(r2, r1);
     }
 }
 
