@@ -346,7 +346,7 @@ fn resolve_use(
 
     let mut result = Vec::new();
     for clause in inner_clauses {
-        let prefixed = prefix_clause(&clause, &module_name);
+        let prefixed = prefix_clause(&clause, &module_name, &resolver.record_decls);
         result.push(prefixed);
 
         if let Some(functor) = clause_head_functor(&clause) {
@@ -374,12 +374,19 @@ fn term_functor(term: &Term) -> Option<String> {
     }
 }
 
-fn prefix_clause(clause: &Clause, module_name: &str) -> Clause {
+fn prefix_clause(
+    clause: &Clause,
+    module_name: &str,
+    record_decls: &HashMap<String, RecordDecl>,
+) -> Clause {
     match clause {
-        Clause::Fact(term) => Clause::Fact(prefix_term(term, module_name)),
+        Clause::Fact(term) => Clause::Fact(prefix_term(term, module_name, record_decls)),
         Clause::Rule { head, body } => Clause::Rule {
-            head: prefix_term(head, module_name),
-            body: body.iter().map(|t| prefix_term(t, module_name)).collect(),
+            head: prefix_term(head, module_name, record_decls),
+            body: body
+                .iter()
+                .map(|t| prefix_term(t, module_name, record_decls))
+                .collect(),
         },
         // RecordDecl はグローバル decl テーブルに乗るので prefix しない。
         // Use directive はクライアントが直接使うことがないのでそのまま。
@@ -387,36 +394,70 @@ fn prefix_clause(clause: &Clause, module_name: &str) -> Clause {
     }
 }
 
-fn prefix_term(term: &Term, module_name: &str) -> Term {
+/// functor が record decl から派生した名前 (make_NAME / NAME_FIELD / set_FIELD_of_NAME)
+/// であれば true。これらは expose 設定によらずグローバルに見えるべきなので prefix しない。
+fn is_record_derived_functor(functor: &str, record_decls: &HashMap<String, RecordDecl>) -> bool {
+    if let Some(name) = functor.strip_prefix("make_") {
+        if record_decls.contains_key(name) {
+            return true;
+        }
+    }
+    for (name, decl) in record_decls {
+        for field in &decl.fields {
+            if functor == &format!("{}_{}", name, field.name)
+                || functor == &format!("set_{}_of_{}", field.name, name)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn prefix_term(
+    term: &Term,
+    module_name: &str,
+    record_decls: &HashMap<String, RecordDecl>,
+) -> Term {
     match term {
         Term::Struct {
             functor,
             args,
             span,
         } => {
-            let prefixed_functor = if is_builtin_functor(functor) {
+            let prefixed_functor = if is_builtin_functor(functor)
+                || is_record_derived_functor(functor, record_decls)
+            {
                 functor.clone()
             } else {
                 format!("{}::{}", module_name, functor)
             };
             Term::Struct {
                 functor: prefixed_functor,
-                args: args.iter().map(|a| prefix_term(a, module_name)).collect(),
+                args: args
+                    .iter()
+                    .map(|a| prefix_term(a, module_name, record_decls))
+                    .collect(),
                 span: *span,
             }
         }
         Term::List { items, tail } => Term::List {
-            items: items.iter().map(|i| prefix_term(i, module_name)).collect(),
-            tail: tail.as_ref().map(|t| Box::new(prefix_term(t, module_name))),
+            items: items
+                .iter()
+                .map(|i| prefix_term(i, module_name, record_decls))
+                .collect(),
+            tail: tail
+                .as_ref()
+                .map(|t| Box::new(prefix_term(t, module_name, record_decls))),
         },
         Term::InfixExpr { op, left, right } => Term::InfixExpr {
             op: *op,
-            left: Box::new(prefix_term(left, module_name)),
-            right: Box::new(prefix_term(right, module_name)),
+            left: Box::new(prefix_term(left, module_name, record_decls)),
+            right: Box::new(prefix_term(right, module_name, record_decls)),
         },
         Term::Eq { left, right } => Term::Eq {
-            left: Box::new(prefix_term(left, module_name)),
-            right: Box::new(prefix_term(right, module_name)),
+            left: Box::new(prefix_term(left, module_name, record_decls)),
+            right: Box::new(prefix_term(right, module_name, record_decls)),
         },
         _ => term.clone(),
     }
@@ -622,6 +663,35 @@ mod tests {
         )
         .expect("diamond record decl should be idempotent");
         assert!(resolver.record_decls.contains_key("output"));
+    }
+
+    /// std 経由で record を `#use` し、make_NAME/getter/setter が
+    /// 名前空間 prefix なしで利用できることを確認する。
+    #[test]
+    fn test_record_predicates_callable_from_use_module() {
+        use crate::term_rewrite::execute;
+        use crate::parse::{database, query};
+        let dir = tempfile::tempdir().unwrap();
+        let std_path = dir.path().join("std/db.cadhr");
+        fs::create_dir_all(std_path.parent().unwrap()).unwrap();
+        fs::write(&std_path, ":- record point(x=0, y=0).\n").unwrap();
+
+        // user db: std を use し、make_point + point_x で値を取り出して assert する。
+        let user_src = "#use(\"std\").\n\
+                        test :- make_point([x(3), y(4)], R), point_x(R, X), assert_eq(X, 3).";
+        let user_clauses = database(user_src).expect("parse user db");
+        let mut resolver = ModuleResolver::new();
+        let mut registry = FileRegistry::new();
+        let mut db = resolve_modules(
+            user_clauses,
+            &[dir.path().to_path_buf()],
+            &mut resolver,
+            &mut registry,
+        )
+        .expect("resolve modules");
+
+        let q = query("test.").expect("parse query").1;
+        execute(&mut db, q).expect("test should succeed");
     }
 
     /// 同名 record を field 構造の異なる形で 2 つ定義するとエラー。
