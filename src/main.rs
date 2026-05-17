@@ -11,6 +11,8 @@ use iced::widget::{column, row, scrollable, text, text_editor, toggler};
 use iced::{Element, Fill, Subscription, Task};
 use std::path::PathBuf;
 
+const DEFAULT_EDITOR_TEXT: &str = "main :- sketch(p(0,0), [line_to(p(X_OUT@30,0)), line_to(p(X_OUT,Y_OUT@20)), line_to(p(0,Y_OUT))]) |> rotateToXY |> linear_extrude(10).";
+
 // rfd ダイアログ呼び出しはiced管理下ではないのでSimulateできない。
 // テストでは固定パスを返す実装に差し替える。
 trait DialogHandler {
@@ -136,7 +138,7 @@ fn init() -> (Model, Task<Msg>) {
 
     (
         Model {
-            editor: text_editor::Content::with_text("main :- cube(10, 20, 30)."),
+            editor: text_editor::Content::with_text(DEFAULT_EDITOR_TEXT),
             previews: vec![],
             next_preview_id: 0,
             current_file_path: None,
@@ -271,7 +273,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
 
         // File I/O
         Msg::NewSession => {
-            model.editor = text_editor::Content::with_text("main :- cube(10, 20, 30).");
+            model.editor = text_editor::Content::with_text(DEFAULT_EDITOR_TEXT);
             model.previews.clear();
             model.next_preview_id = 0;
             model.current_file_path = None;
@@ -496,9 +498,7 @@ mod tests {
 
     fn fresh_model() -> Model {
         Model {
-            editor: text_editor::Content::with_text(
-                "main :- path(p(0,0), [line_to(p(X_OUT@30,0)), line_to(p(X_OUT,Y_OUT@20)), line_to(p(0,Y_OUT))]) |> rotateToXY |> linear_extrude(10).",
-            ),
+            editor: text_editor::Content::with_text(DEFAULT_EDITOR_TEXT),
             previews: vec![],
             next_preview_id: 0,
             current_file_path: None,
