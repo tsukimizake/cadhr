@@ -1263,11 +1263,17 @@ impl PlacedSketch {
     fn to_polygon_rings(&self) -> Option<Vec<Vec<f64>>> {
         let rings = self.profile.to_polygon_rings()?;
         // XZ平面はRx(-90°)で+Y方向に押し出すため、ローカルY座標を反転して回転後の+Y方向に合わせる。
+        // Y反転は多角形の符号付き面積を反転させCW化するので、Manifold::extrudeに渡す前にensure_ccwで戻す。
         if self.plane == Plane3D::XZ {
             Some(
                 rings
                     .into_iter()
-                    .map(|ring| ring.chunks_exact(2).flat_map(|c| [c[0], -c[1]]).collect())
+                    .map(|ring| {
+                        let mut pairs: Vec<(f64, f64)> =
+                            ring.chunks_exact(2).map(|c| (c[0], -c[1])).collect();
+                        ensure_ccw(&mut pairs);
+                        pairs_to_flat(&pairs)
+                    })
                     .collect(),
             )
         } else {
@@ -3375,6 +3381,74 @@ mod tests {
         assert_close!(x_extent, 10.0);
         assert_close!(y_extent, 2.0);
         assert_close!(z_extent, 10.0);
+    }
+
+    /// メッシュの符号付き体積を計算する。法線が外向きなら正、反転していたら負になる。
+    /// 三角形の v0·(v1×v2) を全三角形にわたり総和し、6で割る。
+    fn signed_mesh_volume(node: &EvaluatedNode) -> f64 {
+        // mesh_verts は num_props (=xyz+normal の 6) ごとに区切られたflatなf32配列。
+        // xyzは先頭3要素。num_props は EvaluatedNode に保存されていないので、
+        // mesh_verts.len() / vertex_count から推定する。
+        let vertex_count = node
+            .mesh_indices
+            .iter()
+            .max()
+            .map(|m| (*m as usize) + 1)
+            .unwrap_or(0);
+        assert!(vertex_count > 0, "empty mesh");
+        let stride = node.mesh_verts.len() / vertex_count;
+        assert!(
+            stride >= 3,
+            "expected at least xyz per vertex, got stride={stride}"
+        );
+        let pos = |idx: u32| {
+            let base = (idx as usize) * stride;
+            [
+                node.mesh_verts[base] as f64,
+                node.mesh_verts[base + 1] as f64,
+                node.mesh_verts[base + 2] as f64,
+            ]
+        };
+        let mut volume = 0.0;
+        for tri in node.mesh_indices.chunks_exact(3) {
+            let v0 = pos(tri[0]);
+            let v1 = pos(tri[1]);
+            let v2 = pos(tri[2]);
+            let cross = [
+                v1[1] * v2[2] - v1[2] * v2[1],
+                v1[2] * v2[0] - v1[0] * v2[2],
+                v1[0] * v2[1] - v1[1] * v2[0],
+            ];
+            volume += v0[0] * cross[0] + v0[1] * cross[1] + v0[2] * cross[2];
+        }
+        volume / 6.0
+    }
+
+    #[test]
+    fn test_rotate_to_xz_path_orientation() {
+        // path で矩形を作って rotateToXZ |> linear_extrude したとき、
+        // メッシュの法線が外向き (= 符号付き体積が正) であることを検証する。
+        // Y反転後にensure_ccwを呼ばないと面が裏返り、符号付き体積が負になる。
+        let exprs = run_main(
+            "main :- path(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToXZ |> linear_extrude(2).",
+        )
+        .unwrap();
+        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
+        let volume = signed_mesh_volume(&node);
+        // 10 * 10 * 2 = 200 が期待値。反転していると -200 になる。
+        assert_close!(volume, 200.0);
+    }
+
+    #[test]
+    fn test_rotate_to_xz_sketch_orientation() {
+        // sketch 版でも同様に法線が外向きであること (回帰防止)。
+        let exprs = run_main(
+            "main :- sketch([p(0,0), p(10,0), p(10,10), p(0,10)]) |> rotateToXZ |> linear_extrude(2).",
+        )
+        .unwrap();
+        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
+        let volume = signed_mesh_volume(&node);
+        assert_close!(volume, 200.0);
     }
 
     #[test]
