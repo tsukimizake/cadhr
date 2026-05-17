@@ -11,7 +11,7 @@ use iced::widget::{column, row, scrollable, text, text_editor, toggler};
 use iced::{Element, Fill, Subscription, Task};
 use std::path::PathBuf;
 
-const DEFAULT_EDITOR_TEXT: &str = "main :- sketch(p(0,0), [line_to(p(X_OUT@30,0)), line_to(p(X_OUT,Y_OUT@20)), line_to(p(0,Y_OUT))]) |> rotateToXY |> linear_extrude(10).";
+const DEFAULT_EDITOR_TEXT: &str = "#use(\"std\", expose([output])).\n\nmain(OUT) :-\n    SHAPE = sketch(p(0,0), [line_to(p(X_OUT@30,0)), line_to(p(X_OUT,Y_OUT@20)), line_to(p(0,Y_OUT))]) |> rotateToXY |> linear_extrude(10),\n    make_output([models([SHAPE])], OUT).";
 
 // rfd ダイアログ呼び出しはiced管理下ではないのでSimulateできない。
 // テストでは固定パスを返す実装に差し替える。

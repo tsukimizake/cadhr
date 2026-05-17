@@ -5,8 +5,8 @@ use cadhr_lang::manifold_bridge::{
 };
 use cadhr_lang::module::{ModuleResolver, resolve_modules};
 use cadhr_lang::parse::{
-    FileRegistry, QueryParam, SrcSpan, collect_query_params, database, parse_error_span,
-    query as parse_query, substitute_query_params,
+    FileRegistry, QueryParam, ScopedTerm, SrcSpan, Term, collect_query_params, database,
+    parse_error_span, query as parse_query, substitute_query_params,
 };
 use cadhr_lang::term_processor::TermProcessor;
 use cadhr_lang::term_rewrite::CadhrError;
@@ -17,6 +17,51 @@ use crate::preview::pipeline::Vertex;
 use manifold_rs::Mesh as RsMesh;
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// `main(...)` の出力引数を平坦化して flat な `Vec<Term>` にする。
+/// 引数が `output(Models, Bom, Controls)` レコード形式ならフィールドを順に展開、
+/// その他は単一項として 1 要素のベクタにする。リスト (`[a, b, c]` および
+/// cons-cell `[a | [b | [c]]]`) は再帰的に平坦化する。
+/// 結果は extract_control_points / BomExtractor / MeshGenerator が受け取る
+/// flat な項列。
+fn unpack_main_output(resolved: &[ScopedTerm]) -> Vec<ScopedTerm> {
+    fn flatten_into(term: ScopedTerm, out: &mut Vec<ScopedTerm>) {
+        match term {
+            Term::List { items, tail } => {
+                for it in items {
+                    flatten_into(it, out);
+                }
+                if let Some(t) = tail {
+                    flatten_into(*t, out);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let mut out = Vec::new();
+    for t in resolved {
+        if let Term::Struct { functor, args, .. } = t
+            && functor == "main"
+        {
+            for arg in args {
+                match arg {
+                    Term::Struct {
+                        functor: rec_func,
+                        args: rec_args,
+                        ..
+                    } if rec_func == "output" => {
+                        for field in rec_args {
+                            flatten_into(field.clone(), &mut out);
+                        }
+                    }
+                    other => flatten_into(other.clone(), &mut out),
+                }
+            }
+            return out;
+        }
+    }
+    out
+}
 
 #[derive(Debug)]
 pub struct MeshJobParams {
@@ -196,10 +241,11 @@ pub fn run_mesh_job(params: MeshJobParams) -> MeshJobResult {
         }
 
         let substituted = substitute_query_params(&query_terms, &values);
-        let (mut resolved, _env) = execute(&mut db, substituted).map_err(|e| {
+        let (resolved_raw, _env) = execute(&mut db, substituted).map_err(|e| {
             format_error("Rewrite error", &e.to_string(), e.span(), &file_registry)
         })?;
 
+        let mut resolved = unpack_main_output(&resolved_raw);
         let control_points =
             extract_control_points(&mut resolved, &params.control_point_overrides);
         Ok((resolved, control_points, query_params))
@@ -306,10 +352,10 @@ pub fn run_collision_job(params: CollisionJobParams) -> CollisionJobResult {
             )
             .map_err(|e| (format!("Module error: {}", e), None))?;
 
-            let (resolved, _env) = execute(&mut db, query_terms).map_err(|e| {
+            let (resolved_raw, _env) = execute(&mut db, query_terms).map_err(|e| {
                 format_error("Rewrite error", &e.to_string(), e.span(), &file_registry)
             })?;
-            Ok(resolved)
+            Ok(unpack_main_output(&resolved_raw))
         })();
 
     let resolved = match resolve_result {

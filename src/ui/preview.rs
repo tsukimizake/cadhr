@@ -49,7 +49,7 @@ impl Preview {
         Self {
             id,
             kind: PreviewKind::Normal,
-            query: "main.".to_string(),
+            query: "main(OUT).".to_string(),
             scene: Scene::new(),
             control_points: vec![],
             control_point_overrides: Default::default(),
@@ -73,7 +73,7 @@ impl Preview {
                 part_count: 0,
                 collision_count: 0,
             },
-            query: "main.".to_string(),
+            query: "main(OUT).".to_string(),
             scene,
             control_points: vec![],
             control_point_overrides: Default::default(),
