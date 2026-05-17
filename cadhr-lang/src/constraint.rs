@@ -365,7 +365,7 @@ impl ArithExpr {
             Term::List { .. } => Err(ConversionError {
                 message: "cannot convert list to arithmetic expression".to_string(),
             }),
-            Term::Constraint { .. } => Err(ConversionError {
+            Term::Eq { .. } => Err(ConversionError {
                 message: "cannot convert constraint to arithmetic expression".to_string(),
             }),
             Term::StringLit { .. } => Err(ConversionError {

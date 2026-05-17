@@ -123,10 +123,12 @@ pub enum Term<Scope = ()> {
     StringLit {
         value: String,
     },
-    /// 遅延された等値ゴール: left = right を後で検証
-    /// 解決時に左右の resolved 形を見て、算術制約 (linear solver) か
-    /// 構造的単一化 (unify) かを判別する。
-    Constraint {
+    /// 等値ゴール `left = right` を表す AST ノード。パース時には常にこの形で生成され、
+    /// 実行時に `resolve_equality_goals` (term_rewrite.rs) が両辺を見て:
+    ///   - 両側が ArithExpr に変換可能 → 算術連立方程式として線形ソルバへ
+    ///   - それ以外 (Struct/List を含む) → unify() で構造的単一化
+    /// のいずれかにディスパッチする。Prolog の `=/2` 相当だが算術ソルバも兼ねる点が拡張。
+    Eq {
         left: Box<Term<Scope>>,
         right: Box<Term<Scope>>,
     },
@@ -196,7 +198,7 @@ pub fn first_span<S>(term: &Term<S>) -> Option<SrcSpan> {
             }
             None
         }
-        Term::InfixExpr { left, right, .. } | Term::Constraint { left, right } => {
+        Term::InfixExpr { left, right, .. } | Term::Eq { left, right } => {
             first_span(left).or_else(|| first_span(right))
         }
         Term::List { items, tail } => {
@@ -269,11 +271,11 @@ impl<Scope: PartialEq> PartialEq for Term<Scope> {
             ) => i1 == i2 && t1 == t2,
             (Term::StringLit { value: v1 }, Term::StringLit { value: v2 }) => v1 == v2,
             (
-                Term::Constraint {
+                Term::Eq {
                     left: l1,
                     right: r1,
                 },
-                Term::Constraint {
+                Term::Eq {
                     left: l2,
                     right: r2,
                 },
@@ -362,7 +364,7 @@ impl<Scope> fmt::Debug for Term<Scope> {
                 write!(f, "]")
             }
             Term::StringLit { value } => write!(f, "\"{}\"", value),
-            Term::Constraint { left, right } => {
+            Term::Eq { left, right } => {
                 write!(f, "constraint({:?} = {:?})", left, right)
             }
         }
@@ -918,12 +920,12 @@ pub(super) fn term(input: &str) -> PResult<'_, Term> {
     pipe_expr(input)
 }
 
-/// goal内の等値: `term = term` → Term::Constraint { left, right }
+/// goal内の等値: `term = term` → Term::Eq { left, right }
 ///
-/// パース時には常に `Term::Constraint` を生成する。実行時（`try_resolve_constraints`）に
+/// パース時には常に `Term::Eq` を生成する。実行時 (`resolve_equality_goals`) に
 /// 左右の resolved 形を見て、両側が ArithExpr に変換できれば算術制約として、
-/// 変換不能な Struct/List が含まれれば構造的単一化（unify）として処理する。
-/// `X = Y` の Var 同士は parse 時には判別不能（後で Struct に束縛される可能性がある）
+/// 変換不能な Struct/List が含まれれば構造的単一化 (unify) として処理する。
+/// `X = Y` の Var 同士は parse 時には判別不能 (後で Struct に束縛される可能性がある)
 /// なので、判別を実行時まで遅延する。
 fn eq_goal(input: &str) -> PResult<'_, Term> {
     let (input, left) = term(input)?;
@@ -931,7 +933,7 @@ fn eq_goal(input: &str) -> PResult<'_, Term> {
     match rhs {
         Some(right) => Ok((
             input,
-            Term::Constraint {
+            Term::Eq {
                 left: Box::new(left),
                 right: Box::new(right),
             },
@@ -1072,7 +1074,7 @@ fn fix_spans_in_term(term: &mut Term, base: usize) {
             fix_spans_in_term(left, base);
             fix_spans_in_term(right, base);
         }
-        Term::Constraint { left, right } => {
+        Term::Eq { left, right } => {
             fix_spans_in_term(left, base);
             fix_spans_in_term(right, base);
         }

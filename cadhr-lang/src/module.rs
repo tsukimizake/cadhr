@@ -212,7 +212,7 @@ fn prefix_term(term: &Term, module_name: &str) -> Term {
             left: Box::new(prefix_term(left, module_name)),
             right: Box::new(prefix_term(right, module_name)),
         },
-        Term::Constraint { left, right } => Term::Constraint {
+        Term::Eq { left, right } => Term::Eq {
             left: Box::new(prefix_term(left, module_name)),
             right: Box::new(prefix_term(right, module_name)),
         },
@@ -264,7 +264,7 @@ fn set_file_id_in_term(term: &mut Term, file_id: u16) {
                 set_file_id_in_term(t, file_id);
             }
         }
-        Term::Constraint { left, right } => {
+        Term::Eq { left, right } => {
             set_file_id_in_term(left, file_id);
             set_file_id_in_term(right, file_id);
         }

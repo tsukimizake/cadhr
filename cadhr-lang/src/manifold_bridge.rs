@@ -829,7 +829,7 @@ impl<'a, S> Args<'a, S> {
             | Term::Struct { .. }
             | Term::List { .. }
             | Term::StringLit { .. }
-            | Term::Constraint { .. } => Err(ConversionError::TypeMismatch {
+            | Term::Eq { .. } => Err(ConversionError::TypeMismatch {
                 functor: self.functor.to_string(),
                 arg_index: i,
                 expected: "number",
@@ -1523,7 +1523,7 @@ impl Model3D {
             Term::Struct { functor, args, .. } => Self::from_struct(functor, args),
             Term::InfixExpr { op, left, right } => Self::from_infix_expr(*op, left, right),
             Term::Var { name, .. } => Err(ConversionError::UnboundVariable(name.clone())),
-            Term::Constraint { .. } => Err(ConversionError::UnknownPrimitive(
+            Term::Eq { .. } => Err(ConversionError::UnknownPrimitive(
                 "constraint should not reach mesh generation".to_string(),
             )),
             _ => Err(ConversionError::UnknownPrimitive(format!("{:?}", term))),

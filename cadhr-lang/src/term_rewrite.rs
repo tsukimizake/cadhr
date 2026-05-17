@@ -266,7 +266,7 @@ fn resolve_inner(term: &ScopedTerm, env: &ScopedEnv, depth: usize) -> ScopedTerm
                 .as_ref()
                 .map(|t| Box::new(resolve_inner(t, env, depth + 1))),
         },
-        Term::Constraint { left, right } => Term::Constraint {
+        Term::Eq { left, right } => Term::Eq {
             left: Box::new(resolve_inner(left, env, depth + 1)),
             right: Box::new(resolve_inner(right, env, depth + 1)),
         },
@@ -274,7 +274,7 @@ fn resolve_inner(term: &ScopedTerm, env: &ScopedEnv, depth: usize) -> ScopedTerm
     }
 }
 
-/// Constraint内のVarから name→scope のマッピングを収集する
+/// Eq ゴール内の Var から name→scope のマッピングを収集する
 fn collect_var_scopes_from_term(term: &ScopedTerm, scopes: &mut HashMap<String, ScopeId>) {
     match term {
         Term::Var { name, scope, .. } if name != "_" => {
@@ -284,7 +284,7 @@ fn collect_var_scopes_from_term(term: &ScopedTerm, scopes: &mut HashMap<String, 
             collect_var_scopes_from_term(left, scopes);
             collect_var_scopes_from_term(right, scopes);
         }
-        Term::Constraint { left, right } => {
+        Term::Eq { left, right } => {
             collect_var_scopes_from_term(left, scopes);
             collect_var_scopes_from_term(right, scopes);
         }
@@ -419,7 +419,7 @@ fn collect_default_var_bindings(
             collect_default_var_bindings(left, bindings);
             collect_default_var_bindings(right, bindings);
         }
-        Term::Constraint { left, right } => {
+        Term::Eq { left, right } => {
             collect_default_var_bindings(left, bindings);
             collect_default_var_bindings(right, bindings);
         }
@@ -483,7 +483,7 @@ fn try_fold_number_literals<S>(term: &Term<S>) -> Option<crate::rational::Ration
         | Term::Struct { .. }
         | Term::List { .. }
         | Term::StringLit { .. }
-        | Term::Constraint { .. } => None,
+        | Term::Eq { .. } => None,
     }
 }
 
@@ -516,7 +516,7 @@ pub fn try_eval_to_number<S>(term: &Term<S>) -> Option<crate::rational::Rational
         | Term::Struct { .. }
         | Term::List { .. }
         | Term::StringLit { .. }
-        | Term::Constraint { .. } => None,
+        | Term::Eq { .. } => None,
     }
 }
 
@@ -543,7 +543,7 @@ pub fn fold_number_literals_in_place<S>(term: &mut Term<S>) {
                     fold_number_literals_in_place(t.as_mut());
                 }
             }
-            Term::Constraint { left, right } => {
+            Term::Eq { left, right } => {
                 fold_number_literals_in_place(left.as_mut());
                 fold_number_literals_in_place(right.as_mut());
             }
@@ -571,7 +571,7 @@ fn occurs_check_scoped(var_name: &str, var_scope: ScopeId, term: &ScopedTerm) ->
             occurs_check_scoped(var_name, var_scope, left)
                 || occurs_check_scoped(var_name, var_scope, right)
         }
-        Term::Constraint { left, right } => {
+        Term::Eq { left, right } => {
             occurs_check_scoped(var_name, var_scope, left)
                 || occurs_check_scoped(var_name, var_scope, right)
         }
@@ -776,7 +776,7 @@ fn collect_ranges_from_body_term(
             collect_ranges_from_body_term(left, ranges);
             collect_ranges_from_body_term(right, ranges);
         }
-        Term::Constraint { left, right } => {
+        Term::Eq { left, right } => {
             collect_ranges_from_body_term(left, ranges);
             collect_ranges_from_body_term(right, ranges);
         }
@@ -1170,7 +1170,7 @@ pub fn unify(
             }
             _ => {
                 if is_potentially_arithmetic(&t1) && is_potentially_arithmetic(&t2) {
-                    constraints.push(Term::Constraint {
+                    constraints.push(Term::Eq {
                         left: Box::new(t1),
                         right: Box::new(t2),
                     });
@@ -1195,33 +1195,30 @@ fn apply_env_in_place(goals: &mut [ScopedTerm], shared_env: &ScopedEnv) {
     }
 }
 
-/// body と other_goals 双方から Constraint を抜き出してまとめて処理する。
-/// 各 Constraint は左右の resolved 形を見て：
-///   - 両側が ArithExpr に変換できる → 線形ソルバへ
-///   - 変換不能 (Struct/List 含む)   → unify()
-/// 解けた束縛は shared_env に反映、残った未解決 Constraint は other_goals 末尾に戻す。
-fn split_and_resolve_constraints(
+/// body と other_goals 双方から Eq ゴールを抜き出してまとめて `resolve_equality_goals` に渡す。
+/// 解けた束縛は shared_env に反映、残った未解決 Eq は other_goals 末尾に戻す。
+fn split_and_resolve_eq_goals(
     remaining_body: &mut Vec<ScopedTerm>,
     other_goals: &mut Vec<ScopedTerm>,
     shared_env: &mut ScopedEnv,
 ) -> Result<(), RewriteError> {
-    let (body_constraints, body_rest): (Vec<_>, Vec<_>) = std::mem::take(remaining_body)
+    let (body_eqs, body_rest): (Vec<_>, Vec<_>) = std::mem::take(remaining_body)
         .into_iter()
-        .partition(|t| matches!(t, Term::Constraint { .. }));
-    let (og_constraints, og_rest): (Vec<_>, Vec<_>) = std::mem::take(other_goals)
+        .partition(|t| matches!(t, Term::Eq { .. }));
+    let (og_eqs, og_rest): (Vec<_>, Vec<_>) = std::mem::take(other_goals)
         .into_iter()
-        .partition(|t| matches!(t, Term::Constraint { .. }));
+        .partition(|t| matches!(t, Term::Eq { .. }));
     *remaining_body = body_rest;
     *other_goals = og_rest;
-    let mut constraints = body_constraints;
-    constraints.extend(og_constraints);
-    if constraints.is_empty() {
+    let mut eqs = body_eqs;
+    eqs.extend(og_eqs);
+    if eqs.is_empty() {
         return Ok(());
     }
     // 既存の shared_env 束縛を反映してから solver/unify に渡す
-    apply_env_in_place(&mut constraints, shared_env);
-    try_resolve_constraints(&mut constraints, shared_env)?;
-    other_goals.extend(constraints);
+    apply_env_in_place(&mut eqs, shared_env);
+    resolve_equality_goals(&mut eqs, shared_env)?;
+    other_goals.extend(eqs);
     Ok(())
 }
 
@@ -1269,26 +1266,36 @@ fn handle_assert_eq(
     }
 }
 
-/// goals 内の Constraint を評価し、解けたものは除去、解けないものは残す。
+/// goals 内の `Term::Eq` (`=` ゴール) を評価し、解けたものは除去、解けないものは残す。
 ///
-/// 各 Constraint について、左右が ArithExpr に変換できるかを実行時に判定する：
-///   - 両側変換可能       → 算術連立方程式の一部として線形ソルバに渡す
-///   - 変換不能（Struct/List 含む） → unify() で構造的単一化を試みる
-/// 解けた束縛は shared_env にも反映され、以降のサブゴール展開で利用可能になる。
-fn try_resolve_constraints(
+/// 各 Eq について、左右が `ArithExpr` に変換できるかを実行時に判定し:
+///   - 両側変換可能              → `solve_arithmetic_equations` で連立方程式として線形ソルバへ
+///   - 変換不能 (Struct/List 含む) → `resolve_structural_unifications` で `unify()` を試みる
+/// 解けた束縛は `shared_env` に反映され、以降のサブゴール展開で利用可能になる。
+///
+/// 構造的 unify を先に処理する: Var → Struct の束縛が後段の算術判定に必要なため。
+fn resolve_equality_goals(
     goals: &mut Vec<ScopedTerm>,
     shared_env: &mut ScopedEnv,
 ) -> Result<(), RewriteError> {
-    // ディスパッチ判定（ArithExpr 変換可能か）が Var の最新束縛を見落とさないよう、
+    // ディスパッチ判定 (ArithExpr 変換可能か) が Var の最新束縛を見落とさないよう、
     // shared_env を反映してから判定する。Var → Struct 束縛があるとき、未解決 Var の
     // ままだと try_from_term が Ok を返してしまい誤って算術ソルバに渡されるため。
     apply_env_in_place(goals, shared_env);
+    resolve_structural_unifications(goals, shared_env)?;
+    solve_arithmetic_equations(goals, shared_env)?;
+    Ok(())
+}
 
-    // 1. unifyが必要な Constraint を先に処理する。
-    //    インデックスを後ろから処理することで goals.remove() のずれを防ぐ。
+/// Eq ゴールのうち少なくとも片側が ArithExpr に変換不能なもの (= 構造項を含むもの) を
+/// `unify()` で処理する。インデックスを後ろから走査することで `goals.remove()` のずれを防ぐ。
+fn resolve_structural_unifications(
+    goals: &mut Vec<ScopedTerm>,
+    shared_env: &mut ScopedEnv,
+) -> Result<(), RewriteError> {
     let mut unify_indices = Vec::new();
     for (i, goal) in goals.iter().enumerate() {
-        if let Term::Constraint { left, right } = goal {
+        if let Term::Eq { left, right } = goal {
             let left_arith = ArithExpr::try_from_term(left).is_ok();
             let right_arith = ArithExpr::try_from_term(right).is_ok();
             if !(left_arith && right_arith) {
@@ -1299,12 +1306,12 @@ fn try_resolve_constraints(
     for &idx in unify_indices.iter().rev() {
         let g = goals.remove(idx);
         let (left, right) = match g {
-            Term::Constraint { left, right } => (*left, *right),
+            Term::Eq { left, right } => (*left, *right),
             _ => unreachable!(),
         };
-        // unify は left/right を消費する。エラー時の goal 復元用に clone しておくが、
-        // 関数冒頭の apply_env_in_place で既に env 反映済みなので resolve は不要。
-        let original_goal = Term::Constraint {
+        // unify は left/right を消費する。エラー時の goal 復元用に clone しておく。
+        // 呼び出し元 resolve_equality_goals で既に env 反映済みなので resolve は不要。
+        let original_goal = Term::Eq {
             left: Box::new(left.clone()),
             right: Box::new(right.clone()),
         };
@@ -1319,12 +1326,19 @@ fn try_resolve_constraints(
             *g = resolve(g, shared_env);
         }
     }
+    Ok(())
+}
 
-    // 2. 残った Constraint（両側が ArithExpr に変換可能なもの）を線形ソルバに渡す。
+/// 残った Eq ゴール (両側が ArithExpr に変換可能なもの) を集めて線形ソルバに渡す。
+/// 解けた束縛は `shared_env` と goals の両方に反映される。
+fn solve_arithmetic_equations(
+    goals: &mut Vec<ScopedTerm>,
+    shared_env: &mut ScopedEnv,
+) -> Result<(), RewriteError> {
     let mut eqs = Vec::new();
     let mut constraint_indices = Vec::new();
     for (i, goal) in goals.iter().enumerate() {
-        if let Term::Constraint { left, right } = goal {
+        if let Term::Eq { left, right } = goal {
             let left_expr = ArithExpr::try_from_term(left);
             let right_expr = ArithExpr::try_from_term(right);
             if let (Ok(l), Ok(r)) = (left_expr, right_expr) {
@@ -1347,7 +1361,7 @@ fn try_resolve_constraints(
     })?;
 
     if !result.bindings.is_empty() || result.fully_resolved {
-        // Constraint内のVarからname→scopeマッピングを収集
+        // Eq 内の Var から name→scope マッピングを収集
         let mut var_scopes: HashMap<String, ScopeId> = HashMap::new();
         for &idx in &constraint_indices {
             collect_var_scopes_from_term(&goals[idx], &mut var_scopes);
@@ -1360,10 +1374,9 @@ fn try_resolve_constraints(
             let mut scoped_env = ScopedEnv::new();
             for (var_name, value) in &result.bindings {
                 if let Some(&scope) = var_scopes.get(var_name) {
-                    // Phase 3: Term::Number も Rational を持つので無損失で格納できる。
                     let term_value = number(value.clone());
                     scoped_env.insert(scope, var_name.clone(), term_value.clone());
-                    // shared_env にも反映: 制約は解消されて消えるので、束縛を共有 env に残さないと
+                    // 等式は解消されて消えるので、束縛を shared_env に残さないと
                     // 後続のサブゴール展開で同じ Var を解決できなくなる。
                     shared_env.insert(scope, var_name.clone(), term_value);
                 }
@@ -1454,7 +1467,7 @@ fn assign_scope_to_term(term: Term, scope_id: ScopeId, env: &mut ScopedEnv) -> S
             tail: tail.map(|t| Box::new(assign_scope_to_term(*t, scope_id, env))),
         },
         Term::StringLit { value } => Term::StringLit { value },
-        Term::Constraint { left, right } => Term::Constraint {
+        Term::Eq { left, right } => Term::Eq {
             left: Box::new(assign_scope_to_term(*left, scope_id, env)),
             right: Box::new(assign_scope_to_term(*right, scope_id, env)),
         },
@@ -1581,15 +1594,15 @@ fn rewrite_term_recursive(
             return Ok(vec![resolved_term]);
         } else {
             // Ruleにマッチ: bodyの各項を再帰的に解決。
-            // remaining_body は「未処理の非 Constraint body 項」、other_goals は「外側ゴール
-            // ＋未解決 Constraint」と役割を物理的に分離する。再帰呼び出しには other_goals
+            // remaining_body は「未処理の非 Eq body 項」、other_goals は「外側ゴール
+            // ＋未解決 Eq」と役割を物理的に分離する。再帰呼び出しには other_goals
             // だけを渡し、binding は shared_env 経由で伝播させる。
             let mut remaining_body: Vec<ScopedTerm> = body;
             let mut all_resolved = Vec::new();
 
-            // body と other_goals 双方から Constraint を集めて解き、束縛を shared_env に伝播。
-            // 残った未解決 Constraint は other_goals に戻す。
-            split_and_resolve_constraints(&mut remaining_body, other_goals, shared_env)?;
+            // body と other_goals 双方から Eq を集めて解き、束縛を shared_env に伝播。
+            // 残った未解決 Eq は other_goals に戻す。
+            split_and_resolve_eq_goals(&mut remaining_body, other_goals, shared_env)?;
             apply_env_in_place(&mut remaining_body, shared_env);
             apply_env_in_place(other_goals, shared_env);
 
@@ -1605,9 +1618,9 @@ fn rewrite_term_recursive(
                     rewrite_term_recursive(db, clause_counter, b, other_goals, shared_env)?;
                 all_resolved.extend(resolved);
 
-                // 再帰中に other_goals に新しい Constraint が追加されたり、shared_env が
-                // 更新された可能性があるので、再度 Constraint を解いて未処理 body にも反映する。
-                try_resolve_constraints(other_goals, shared_env)?;
+                // 再帰中に other_goals に新しい Eq が追加されたり、shared_env が
+                // 更新された可能性があるので、再度 Eq を解いて未処理 body にも反映する。
+                resolve_equality_goals(other_goals, shared_env)?;
                 apply_env_in_place(&mut remaining_body, shared_env);
             }
 
@@ -1834,11 +1847,11 @@ pub fn execute(
         results.extend(other_goals);
 
         // 各ゴールの rewrite 後に制約解決し、得られた束縛を後続に伝播
-        try_resolve_constraints(&mut results, &mut shared_env)?;
+        resolve_equality_goals(&mut results, &mut shared_env)?;
     }
 
-    // 解決済み Constraint を結果から除去
-    results.retain(|t| !matches!(t, Term::Constraint { .. }));
+    // 解決済み Eq ゴールを結果から除去
+    results.retain(|t| !matches!(t, Term::Eq { .. }));
 
     Ok((results, shared_env))
 }
@@ -2652,7 +2665,7 @@ wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(p(0, 0, 0), p(X, Y, H)).\n\
     }
 
     /// `=` の左右が parse 時には両方 Var でも、ランタイムで Struct に束縛されれば
-    /// 単一化として処理される。`try_resolve_constraints` での実行時ディスパッチの動作確認。
+    /// 単一化として処理される。`resolve_equality_goals` での実行時ディスパッチの動作確認。
     #[test]
     fn body_eq_var_to_var_unifies_when_struct_bound_at_runtime() {
         let mut db = database(
