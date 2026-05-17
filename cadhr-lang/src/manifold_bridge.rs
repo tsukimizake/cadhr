@@ -2789,14 +2789,9 @@ mod tests {
 
     #[test]
     fn test_control_shared_var_with_geometry() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db = database(
-            "main :- linear_extrude(rotateToXY(sketch(p(0, 0), [line_to(p(0, 40)), line_to(p(30, 0))])), X@10), control3d(p(X, 0, 0), \"width\")."
-        ).unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let mut resolved = execute_main_args(
+            "main(L) :- L = [linear_extrude(rotateToXY(sketch(p(0, 0), [line_to(p(0, 40)), line_to(p(30, 0))])), X@10), control3d(p(X, 0, 0), \"width\")].",
+        );
         let cps = extract_control_points(&mut resolved, &Default::default());
 
         assert_eq!(cps.len(), 1);
@@ -2811,16 +2806,10 @@ mod tests {
 
     #[test]
     fn test_control_shared_var_without_default() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
         // X=なし: controlのVar座標が0にフォールバックし、extrude側にも0が代入される
-        let mut db = database(
-            "main :- linear_extrude(rotateToXY(sketch(p(0, 0), [line_to(p(0, 40)), line_to(p(30, 0))])), X), control3d(p(X, -10, -10)).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let mut resolved = execute_main_args(
+            "main(L) :- L = [linear_extrude(rotateToXY(sketch(p(0, 0), [line_to(p(0, 40)), line_to(p(30, 0))])), X), control3d(p(X, -10, -10))].",
+        );
         let cps = extract_control_points(&mut resolved, &Default::default());
 
         assert_eq!(cps.len(), 1);
@@ -2834,15 +2823,9 @@ mod tests {
 
     #[test]
     fn test_control_shared_var_in_arith_expr() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db = database(
-            "main :- sketch(p(0,0), [line_to(p(0,40)), line_to(p(30,0))]) |> rotateToXY |> linear_extrude(X+1), control3d(p(X, -10, -10)).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let mut resolved = execute_main_args(
+            "main(L) :- L = [sketch(p(0,0), [line_to(p(0,40)), line_to(p(30,0))]) |> rotateToXY |> linear_extrude(X+1), control3d(p(X, -10, -10))].",
+        );
         let cps = extract_control_points(&mut resolved, &Default::default());
 
         assert_eq!(cps.len(), 1);
@@ -2855,21 +2838,17 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let src = "main :- sketch(p(0,0), [line_to(p(0,40)), line_to(p(30,0))]) |> rotateToXY |> linear_extrude(X+1), control3d(p(X, -10, -10)).";
-        let mut db = database(src).unwrap();
-        let (_, q) = parse_query("main.").unwrap();
+        let src = "main(L) :- L = [sketch(p(0,0), [line_to(p(0,40)), line_to(p(30,0))]) |> rotateToXY |> linear_extrude(X+1), control3d(p(X, -10, -10))].";
 
         // 初回: overridesなし
-        let (mut resolved, _) = execute(&mut db, q.clone()).unwrap();
+        let mut resolved = execute_main_args(src);
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
         assert_eq!(cps[0].var_names[0], Some("X".to_string()));
         assert_eq!(cps[0].x.value, 0.0); // Varフォールバック
 
         // 2回目: X=5.0でoverride → var_namesが保持されること
-        let mut db2 = database(src).unwrap();
-        let (_, q2) = parse_query("main.").unwrap();
-        let (mut resolved2, _) = execute(&mut db2, q2).unwrap();
+        let mut resolved2 = execute_main_args(src);
         let overrides = std::collections::HashMap::from([("X".to_string(), 5.0)]);
         let cps2 = extract_control_points(&mut resolved2, &overrides);
         assert_eq!(cps2.len(), 1);
@@ -2964,15 +2943,9 @@ mod tests {
     /// Var に伝搬し、range 注釈があれば axis_ranges に入る。
     #[test]
     fn test_control_2d_unify_bare_var_with_range() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db = database(
-            "main :- cube(1,1,1), control2d(-100<CENTER<100).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let mut resolved = execute_main_args(
+            "main(L) :- L = [cube(1,1,1), control2d(-100<CENTER<100)].",
+        );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
         // axis 名は `<bare>.<axis>#<scope>` 形式。スコープ ID 部分は内部実装に依存するので
@@ -2990,22 +2963,17 @@ mod tests {
     /// 同じ Var の bare 参照があっても range 情報が control2d 側で保持される。
     #[test]
     fn test_control_2d_unify_multi_reference_with_range() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db = database(
-            "main :- battery_box |> center3d(p(0,0,0)).
-             battery_box :-
-               (((sketch(p(0,0), [line_to(p(X@20,0)), line_to(p(X,Y@58)), line_to(p(0,Y))]) |> center2d(CENTER))
-                 - inner(CENTER)) |> rotateToYZ |> linear_extrude(20))
-                 + (inner(CENTER) |> rotateToYZ |> linear_extrude(2)),
-               control2d(-100<CENTER<100).
-             inner(CENTER) :- sketch(p(0,0), [line_to(p(XIN@14.6,0)), line_to(p(XIN,INNERLEN@49.8)), line_to(p(0,INNERLEN))])
-                |> center2d(CENTER).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let mut resolved = execute_main_args(
+            "inner(CENTER, M) :- M = sketch(p(0,0), [line_to(p(XIN@14.6,0)), line_to(p(XIN,INNERLEN@49.8)), line_to(p(0,INNERLEN))])
+                |> center2d(CENTER).
+             battery_box(M, C) :-
+               inner(CENTER, INNER),
+               M = (((sketch(p(0,0), [line_to(p(X@20,0)), line_to(p(X,Y@58)), line_to(p(0,Y))]) |> center2d(CENTER))
+                     - INNER) |> rotateToYZ |> linear_extrude(20))
+                    + (INNER |> rotateToYZ |> linear_extrude(2)),
+               C = control2d(-100<CENTER<100).
+             main(L) :- battery_box(B, C), L = [B |> center3d(p(0,0,0)), C].",
+        );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
         assert_eq!(
@@ -3022,22 +2990,17 @@ mod tests {
     /// center2d の引数として値を取り出せる) ことを保証する。
     #[test]
     fn test_control_2d_unify_multi_reference_mesh_generation() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db = database(
-            "main :- battery_box |> center3d(p(0,0,0)).
-             battery_box :-
-               (((sketch(p(0,0), [line_to(p(X@20,0)), line_to(p(X,Y@58)), line_to(p(0,Y))]) |> center2d(CENTER))
-                 - inner(CENTER)) |> rotateToYZ |> linear_extrude(20))
-                 + (inner(CENTER) |> rotateToYZ |> linear_extrude(2)),
-               control2d(-100<CENTER<100).
-             inner(CENTER) :- sketch(p(0,0), [line_to(p(XIN@14.6,0)), line_to(p(XIN,INNERLEN@49.8)), line_to(p(0,INNERLEN))])
-                |> center2d(CENTER).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let mut resolved = execute_main_args(
+            "inner(CENTER, M) :- M = sketch(p(0,0), [line_to(p(XIN@14.6,0)), line_to(p(XIN,INNERLEN@49.8)), line_to(p(0,INNERLEN))])
+                |> center2d(CENTER).
+             battery_box(M, C) :-
+               inner(CENTER, INNER),
+               M = (((sketch(p(0,0), [line_to(p(X@20,0)), line_to(p(X,Y@58)), line_to(p(0,Y))]) |> center2d(CENTER))
+                     - INNER) |> rotateToYZ |> linear_extrude(20))
+                    + (INNER |> rotateToYZ |> linear_extrude(2)),
+               C = control2d(-100<CENTER<100).
+             main(L) :- battery_box(B, C), L = [B |> center3d(p(0,0,0)), C].",
+        );
         let _cps = extract_control_points(&mut resolved, &Default::default());
         let exprs: Vec<Model3D> = resolved
             .iter()
@@ -3059,18 +3022,11 @@ mod tests {
     /// 渡す。bar の POS は明示的に別の値で bind される。
     #[test]
     fn test_control_3d_bare_unify_does_not_cross_scopes() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db = database(
-            "main :- foo + bar.
-             foo :- cube(1, 1, 1), control3d(POS).
-             bar :- cube(2, 2, 2) |> translate(p(0,0,0), POS),
-               POS = p(5, 0, 0).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let mut resolved = execute_main_args(
+            "foo(M, C) :- M = cube(1, 1, 1), C = control3d(POS).
+             bar(M) :- M = cube(2, 2, 2) |> translate(p(0,0,0), POS), POS = p(5, 0, 0).
+             main(L) :- foo(M1, C), bar(M2), L = [M1 + M2, C].",
+        );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
         // foo の control3d は POS を p(POS.x#<scope>, POS.y#<scope>, POS.z#<scope>) に unify
@@ -3089,17 +3045,11 @@ mod tests {
     /// 巻き込まれたり range が混在したりしてはいけない。
     #[test]
     fn test_control_2d_distinct_scopes_with_same_name() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db = database(
-            "main :- foo + bar.
-             foo :- cube(1, 1, 1), control2d(-100<CENTER<100).
-             bar :- cube(2, 2, 2), control2d(0<CENTER<50).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let mut resolved = execute_main_args(
+            "foo(M, C) :- M = cube(1, 1, 1), C = control2d(-100<CENTER<100).
+             bar(M, C) :- M = cube(2, 2, 2), C = control2d(0<CENTER<50).
+             main(L) :- foo(M1, C1), bar(M2, C2), L = [M1 + M2, C1, C2].",
+        );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 2, "両方の control2d がそれぞれ独立に抽出されるべき");
 
@@ -3131,13 +3081,9 @@ mod tests {
     /// 明示形 `p(0<X<100, 50<Y<150)` で軸ごとに異なる range が axis_ranges に入る。
     #[test]
     fn test_control_2d_named_per_axis_ranges() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db =
-            database("main :- cube(1,1,1), control2d(p(0<X<100, 50<Y<150)).").unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let mut resolved = execute_main_args(
+            "main(L) :- L = [cube(1,1,1), control2d(p(0<X<100, 50<Y<150))].",
+        );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
         // 各軸の midpoint
@@ -3152,15 +3098,9 @@ mod tests {
     /// 明示形 + 負の range
     #[test]
     fn test_control_3d_named_per_axis_negative_range() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db = database(
-            "main :- cube(1,1,1), control3d(p(-100<X<-50, -10<Y<10, 0<Z<200)).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let mut resolved = execute_main_args(
+            "main(L) :- L = [cube(1,1,1), control3d(p(-100<X<-50, -10<Y<10, 0<Z<200))].",
+        );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
         assert_eq!(cps[0].axis_ranges[0], Some((-100.0, -50.0)));
@@ -3170,45 +3110,35 @@ mod tests {
 
     #[test]
     fn test_resolved_var_names_after_execute() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        // クエリの変数名を確認
-        let mut db =
-            database("box(X) :- cube(X, X, X).\nmain :- box(10), box(20), control3d(p(X, 0, 0)).")
-                .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (resolved, _) = execute(&mut db, q).unwrap();
+        // クエリの変数名を確認 (デバッグ出力するだけの diagnostic テスト)
+        let resolved = execute_main_args(
+            "box(N, M) :- M = cube(N, N, N).\n\
+             main(L) :- box(10, S1), box(20, S2), L = [S1, S2, control3d(p(X, 0, 0))].",
+        );
         eprintln!("case1: {:?}", resolved);
 
         // 2つのcontrolが同じ変数名Xを使うケース
-        let mut db2 = database(
-            "main :- cube(X+Y, 20, 30), control3d(p(X, 0, 0)), control3d(p(Y, 0, 0)).",
-        )
-        .unwrap();
-        let (_, q2) = parse_query("main.").unwrap();
-        let (resolved2, _) = execute(&mut db2, q2).unwrap();
+        let resolved2 = execute_main_args(
+            "main(L) :- L = [cube(X+Y, 20, 30), control3d(p(X, 0, 0)), control3d(p(Y, 0, 0))].",
+        );
         eprintln!("case2: {:?}", resolved2);
 
         // ルール経由で同名変数が複数スコープに存在するケース
-        let mut db3 = database(
-            "helper(X) :- cube(X, X, X), control3d(p(X, 0, 0)).\nmain :- helper(10), helper(20).",
-        )
-        .unwrap();
-        let (_, q3) = parse_query("main.").unwrap();
-        let (resolved3, _) = execute(&mut db3, q3).unwrap();
+        let resolved3 = execute_main_args(
+            "helper(N, M, C) :- M = cube(N, N, N), C = control3d(p(X, 0, 0)).\n\
+             main(L) :- helper(10, M1, C1), helper(20, M2, C2), L = [M1, M2, C1, C2].",
+        );
         eprintln!("case3: {:?}", resolved3);
     }
 
     #[test]
     fn test_apply_var_overrides() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
         use std::collections::HashMap;
 
-        let mut db = database("main :- cube(X+10, 20, 30), control3d(p(X, 0, 0)).").unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        // shape と control を 1 つのリストとして main(M) 経由で受け取る。
+        let mut resolved = execute_main_args(
+            "main(M) :- M = [cube(X+10, 20, 30), control3d(p(X, 0, 0))].",
+        );
 
         let mut overrides = HashMap::new();
         overrides.insert("X".to_string(), 5.0);
@@ -3224,17 +3154,15 @@ mod tests {
 
     #[test]
     fn test_apply_var_overrides_no_cross_contamination() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
         use std::collections::HashMap;
 
-        // box(X)が2回使われ、control(X,0,0)のXはクエリ由来
-        // overrideはcontrolのXのみに影響し、box(10),box(20)は変わらないはず
-        let mut db =
-            database("box(X) :- cube(X, X, X).\nmain :- box(10), box(20), control3d(p(X, 0, 0)).")
-                .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        // box(N, M) 内部の X は box の scope に閉じる。control3d 側の X はクエリ由来
+        // (main の自由変数)。override は control3d 側 X のみに影響し、
+        // box(10) → cube(10,10,10) / box(20) → cube(20,20,20) は変わらないこと。
+        let mut resolved = execute_main_args(
+            "box(N, M) :- M = cube(N, N, N).\n\
+             main(L) :- box(10, S1), box(20, S2), L = [S1, S2, control3d(p(X, 0, 0))].",
+        );
 
         let mut overrides = HashMap::new();
         overrides.insert("X".to_string(), 5.0);
@@ -3242,7 +3170,7 @@ mod tests {
 
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
-        // box(10)→cube(10,10,10), box(20)→cube(20,20,20) が残るはず
+        // shape は 2 つ残る
         assert_eq!(resolved.len(), 2);
         let (mesh, _) = generate_mesh_and_tree_from_terms(&resolved, &[]).unwrap();
         assert!(mesh.vertices().len() > 0);
@@ -3400,12 +3328,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let mut db = database(
-            "main :- cube(10,10,10) |> translate(p(0,0,0), p(5,0,0)) |> center3d(p(0,0,0)).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (resolved, _) = execute(&mut db, q).unwrap();
+        let resolved = execute_main_args("main(M) :- M = cube(10,10,10) |> translate(p(0,0,0), p(5,0,0)) |> center3d(p(0,0,0)).");
         let exprs: Vec<Model3D> = resolved
             .iter()
             .filter_map(|t| Model3D::from_term(t).ok())
@@ -3422,15 +3345,9 @@ mod tests {
 
     #[test]
     fn test_center3d_with_control() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db = database(
-            "main :- control3d(p(X@0, Y@0, Z@0)), cube(10,10,10) |> center3d(p(X, Y, Z)).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let mut resolved = execute_main_args(
+            "main(L) :- L = [control3d(p(X@0, Y@0, Z@0)), cube(10,10,10) |> center3d(p(X, Y, Z))].",
+        );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
         assert_eq!(cps[0].x.value, 0.0);
@@ -3455,12 +3372,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let mut db = database(
-            "main :- circle(5) |> center2d(p(10, 20)) |> rotateToXY |> linear_extrude(2).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (resolved, _) = execute(&mut db, q).unwrap();
+        let resolved = execute_main_args("main(M) :- M = circle(5) |> center2d(p(10, 20)) |> rotateToXY |> linear_extrude(2).");
         let exprs: Vec<Model3D> = resolved
             .iter()
             .filter_map(|t| Model3D::from_term(t).ok())
@@ -3480,12 +3392,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let mut db = database(
-            "main :- sketch(p(10,20), [line_to(p(20,20)), line_to(p(20,30)), line_to(p(10,30))]) |> center2d(p(0, 0)) |> rotateToYZ |> linear_extrude(2).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (resolved, _) = execute(&mut db, q).unwrap();
+        let resolved = execute_main_args("main(M) :- M = sketch(p(10,20), [line_to(p(20,20)), line_to(p(20,30)), line_to(p(10,30))]) |> center2d(p(0, 0)) |> rotateToYZ |> linear_extrude(2).");
         let exprs: Vec<Model3D> = resolved
             .iter()
             .filter_map(|t| Model3D::from_term(t).ok())
@@ -3510,12 +3417,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let mut db = database(
-            "main :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))]) |> center2d(p(0, 0)) |> rotateToXY |> linear_extrude(1).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (resolved, _) = execute(&mut db, q).unwrap();
+        let resolved = execute_main_args("main(M) :- M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))]) |> center2d(p(0, 0)) |> rotateToXY |> linear_extrude(1).");
         let exprs: Vec<Model3D> = resolved
             .iter()
             .filter_map(|t| Model3D::from_term(t).ok())
@@ -3532,16 +3434,10 @@ mod tests {
     /// center2d/center3d/translate は `p(...)` 形 + 値が決まっていることを要求する。
     #[test]
     fn test_bare_var_as_point_errors_center2d() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db = database(
-            "inner_part(CENTER) :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))]) |> center2d(CENTER).
-             main :- inner_part(CENTER) |> rotateToXY |> linear_extrude(1).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (resolved, _) = execute(&mut db, q).unwrap();
+        let resolved = execute_main_args(
+            "inner_part(CENTER, M) :- M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))]) |> center2d(CENTER).
+             main(M) :- inner_part(CENTER, INNER), M = INNER |> rotateToXY |> linear_extrude(1).",
+        );
         let err = resolved
             .iter()
             .map(|t| Model3D::from_term(t))
@@ -3555,12 +3451,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let mut db = database(
-            "main :- cube(10,10,10) |> translate(p(0,0,0), p(5,0,0)) |> center3d(P).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (resolved, _) = execute(&mut db, q).unwrap();
+        let resolved = execute_main_args("main(M) :- M = cube(10,10,10) |> translate(p(0,0,0), p(5,0,0)) |> center3d(P).");
         let err = resolved
             .iter()
             .map(|t| Model3D::from_term(t))
@@ -3588,17 +3479,11 @@ mod tests {
     /// engine の unification で展開されて値が伝播する。
     #[test]
     fn test_var_bound_to_point_works() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db = database(
-            "main :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))])
-               |> center2d(CENTER) |> rotateToXY |> linear_extrude(1),
-               CENTER = p(10, 20).",
-        )
-        .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (resolved, _) = execute(&mut db, q).unwrap();
+        let resolved = execute_main_args(
+            "main(M) :- CENTER = p(10, 20),
+                        M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))])
+                            |> center2d(CENTER) |> rotateToXY |> linear_extrude(1).",
+        );
         let exprs: Vec<Model3D> = resolved
             .iter()
             .map(|t| Model3D::from_term(t))
@@ -3637,14 +3522,49 @@ mod tests {
     // rotateToXY/YZ/XZ + seal-error tests
     // ============================================================
 
-    fn run_main(src: &str) -> Result<Vec<Model3D>, ConversionError> {
-        use crate::parse::{database, query as parse_query};
+    /// src を parse して `main(M).` を実行し、`main(...)` の head 引数列を取り出して
+    /// 平坦化したものを返す。
+    ///
+    /// `M` がリスト `[shape, ctl, ...]` に束縛されている場合はリスト中身を平坦化し、
+    /// 単一 term の場合はそのまま 1 要素 Vec として返す。
+    /// `apply_var_overrides` / `extract_control_points` / `Model3D::from_term` 等は
+    /// Vec<Term> 入力なので、ここで平坦化してから渡す。
+    fn execute_main_args(src: &str) -> Vec<crate::parse::ScopedTerm> {
+        use crate::parse::{Term, database, query as parse_query};
         use crate::term_rewrite::execute;
 
         let mut db = database(src).unwrap();
-        let (_, q) = parse_query("main.").unwrap();
+        let (_, q) = parse_query("main(M).").unwrap();
         let (resolved, _) = execute(&mut db, q).unwrap();
-        resolved
+        let raw = main_args(&resolved);
+        let mut out = Vec::new();
+        for arg in raw {
+            if let Term::List { items, tail: None } = arg {
+                out.extend(items);
+            } else {
+                out.push(arg);
+            }
+        }
+        out
+    }
+
+    /// resolved の中から `main(...)` の引数列を抽出する。
+    fn main_args<S: Clone>(resolved: &[crate::parse::Term<S>]) -> Vec<crate::parse::Term<S>> {
+        use crate::parse::Term;
+        for t in resolved {
+            if let Term::Struct { functor, args, .. } = t
+                && functor == "main"
+            {
+                return args.clone();
+            }
+        }
+        Vec::new()
+    }
+
+    /// `main(M) :- M = pipeline.` 形式の db を実行し、M に束縛された shape を Model3D
+    /// にして返す。
+    fn run_main(src: &str) -> Result<Vec<Model3D>, ConversionError> {
+        execute_main_args(src)
             .iter()
             .map(|t| Model3D::from_term(t))
             .collect::<Result<Vec<_>, _>>()
@@ -3654,7 +3574,7 @@ mod tests {
     fn test_rotate_to_yz_basic() {
         // 10x10の正方形をrotateToYZしてZ方向(=push後の+X)に2押し出し
         let exprs = run_main(
-            "main :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToYZ |> linear_extrude(2).",
+            "main(M) :- M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToYZ |> linear_extrude(2).",
         )
         .unwrap();
         assert_eq!(exprs.len(), 1);
@@ -3671,7 +3591,7 @@ mod tests {
     fn test_rotate_to_xz_basic() {
         // 10x10の正方形をrotateToXZ → 押し出しは+Y方向に2
         let exprs = run_main(
-            "main :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToXZ |> linear_extrude(2).",
+            "main(M) :- M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToXZ |> linear_extrude(2).",
         )
         .unwrap();
         assert_eq!(exprs.len(), 1);
@@ -3729,7 +3649,7 @@ mod tests {
     fn test_rotate_to_xz_sketch_orientation() {
         // sketch 版でも同様に法線が外向きであること (回帰防止)。
         let exprs = run_main(
-            "main :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToXZ |> linear_extrude(2).",
+            "main(M) :- M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToXZ |> linear_extrude(2).",
         )
         .unwrap();
         let node = build_evaluated_node(&exprs[0], &[]).unwrap();
@@ -3741,7 +3661,7 @@ mod tests {
     fn test_rotate_to_xy_places_on_xy() {
         // rotateToXY を明示すると XY 平面の押し出し (押し出し方向は +Z)
         let exprs = run_main(
-            "main :- sketch(p(0,0), [line_to(p(4,0)), line_to(p(4,3)), line_to(p(0,3))]) |> rotateToXY |> linear_extrude(2).",
+            "main(M) :- M = sketch(p(0,0), [line_to(p(4,0)), line_to(p(4,3)), line_to(p(0,3))]) |> rotateToXY |> linear_extrude(2).",
         )
         .unwrap();
         let node = build_evaluated_node(&exprs[0], &[]).unwrap();
@@ -3755,14 +3675,9 @@ mod tests {
 
     #[test]
     fn test_linear_extrude_requires_plane() {
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
-        let mut db =
-            database("main :- sketch(p(0,0), [line_to(p(4,0)), line_to(p(4,3)), line_to(p(0,3))]) |> linear_extrude(2).")
-                .unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (resolved, _) = execute(&mut db, q).unwrap();
+        let resolved = execute_main_args(
+            "main(M) :- M = sketch(p(0,0), [line_to(p(4,0)), line_to(p(4,3)), line_to(p(0,3))]) |> linear_extrude(2).",
+        );
         let err = resolved
             .iter()
             .map(|t| Model3D::from_term(t))
@@ -3779,7 +3694,7 @@ mod tests {
         // (a - b) |> rotateToYZ |> linear_extrude
         // 今回の battery_case のバグ再現ケースが正しく動くこと
         let exprs = run_main(
-            "main :- (sketch(p(0,0), [line_to(p(20,0)), line_to(p(20,58)), line_to(p(0,58))]) - sketch(p(2.7,4.1), [line_to(p(17.3,4.1)), line_to(p(17.3,53.9)), line_to(p(2.7,53.9))])) |> rotateToYZ |> linear_extrude(20).",
+            "main(M) :- M = (sketch(p(0,0), [line_to(p(20,0)), line_to(p(20,58)), line_to(p(0,58))]) - sketch(p(2.7,4.1), [line_to(p(17.3,4.1)), line_to(p(17.3,53.9)), line_to(p(2.7,53.9))])) |> rotateToYZ |> linear_extrude(20).",
         )
         .unwrap();
         assert_eq!(exprs.len(), 1);
@@ -3796,7 +3711,7 @@ mod tests {
     #[test]
     fn test_circle_rotate_to_yz() {
         // circle(r) |> rotateToYZ |> linear_extrude が YZ 平面の円柱になる
-        let exprs = run_main("main :- circle(5) |> rotateToYZ |> linear_extrude(3).").unwrap();
+        let exprs = run_main("main(M) :- M = circle(5) |> rotateToYZ |> linear_extrude(3).").unwrap();
         let node = build_evaluated_node(&exprs[0], &[]).unwrap();
         let x_extent = node.aabb_max[0] - node.aabb_min[0];
         let y_extent = node.aabb_max[1] - node.aabb_min[1];
@@ -3811,9 +3726,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let mut db = database(src).unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (resolved, _) = execute(&mut db, q).unwrap();
+        let resolved = execute_main_args(src);
         let err = resolved
             .iter()
             .map(|t| Model3D::from_term(t))
@@ -3830,19 +3743,19 @@ mod tests {
     #[test]
     fn test_boolean_after_rotate_errors() {
         expect_sealed(
-            "main :- (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> linear_extrude(1).",
+            "main(M) :- M = (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> linear_extrude(1).",
             "+",
         );
         expect_sealed(
-            "main :- sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) |> linear_extrude(1).",
+            "main(M) :- M = sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) |> linear_extrude(1).",
             "+",
         );
         expect_sealed(
-            "main :- (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) |> linear_extrude(1).",
+            "main(M) :- M = (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) |> linear_extrude(1).",
             "+",
         );
         expect_sealed(
-            "main :- (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToXZ) |> linear_extrude(1).",
+            "main(M) :- M = (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToXZ) |> linear_extrude(1).",
             "+",
         );
     }
@@ -3850,7 +3763,7 @@ mod tests {
     #[test]
     fn test_difference_after_rotate_errors() {
         expect_sealed(
-            "main :- (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) - sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> linear_extrude(1).",
+            "main(M) :- M = (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) - sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> linear_extrude(1).",
             "-",
         );
     }
@@ -3858,7 +3771,7 @@ mod tests {
     #[test]
     fn test_center2d_after_rotate_errors() {
         expect_sealed(
-            "main :- sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> center2d(p(0, 0)) |> linear_extrude(1).",
+            "main(M) :- M = sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> center2d(p(0, 0)) |> linear_extrude(1).",
             "center2d",
         );
     }
@@ -3870,19 +3783,14 @@ mod tests {
         // - boolean の結果を rotateToYZ で平面に置いてから linear_extrude
         // rotateTo* が is_builtin_functor として正しく登録され、term_rewrite で
         // 既定ファンクタとして扱われることをこの統合テストで確認する。
-        use crate::parse::{database, query as parse_query};
-        use crate::term_rewrite::execute;
-
         let src = "\
-main :- battery_box.
-battery_box :-
-  (sketch(p(0,0), [line_to(p(20,0)), line_to(p(20,58)), line_to(p(0,58))]) |> center2d(p(0,0)))
-  - honi |> rotateToYZ |> linear_extrude(20).
-honi :- sketch(p(0,0), [line_to(p(14.6,0)), line_to(p(14.6,49.8)), line_to(p(0,49.8))]) |> center2d(p(0,0)).
+honi(M) :- M = sketch(p(0,0), [line_to(p(14.6,0)), line_to(p(14.6,49.8)), line_to(p(0,49.8))]) |> center2d(p(0,0)).
+battery_box(M) :- honi(H),
+  M = (sketch(p(0,0), [line_to(p(20,0)), line_to(p(20,58)), line_to(p(0,58))]) |> center2d(p(0,0)))
+      - H |> rotateToYZ |> linear_extrude(20).
+main(M) :- battery_box(M).
 ";
-        let mut db = database(src).unwrap();
-        let (_, q) = parse_query("main.").unwrap();
-        let (resolved, _) = execute(&mut db, q).unwrap();
+        let resolved = execute_main_args(src);
         let exprs: Vec<Model3D> = resolved
             .iter()
             .map(|t| Model3D::from_term(t))
@@ -3902,15 +3810,15 @@ honi :- sketch(p(0,0), [line_to(p(14.6,0)), line_to(p(14.6,49.8)), line_to(p(0,4
     #[test]
     fn test_double_rotate_errors() {
         expect_sealed(
-            "main :- sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToXZ |> linear_extrude(1).",
+            "main(M) :- M = sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToXZ |> linear_extrude(1).",
             "rotateToXZ",
         );
         expect_sealed(
-            "main :- sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToYZ |> linear_extrude(1).",
+            "main(M) :- M = sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToYZ |> linear_extrude(1).",
             "rotateToYZ",
         );
         expect_sealed(
-            "main :- sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToXY |> linear_extrude(1).",
+            "main(M) :- M = sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToXY |> linear_extrude(1).",
             "rotateToXY",
         );
     }

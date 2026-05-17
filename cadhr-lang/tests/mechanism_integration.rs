@@ -3,41 +3,67 @@
 //! `cadhr-lang/tests/mechanism.cadhr` を include_str! で取り込み、平歯車の連鎖を
 //! validate + render するワークフローを通しでチェックする。
 
-use cadhr_lang::parse::{database, query};
+use cadhr_lang::parse::{Term, database, query};
 use cadhr_lang::term_rewrite::execute;
 
 const MECHANISM_SRC: &str = include_str!("mechanism.cadhr");
 
+/// `main(...)` の最後の引数 (描画モデルのリスト) を平坦化して各要素を文字列化する。
+/// `[A | [B | [C]]]` のような cons-cell 連鎖も `[A, B, C]` 相当に扱う。
+fn render_strings(resolved: &[Term<usize>]) -> Vec<String> {
+    fn flatten(term: &Term<usize>, out: &mut Vec<Term<usize>>) {
+        if let Term::List { items, tail } = term {
+            for it in items {
+                out.push(it.clone());
+            }
+            if let Some(t) = tail {
+                flatten(t, out);
+            }
+        }
+    }
+    for t in resolved {
+        if let Term::Struct { functor, args, .. } = t
+            && functor == "main"
+            && let Some(last) = args.last()
+        {
+            let mut flat = Vec::new();
+            flatten(last, &mut flat);
+            return flat.iter().map(|t| format!("{:?}", t)).collect();
+        }
+    }
+    Vec::new()
+}
+
 fn run(extra_db: &str, query_src: &str) -> Result<Vec<String>, String> {
     let full_db = format!("{}\n{}", MECHANISM_SRC, extra_db);
     let mut db = database(&full_db).map_err(|e| format!("parse db: {:?}", e))?;
-    let q = query(query_src).map_err(|e| format!("parse query: {:?}", e))?.1;
+    let q = query(query_src)
+        .map_err(|e| format!("parse query: {:?}", e))?
+        .1;
     let (resolved, _) = execute(&mut db, q).map_err(|e| format!("execute: {}", e))?;
-    Ok(resolved.iter().map(|t| format!("{:?}", t)).collect())
+    Ok(render_strings(&resolved))
 }
 
 /// 3 段ギアトレインが規格通り配置されたとき、矛盾なく chain を validate できる。
 /// T1 を 0 にすると T2, T3 もすべて 0 になり、各歯車は静止位置で描画される。
-/// (歯数 20-40-20: 連動回転が FixedPoint で完全整除になる組み合わせ)
 #[test]
 fn three_gear_chain_validates_and_renders() {
     let src = r#"
-main :- do_mech([
+main(OUT) :- do_mech([
     gp(g1, 1, 20, 0,  0, 0,  5),
     gp(g2, 1, 40, 30, 0, T2, 5),
     gp(g3, 1, 20, 60, 0, T3, 5)
-]).
+], OUT).
 "#;
-    let resolved = run(src, "main.").expect("should succeed");
-    // 各歯車が translate(rotate(cylinder(...), ...), p(0,0,0), p(x, y, 0)) として 3 個描画される
-    let render_count = resolved
+    let renders = run(src, "main(OUT).").expect("should succeed");
+    let render_count = renders
         .iter()
         .filter(|s| s.starts_with("translate("))
         .count();
     assert_eq!(
         render_count, 3,
         "expected 3 translated cylinders, got {:#?}",
-        resolved
+        renders
     );
 }
 
@@ -45,13 +71,13 @@ main :- do_mech([
 #[test]
 fn driver_rotation_propagates_to_first_pair() {
     let src = r#"
-main(T1) :- do_mech([
+main(T1, OUT) :- do_mech([
     gp(g1, 1, 20, 0,  0, T1, 5),
     gp(g2, 1, 40, 30, 0, T2, 5)
-]).
+], OUT).
 "#;
-    let resolved = run(src, "main(20).").expect("should succeed");
-    let joined = resolved.join("\n");
+    let renders = run(src, "main(20, OUT).").expect("should succeed");
+    let joined = renders.join("\n");
     // T1=20, T2 = -Z1*T1/Z2 = -20*20/40 = -10
     assert!(joined.contains("-10"), "expected T2=-10 in: {}", joined);
 }
@@ -62,14 +88,14 @@ main(T1) :- do_mech([
 #[test]
 fn driver_rotation_propagates_through_three_gear_chain() {
     let src = r#"
-main(T1) :- do_mech([
+main(T1, OUT) :- do_mech([
     gp(g1, 1, 20, 0,  0, T1, 5),
     gp(g2, 1, 40, 30, 0, T2, 5),
     gp(g3, 1, 20, 60, 0, T3, 5)
-]).
+], OUT).
 "#;
-    let resolved = run(src, "main(20).").expect("should succeed");
-    let joined = resolved.join("\n");
+    let renders = run(src, "main(20, OUT).").expect("should succeed");
+    let joined = renders.join("\n");
     assert!(joined.contains("-10"), "expected T2=-10 in: {}", joined);
     assert!(
         joined.contains("0, 0, 20)"),
@@ -84,21 +110,17 @@ main(T1) :- do_mech([
 #[test]
 fn driver_rotation_propagates_with_non_exact_division() {
     let src = r#"
-main(T1) :- do_mech([
+main(T1, OUT) :- do_mech([
     gp(g1, 1, 20, 0,  0, T1, 5),
     gp(g2, 1, 40, 30, 0, T2, 5),
     gp(g3, 1, 30, 65, 0, T3, 5)
-]).
+], OUT).
 "#;
-    let resolved = run(src, "main(20).").expect("should succeed");
-    let joined = resolved.join("\n");
+    let renders = run(src, "main(20, OUT).").expect("should succeed");
+    let joined = renders.join("\n");
     // T1=20, T2=-10 (exact), T3 = -40*(-10)/30 = 40/3 = 13.33 (rounded display)
     assert!(joined.contains("-10"), "expected T2=-10 in: {}", joined);
-    assert!(
-        joined.contains("13.33"),
-        "expected T3≈13.33 in: {}",
-        joined
-    );
+    assert!(joined.contains("13.33"), "expected T3≈13.33 in: {}", joined);
 }
 
 /// 5 段チェーン (20-30-40-25-30) — 隣接歯数比が割り切れない組み合わせを
@@ -115,16 +137,16 @@ main(T1) :- do_mech([
 #[test]
 fn five_gear_chain_no_error_accumulation() {
     let src = r#"
-main(T1) :- do_mech([
+main(T1, OUT) :- do_mech([
     gp(g1, 1, 20, 0,    0, T1, 5),
     gp(g2, 1, 30, 25,   0, T2, 5),
     gp(g3, 1, 40, 60,   0, T3, 5),
     gp(g4, 1, 25, 92.5, 0, T4, 5),
     gp(g5, 1, 30, 120,  0, T5, 5)
-]).
+], OUT).
 "#;
-    let resolved = run(src, "main(30).").expect("should succeed");
-    let joined = resolved.join("\n");
+    let renders = run(src, "main(30, OUT).").expect("should succeed");
+    let joined = renders.join("\n");
     // T2=-20, T3=15, T4=-24, T5=20 のすべてが正確に解ける
     assert!(
         joined.contains(", 0, -20),"),
@@ -155,16 +177,15 @@ main(T1) :- do_mech([
 #[test]
 fn rational_does_not_introduce_false_contradictions() {
     // 距離・角度がすべて非整除な値だが整合している。Rational なら通過する。
-    // (旧 FixedPoint では DistSq*DistSq vs R*R の丸めで偽の不整合が出る可能性があった)
     let src = r#"
-main(T1) :- do_mech([
+main(T1, OUT) :- do_mech([
     gp(g1, 1, 7,  0,    0, T1, 5),
     gp(g2, 1, 11, 9,    0, T2, 5)
-]).
+], OUT).
 "#;
     // Z1+Z2 = 18, M=1, center distance = 9. 9*9 = 81. DistSq = 9*9 = 81. 一致。
-    let resolved = run(src, "main(0).").expect("should succeed");
-    let render_count = resolved
+    let renders = run(src, "main(0, OUT).").expect("should succeed");
+    let render_count = renders
         .iter()
         .filter(|s| s.starts_with("translate("))
         .count();
@@ -176,12 +197,12 @@ main(T1) :- do_mech([
 #[test]
 fn distance_mismatch_reports_labeled_error() {
     let src = r#"
-main :- do_mech([
+main(OUT) :- do_mech([
     gp(g1, 1, 20, 0,  0, 0,  5),
     gp(g2, 1, 40, 31, 0, T2, 5)
-]).
+], OUT).
 "#;
-    let err = run(src, "main.").expect_err("distance mismatch should fail");
+    let err = run(src, "main(OUT).").expect_err("distance mismatch should fail");
     assert!(
         err.contains("gear center distance"),
         "expected label 'gear center distance' in: {}",
@@ -200,12 +221,12 @@ main :- do_mech([
 #[test]
 fn module_mismatch_fails_to_unify_mesh_head() {
     let src = r#"
-main :- do_mech([
+main(OUT) :- do_mech([
     gp(g1, 1, 20, 0,  0, 0,  5),
     gp(g2, 2, 20, 30, 0, T2, 5)
-]).
+], OUT).
 "#;
-    let err = run(src, "main.").expect_err("module mismatch should fail");
+    let err = run(src, "main(OUT).").expect_err("module mismatch should fail");
     // mesh/2 の head の M で構造マッチが起きないため、no clause matches となる
     assert!(
         err.contains("no clause matches") || err.contains("unify"),

@@ -335,9 +335,10 @@ impl ArithExpr {
     /// Struct や List など算術式でないものは Err を返す。
     pub fn try_from_term<S>(term: &Term<S>) -> Result<Self, ConversionError> {
         match term {
-            Term::Var { default_value: Some(value), .. } => {
-                Ok(ArithExpr::Num(value.clone()))
-            }
+            Term::Var {
+                default_value: Some(value),
+                ..
+            } => Ok(ArithExpr::Num(value.clone())),
             Term::Var { name, min, max, .. } if min.is_some() || max.is_some() => {
                 Ok(ArithExpr::RangeVar {
                     name: name.clone(),
@@ -586,9 +587,6 @@ mod tests {
         assert_eq!(r.bindings.get("X"), Some(&r_int(5)));
     }
 
-    /// 旧 FixedPoint ソルバでは完全整除を要求していたため `30*X = 400` が解けず、
-    /// tolerance 緩和でも近似値 (13.33) しか得られなかった。
-    /// Rational 化により厳密に `X = 40/3` で束縛される。
     #[test]
     fn test_non_exact_division_is_exact() {
         // 30 * X = 400 -> X = 40/3

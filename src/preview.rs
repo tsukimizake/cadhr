@@ -183,7 +183,7 @@ impl Scene {
         (max * 2.4 * 3.0).max(5.0)
     }
 
-    /// CP 球体半径計算用: 原点からの最大距離 (旧 compute_aabb 互換)
+    /// CP 球体半径計算用: 原点からの最大距離
     fn aabb_max_abs(&self) -> f32 {
         let v = self.bbox_min.abs().max(self.bbox_max.abs());
         v.x.max(v.y).max(v.z)

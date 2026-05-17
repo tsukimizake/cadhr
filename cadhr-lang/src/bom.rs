@@ -178,15 +178,32 @@ mod tests {
         assert_eq!(entries[0].name, "plate");
     }
 
+    /// `main(..., OUT)` の OUT 引数 (リスト) を取り出して平坦化する。
+    fn unpack_main_out_list<S: Clone>(resolved: &[Term<S>]) -> Vec<Term<S>> {
+        for t in resolved {
+            if let Term::Struct { functor, args, .. } = t
+                && functor == "main"
+            {
+                if let Some(Term::List { items, .. }) = args.last() {
+                    return items.clone();
+                }
+            }
+        }
+        Vec::new()
+    }
+
     #[test]
     fn test_bom_via_rule() {
-        let db_src = r#"main(L) :- cube(L, L, L), bom("frame", [len(L)])."#;
-        let query_src = "main(60).";
+        // main の最後の引数 (リスト) に bom 項を含めて runtime に届ける。
+        let db_src =
+            r#"main(L, OUT) :- OUT = [cube(L, L, L), bom("frame", [len(L)])]."#;
+        let query_src = "main(60, OUT).";
         let (_, query_terms) = query(query_src).unwrap();
         let mut db = database(db_src).unwrap();
         let (resolved, _) = execute(&mut db, query_terms).unwrap();
 
-        let entries = BomExtractor.process(&resolved).unwrap();
+        let items = unpack_main_out_list(&resolved);
+        let entries = BomExtractor.process(&items).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "frame");
         assert_eq!(
@@ -200,19 +217,22 @@ mod tests {
         use crate::parse::{collect_query_params, substitute_query_params};
         use crate::term_rewrite::infer_query_param_ranges;
 
-        let db_src = r#"main(L) :- 50<L<2000, cube(L, L, L), bom("frame", [len(L)])."#;
-        let query_src = "main(60).";
+        let db_src =
+            r#"main(L, OUT) :- 50<L<2000, OUT = [cube(L, L, L), bom("frame", [len(L)])]."#;
+        let query_src = "main(60, OUT).";
         let (_, query_terms) = query(query_src).unwrap();
         let mut db = database(db_src).unwrap();
 
         let mut query_params = collect_query_params(&query_terms);
         infer_query_param_ranges(&query_terms, &db, &mut query_params).unwrap();
-        let substituted = substitute_query_params(&query_terms, &std::collections::HashMap::from([("L".to_string(), 60.0)]));
+        let substituted = substitute_query_params(
+            &query_terms,
+            &std::collections::HashMap::from([("L".to_string(), 60.0)]),
+        );
 
         let (resolved, _) = execute(&mut db, substituted).unwrap();
-        eprintln!("resolved: {:#?}", resolved);
-
-        let entries = BomExtractor.process(&resolved).unwrap();
+        let items = unpack_main_out_list(&resolved);
+        let entries = BomExtractor.process(&items).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "frame");
         assert_eq!(

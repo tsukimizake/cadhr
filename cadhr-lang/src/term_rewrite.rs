@@ -302,17 +302,6 @@ fn is_builtin_term<S>(term: &Term<S>) -> bool {
     }
 }
 
-/// ジオメトリではないメタデータ用のビルトインファンクタ（bom等）かどうか
-fn is_metadata_term<S>(term: &Term<S>) -> bool {
-    matches!(term, Term::Struct { functor, .. }
-        if is_builtin_functor(functor) && !should_resolve_args(functor))
-}
-
-/// control2d / control3d のいずれかかどうか
-fn is_control_term<S>(term: &Term<S>) -> bool {
-    matches!(term, Term::Struct { functor, .. } if functor == "control2d" || functor == "control3d")
-}
-
 fn builtin_fact(functor: &str, arity: usize) -> Clause {
     let args = (0..arity)
         .map(|idx| var(format!("__builtin_arg_{}", idx)))
@@ -439,8 +428,6 @@ fn apply_default_var_bindings(term: &mut ScopedTerm, goals: &mut Vec<ScopedTerm>
     }
 }
 
-
-
 /// term に含まれる @-default を `targets` の各項に反映させる。
 /// rewrite_term_recursive 内の apply_default_var_bindings は other_goals にしか伝播しないので、
 /// 同じルール本体の未処理 body 項に @-default を波及させたい時はこのヘルパーを使う。
@@ -455,6 +442,26 @@ fn propagate_defaults_to(term: &ScopedTerm, targets: &mut [ScopedTerm]) {
         env.insert(scope, name, number(value));
     }
     for t in targets.iter_mut() {
+        *t = resolve(t, &env);
+    }
+}
+
+/// body 全体から @-default を集めて、全 body 項に反映する。
+/// Eq ゴールが split_and_resolve_eq_goals で先に処理される前に、別 goal で宣言された
+/// `W@5` のような default を Eq の右辺に行き渡らせる必要があるため。
+fn propagate_defaults_across_body(body: &mut [ScopedTerm]) {
+    let mut bindings = Vec::new();
+    for t in body.iter() {
+        collect_default_var_bindings(t, &mut bindings);
+    }
+    if bindings.is_empty() {
+        return;
+    }
+    let mut env = ScopedEnv::new();
+    for (name, scope, value) in bindings {
+        env.insert(scope, name, number(value));
+    }
+    for t in body.iter_mut() {
         *t = resolve(t, &env);
     }
 }
@@ -959,8 +966,13 @@ pub fn unify(
             t2 = number(val);
         }
 
-        // 算術式がまだ評価できない場合は遅延
-        if matches!(t1, Term::InfixExpr { .. }) || matches!(t2, Term::InfixExpr { .. }) {
+        // 算術式がまだ評価できない場合は遅延する。両辺が "潜在的に算術" (Number / Var /
+        // 算術 InfixExpr) のときだけ遅延キューに入れる。InfixExpr に shape 系の Struct
+        // (cube など) が含まれているときは構造的単一化に流すため遅延しない。
+        let both_arith = is_potentially_arithmetic(&t1) && is_potentially_arithmetic(&t2);
+        if (matches!(t1, Term::InfixExpr { .. }) || matches!(t2, Term::InfixExpr { .. }))
+            && both_arith
+        {
             deferred.push((t1, t2));
             continue;
         }
@@ -1496,8 +1508,7 @@ fn try_rewrite_single_with_result(
 ) -> Option<(ScopedTerm, Vec<ScopedTerm>)> {
     for clause in db.iter() {
         *clause_counter += 1;
-        let scoped =
-            assign_scope_to_clause(clause.clone(), *clause_counter, shared_env);
+        let scoped = assign_scope_to_clause(clause.clone(), *clause_counter, shared_env);
         let (head, body) = match scoped {
             Clause::Fact(t) => (t, vec![]),
             Clause::Rule { head, body } => (head, body),
@@ -1552,10 +1563,7 @@ fn handle_make_record(
         Term::List { items, tail } => {
             if tail.is_some() {
                 return Err(RewriteError {
-                    message: format!(
-                        "make_{} spec list must not have a tail",
-                        record_name
-                    ),
+                    message: format!("make_{} spec list must not have a tail", record_name),
                     goal: spec_resolved.clone(),
                 });
             }
@@ -1574,11 +1582,7 @@ fn handle_make_record(
     for item in items {
         let item_resolved = resolve(&item, shared_env);
         match &item_resolved {
-            Term::Struct {
-                functor,
-                args,
-                ..
-            } if args.len() == 1 => {
+            Term::Struct { functor, args, .. } if args.len() == 1 => {
                 if by_field.contains_key(functor) {
                     return Err(RewriteError {
                         message: format!(
@@ -1660,7 +1664,12 @@ fn rewrite_term_recursive(
 
     // assert_eq(Expected, Actual) / assert_eq(Expected, Actual, "label"):
     // 両辺を数値に評価して比較。一致なら成功（結果空）、不一致なら RewriteError。
-    if let Term::Struct { functor, args, span } = &term {
+    if let Term::Struct {
+        functor,
+        args,
+        span,
+    } = &term
+    {
         if functor == "assert_eq" && (args.len() == 2 || args.len() == 3) {
             return handle_assert_eq(args, *span, shared_env);
         }
@@ -1755,15 +1764,22 @@ fn rewrite_term_recursive(
             };
             return Ok(vec![resolved_term]);
         } else {
-            // Ruleにマッチ: bodyの各項を再帰的に解決。
-            // remaining_body は「未処理の非 Eq body 項」、other_goals は「外側ゴール
-            // ＋未解決 Eq」と役割を物理的に分離する。再帰呼び出しには other_goals
-            // だけを渡し、binding は shared_env 経由で伝播させる。
+            // 全 body 項を見て @-default を相互伝播。Eq が先に split されて単体処理されるため、
+            // 他の body 項に書かれた `X@N` を Eq 側に行き渡らせておく必要がある。
+            let mut body = body;
+            propagate_defaults_across_body(&mut body);
+            // Rule にマッチ: body を走らせるが戻り値は捨てる。返り値は head 単一化された
+            // resolved_term。body 評価の効果は env への束縛追加のみ:
+            //   - Eq ゴール (`X = ...`) が shared_env に束縛を入れる
+            //   - サブルール呼び出しが head 単一化を通じて出力引数を束縛
+            //   - 算術制約 (`0<X<10` や `A+B=C`) が線形ソルバ経由で束縛
+            //   - make_NAME builtin が record 構築結果を引数 var に unify
+            //   - @-default が他 body 項にも伝播 (propagate_defaults_to)
+            //   - assert_eq は失敗時に RewriteError を返して中断する (env 更新はしない)
+            // bom / control2d / control3d は body 内では bubble up せず捨てられる。
+            // 出力する場合は record output の bom/controls field 経由で明示的に渡す。
             let mut remaining_body: Vec<ScopedTerm> = body;
-            let mut all_resolved = Vec::new();
 
-            // body と other_goals 双方から Eq を集めて解き、束縛を shared_env に伝播。
-            // 残った未解決 Eq は other_goals に戻す。
             split_and_resolve_eq_goals(&mut remaining_body, other_goals, shared_env)?;
             apply_env_in_place(&mut remaining_body, shared_env);
             apply_env_in_place(other_goals, shared_env);
@@ -1776,7 +1792,7 @@ fn rewrite_term_recursive(
                 // しか伝播しないため、ここで明示的に行う必要がある。
                 propagate_defaults_to(&b, &mut remaining_body);
 
-                let resolved = rewrite_term_recursive(
+                let _ = rewrite_term_recursive(
                     db,
                     record_decls,
                     clause_counter,
@@ -1784,7 +1800,6 @@ fn rewrite_term_recursive(
                     other_goals,
                     shared_env,
                 )?;
-                all_resolved.extend(resolved);
 
                 // 再帰中に other_goals に新しい Eq が追加されたり、shared_env が
                 // 更新された可能性があるので、再度 Eq を解いて未処理 body にも反映する。
@@ -1792,14 +1807,17 @@ fn rewrite_term_recursive(
                 apply_env_in_place(&mut remaining_body, shared_env);
             }
 
-            return Ok(all_resolved);
+            // 副作用評価後、head の最終形 (env 反映済み) を返す。
+            let final_head = resolve(&resolved_term, shared_env);
+            return Ok(vec![final_head]);
         }
     }
 
     // ルールにマッチしない場合、サブタームを再帰的に書き換える
     match term {
         Term::InfixExpr { op, left, right } => {
-            let new_left_terms = rewrite_term_recursive(
+            // サブ式の resolve 結果は単一項であることを要求する。
+            let mut new_left_terms = rewrite_term_recursive(
                 db,
                 record_decls,
                 clause_counter,
@@ -1807,7 +1825,7 @@ fn rewrite_term_recursive(
                 other_goals,
                 shared_env,
             )?;
-            let new_right_terms = rewrite_term_recursive(
+            let mut new_right_terms = rewrite_term_recursive(
                 db,
                 record_decls,
                 clause_counter,
@@ -1816,43 +1834,26 @@ fn rewrite_term_recursive(
                 shared_env,
             )?;
 
-            // メタデータ(bom等)やcontrol2d/control3dをother_goalsへ分離し、シェイプだけ残す
-            let (left_shapes, left_meta): (Vec<_>, Vec<_>) =
-                new_left_terms.into_iter().partition(|t| {
-                    !is_metadata_term(t) && !is_control_term(t)
-                });
-            let (right_shapes, right_meta): (Vec<_>, Vec<_>) =
-                new_right_terms.into_iter().partition(|t| {
-                    !is_metadata_term(t) && !is_control_term(t)
-                });
-
-            other_goals.extend(left_meta);
-            other_goals.extend(right_meta);
-
-            if left_shapes.len() != 1 || right_shapes.len() != 1 {
+            if new_left_terms.len() != 1 || new_right_terms.len() != 1 {
                 return Err(RewriteError {
-                    message: "InfixExpr operand resolved to multiple terms".to_string(),
+                    message: "InfixExpr operand resolved to non-singleton".to_string(),
                     goal: Term::InfixExpr {
                         op,
-                        left: Box::new(left_shapes.into_iter().next().unwrap_or(Term::Number {
+                        left: Box::new(new_left_terms.pop().unwrap_or(Term::Number {
                             value: crate::rational::Rational::zero(),
                         })),
-                        right: Box::new(right_shapes.into_iter().next().unwrap_or(Term::Number {
+                        right: Box::new(new_right_terms.pop().unwrap_or(Term::Number {
                             value: crate::rational::Rational::zero(),
                         })),
                     },
                 });
             }
 
-            let new_left = left_shapes.into_iter().next().unwrap();
-            let new_right = right_shapes.into_iter().next().unwrap();
-
             let new_term = Term::InfixExpr {
                 op,
-                left: Box::new(new_left),
-                right: Box::new(new_right),
+                left: Box::new(new_left_terms.into_iter().next().unwrap()),
+                right: Box::new(new_right_terms.into_iter().next().unwrap()),
             };
-            // 書き換え後の項がビルトインプリミティブならOK
             if is_builtin_term(&new_term) {
                 Ok(vec![new_term])
             } else {
@@ -1984,20 +1985,10 @@ fn resolve_builtin_arg(
                 other_goals,
                 shared_env,
             )?;
-            if resolved.len() > 1 {
-                let mut shape = Vec::new();
-                for t in resolved {
-                    if is_control_term(&t) || is_metadata_term(&t) {
-                        other_goals.push(t);
-                    } else {
-                        shape.push(t);
-                    }
-                }
-                resolved = shape;
-            }
+            // builtin の引数は単一項に resolve される
             if resolved.len() != 1 {
                 return Err(RewriteError {
-                    message: "builtin argument resolved to multiple terms".to_string(),
+                    message: "builtin argument resolved to non-singleton".to_string(),
                     goal: resolved.into_iter().next().unwrap_or(Term::Number {
                         value: crate::rational::Rational::zero(),
                     }),
@@ -2134,8 +2125,8 @@ mod tests {
         let db_raw = database(db_src).expect("failed to parse db");
         let mut resolver = ModuleResolver::new();
         let mut registry = FileRegistry::new();
-        let mut db = resolve_modules(db_raw, &[], &mut resolver, &mut registry)
-            .expect("resolve modules");
+        let mut db =
+            resolve_modules(db_raw, &[], &mut resolver, &mut registry).expect("resolve modules");
         let q = query(query_src).expect("failed to parse query").1;
         let (resolved, _env) = execute(&mut db, q).expect("Expected success");
         resolved.iter().map(|t| format!("{:?}", t)).collect()
@@ -2274,13 +2265,13 @@ mod tests {
     #[test]
     fn default_var_propagates_within_rule_body() {
         let resolved = run_success(
-            "cut(W) :- cube(W, 50, 260). main :- cube(X@25, 50, 300) - (cut(W@5) |> translate(p(0, 0, 0), p(X / 2 - W, 0, 0))).",
-            "main.",
+            "cut(W, MODEL) :- MODEL = cube(W, 50, 260). main(MODEL) :- cut(W@5, CUT), MODEL = cube(X@25, 50, 300) - (CUT |> translate(p(0, 0, 0), p(X / 2 - W, 0, 0))).",
+            "main(M).",
         );
         assert_eq!(
             resolved,
             vec![
-                "(cube(X@25, 50, 300) - translate(cube(5, 50, 260), p(0, 0, 0), p(7.5, 0, 0)))"
+                "main((cube(X@25, 50, 300) - translate(cube(5, 50, 260), p(0, 0, 0), p(7.5, 0, 0))))"
             ]
         );
     }
@@ -2395,22 +2386,23 @@ mod tests {
     // ===== rule tests =====
 
     #[test]
-    fn resolved_goals_returned() {
-        // Ruleにマッチするとheadがbodyで置換される
+    fn resolved_goal_returned_as_head() {
+        // ルール解決の結果は head 単一化された term (binding 適用済み)。
+        // body は副作用 (env 束縛) のみのために評価される。
         let resolved = run_success("p :- q(X, Z), r(Z, Y). q(a, b). r(b, c).", "p.");
-        assert_eq!(resolved, vec!["q(a, b)", "r(b, c)"]);
+        assert_eq!(resolved, vec!["p"]);
     }
 
     #[test]
     fn rule_single_goal() {
         let resolved = run_success("parent(X) :- father(X). father(tom).", "parent(tom).");
-        assert_eq!(resolved, vec!["father(tom)"]);
+        assert_eq!(resolved, vec!["parent(tom)"]);
     }
 
     #[test]
     fn rule_single_goal_with_var_query() {
         let resolved = run_success("parent(X) :- father(X). father(tom).", "parent(Y).");
-        assert_eq!(resolved, vec!["father(tom)"]);
+        assert_eq!(resolved, vec!["parent(tom)"]);
     }
 
     #[test]
@@ -2421,7 +2413,7 @@ mod tests {
             grandparent(X, Y) :- parent(X, Z), parent(Z, Y).
         "#;
         let resolved = run_success(db, "grandparent(alice, Who).");
-        assert_eq!(resolved, vec!["parent(alice, bob)", "parent(bob, carol)"]);
+        assert_eq!(resolved, vec!["grandparent(alice, carol)"]);
     }
 
     // ===== list tests =====
@@ -2451,7 +2443,7 @@ mod tests {
     #[test]
     fn list_traverse() {
         let resolved = run_success("f([]). f([X|T]) :- f(T).", "f([a, b, c]).");
-        assert_eq!(resolved, vec!["f([])"]);
+        assert_eq!(resolved, vec!["f([a, b, c])"]);
     }
 
     #[test]
@@ -2488,7 +2480,7 @@ mod tests {
     #[test]
     fn rule_chain_two_levels() {
         let resolved = run_success("a(X) :- b(X). b(X) :- c(X). c(foo).", "a(foo).");
-        assert_eq!(resolved, vec!["c(foo)"]);
+        assert_eq!(resolved, vec!["a(foo)"]);
     }
 
     #[test]
@@ -2497,13 +2489,13 @@ mod tests {
             "a(X) :- b(X). b(X) :- c(X). c(X) :- d(X). d(bar).",
             "a(bar).",
         );
-        assert_eq!(resolved, vec!["d(bar)"]);
+        assert_eq!(resolved, vec!["a(bar)"]);
     }
 
     #[test]
     fn rule_chain_with_var_binding() {
         let resolved = run_success("a(X) :- b(X). b(X) :- c(X). c(baz).", "a(Y).");
-        assert_eq!(resolved, vec!["c(baz)"]);
+        assert_eq!(resolved, vec!["a(baz)"]);
     }
 
     // ===== rule with nested struct tests =====
@@ -2514,13 +2506,13 @@ mod tests {
             "outer(X) :- inner(X). inner(pair(a, b)).",
             "outer(pair(a, b)).",
         );
-        assert_eq!(resolved, vec!["inner(pair(a, b))"]);
+        assert_eq!(resolved, vec!["outer(pair(a, b))"]);
     }
 
     #[test]
     fn rule_with_nested_struct_var_binding() {
         let resolved = run_success("outer(X) :- inner(X). inner(pair(a, b)).", "outer(Y).");
-        assert_eq!(resolved, vec!["inner(pair(a, b))"]);
+        assert_eq!(resolved, vec!["outer(pair(a, b))"]);
     }
 
     #[test]
@@ -2529,13 +2521,13 @@ mod tests {
             "wrap(X) :- data(X). data(node(leaf(a), leaf(b))).",
             "wrap(node(leaf(a), leaf(b))).",
         );
-        assert_eq!(resolved, vec!["data(node(leaf(a), leaf(b)))"]);
+        assert_eq!(resolved, vec!["wrap(node(leaf(a), leaf(b)))"]);
     }
 
     #[test]
     fn rule_shared_variable_in_body() {
         let resolved = run_success("same(X) :- eq(X, X). eq(a, a).", "same(a).");
-        assert_eq!(resolved, vec!["eq(a, a)"]);
+        assert_eq!(resolved, vec!["same(a)"]);
     }
 
     // ===== rule with multiple args =====
@@ -2546,7 +2538,7 @@ mod tests {
             "triple(X, Y, Z) :- first(X), second(Y), third(Z). first(a). second(b). third(c).",
             "triple(A, B, C).",
         );
-        assert_eq!(resolved, vec!["first(a)", "second(b)", "third(c)"]);
+        assert_eq!(resolved, vec!["triple(a, b, c)"]);
     }
 
     // ===== rule head with struct =====
@@ -2557,7 +2549,7 @@ mod tests {
             "make_pair(pair(X, Y)) :- left(X), right(Y). left(a). right(b).",
             "make_pair(pair(a, b)).",
         );
-        assert_eq!(resolved, vec!["left(a)", "right(b)"]);
+        assert_eq!(resolved, vec!["make_pair(pair(a, b))"]);
     }
 
     #[test]
@@ -2566,102 +2558,61 @@ mod tests {
             "make_pair(pair(X, Y)) :- left(X), right(Y). left(a). right(b).",
             "make_pair(P).",
         );
-        assert_eq!(resolved, vec!["left(a)", "right(b)"]);
+        assert_eq!(resolved, vec!["make_pair(pair(a, b))"]);
     }
 
     #[test]
     fn arith_with_user_defined_rule() {
-        // ob :- cube(1,1,1). main :- ob + cube(2,2,2).
-        // ob should be resolved to cube(1,1,1), then the whole thing becomes cube + cube
-        let resolved = run_success("ob :- cube(1,1,1). main :- ob + cube(2,2,2).", "main.");
-        assert_eq!(resolved, vec!["(cube(1, 1, 1) + cube(2, 2, 2))"]);
+        // shape は head 引数で明示的に受け渡す。
+        let resolved = run_success(
+            "ob(M) :- M = cube(1,1,1). main(M) :- ob(O), M = O + cube(2,2,2).",
+            "main(M).",
+        );
+        assert_eq!(resolved, vec!["main((cube(1, 1, 1) + cube(2, 2, 2)))"]);
     }
 
     #[test]
     fn arith_with_chained_rules() {
-        // ob :- foo. foo :- cube(1,1,1). main :- ob + cube(2,2,2).
         let resolved = run_success(
-            "ob :- foo. foo :- cube(1,1,1). main :- ob + cube(2,2,2).",
-            "main.",
+            "ob(M) :- foo(M). foo(M) :- M = cube(1,1,1). main(M) :- ob(O), M = O + cube(2,2,2).",
+            "main(M).",
         );
-        assert_eq!(resolved, vec!["(cube(1, 1, 1) + cube(2, 2, 2))"]);
+        assert_eq!(resolved, vec!["main((cube(1, 1, 1) + cube(2, 2, 2)))"]);
     }
 
     #[test]
     fn arith_with_pipe_and_rule() {
-        // ob :- cube(1,1,1) |> translate(p(0,0,0), p(10,0,0)). main :- ob + cube(2,2,2).
         let resolved = run_success(
-            "ob :- cube(1,1,1) |> translate(p(0,0,0), p(10,0,0)). main :- ob + cube(2,2,2).",
-            "main.",
+            "ob(M) :- M = cube(1,1,1) |> translate(p(0,0,0), p(10,0,0)). main(M) :- ob(O), M = O + cube(2,2,2).",
+            "main(M).",
         );
         assert_eq!(
             resolved,
-            vec![
-                "(translate(cube(1, 1, 1), p(0, 0, 0), p(10, 0, 0)) + cube(2, 2, 2))"
-            ]
+            vec!["main((translate(cube(1, 1, 1), p(0, 0, 0), p(10, 0, 0)) + cube(2, 2, 2)))"]
         );
     }
 
     #[test]
     fn arith_with_builtin_arg_clause_reference() {
         let resolved = run_success(
-            "cub :- cube(40,90,50). main :- (cub - rotate(cub, 0, 30, 0)).",
-            "main.",
+            "cub(M) :- M = cube(40,90,50). main(M) :- cub(C), M = (C - rotate(C, 0, 30, 0)).",
+            "main(M).",
         );
         assert_eq!(
             resolved,
-            vec!["(cube(40, 90, 50) - rotate(cube(40, 90, 50), 0, 30, 0))"]
+            vec!["main((cube(40, 90, 50) - rotate(cube(40, 90, 50), 0, 30, 0)))"]
         );
-    }
-
-    #[test]
-    fn builtin_arg_rule_with_control_separation() {
-        let resolved = run_success(
-            "blade_cut :- path(p(0, 0), [line_to(p(10, 0)), line_to(p(10, 20))]), control3d(p(X@0, Y@20, 0)). main :- linear_extrude(blade_cut, 100).",
-            "main.",
-        );
-        assert_eq!(resolved.len(), 2);
-        assert!(resolved[0].starts_with("linear_extrude(path("));
-        assert!(resolved[1].starts_with("control3d("));
-    }
-
-    #[test]
-    fn builtin_arg_rule_with_bom_separation() {
-        let resolved = run_success(
-            "part(X) :- cube(X, 10, 10), bom(\"cube\", []). main :- translate(part(5), p(0, 0, 0), p(10, 0, 0)).",
-            "main.",
-        );
-        assert_eq!(resolved.len(), 2);
-        assert!(resolved[0].starts_with("translate(cube("));
-        assert!(resolved[1].starts_with("bom("));
-    }
-
-    #[test]
-    fn infix_expr_with_bom_separation() {
-        let resolved = run_success(
-            "part :- cube(10, 10, 10), bom(\"cube\", []). main :- part + cube(5, 5, 5).",
-            "main.",
-        );
-        assert_eq!(resolved.len(), 2);
-        assert!(resolved[0].contains("+"));
-        assert!(resolved[1].starts_with("bom("));
-    }
-
-    #[test]
-    fn pipe_with_bom_separation() {
-        let resolved = run_success(
-            "part(X) :- cube(X, 10, 10), bom(\"cube\", []). main :- part(5) |> translate(p(0, 0, 0), p(10, 0, 0)).",
-            "main.",
-        );
-        assert_eq!(resolved.len(), 2);
-        assert!(resolved[0].starts_with("translate(cube("));
-        assert!(resolved[1].starts_with("bom("));
     }
 
     #[test]
     fn constraint_solving_binds_variable() {
-        let resolved = run_success("box(X+Y, Y) :- cube(X, Y, 10).", "box(7, 3).");
-        assert_eq!(resolved, vec!["cube(4, 3, 10)"]);
+        // head の X+Y=7, Y=3 → X=4。body の cube(X, Y, 10) に伝播し、MODEL が
+        // cube(4, 3, 10) に bind される。
+        let resolved = run_success(
+            "box(X+Y, Y, MODEL) :- MODEL = cube(X, Y, 10).",
+            "box(7, 3, M).",
+        );
+        assert_eq!(resolved, vec!["box(7, 3, cube(4, 3, 10))"]);
     }
 
     #[test]
@@ -2674,32 +2625,37 @@ mod tests {
 
     #[test]
     fn body_range_constraint() {
-        let resolved = run_success("foo(X) :- 0<X<10, cube(X, X, X).", "foo(5).");
-        assert_eq!(resolved, vec!["cube(5, 5, 5)"]);
+        let resolved = run_success(
+            "foo(X, MODEL) :- 0<X<10, MODEL = cube(X, X, X).",
+            "foo(5, M).",
+        );
+        assert_eq!(resolved, vec!["foo(5, cube(5, 5, 5))"]);
     }
 
     #[test]
     fn body_eq_constraint_with_rule() {
         let resolved = run_success(
-            "cut(SLIT, W, H) :- X=(W-SLIT)/2, sketch(p(X, 0), [line_to(p(SLIT+W, 0)), line_to(p(SLIT+W, H-20)), line_to(p(X, H-20))]).",
-            "cut(18, 40, 120).",
+            "cut(SLIT, W, H, MODEL) :- X=(W-SLIT)/2, MODEL = sketch(p(X, 0), [line_to(p(SLIT+W, 0)), line_to(p(SLIT+W, H-20)), line_to(p(X, H-20))]).",
+            "cut(18, 40, 120, M).",
         );
         assert_eq!(
             resolved,
-            vec!["sketch(p(11, 0), [line_to(p(58, 0)), line_to(p(58, 100)), line_to(p(11, 100))])"]
+            vec![
+                "cut(18, 40, 120, sketch(p(11, 0), [line_to(p(58, 0)), line_to(p(58, 100)), line_to(p(11, 100))]))"
+            ]
         );
     }
 
     #[test]
     fn constraint_solving_does_not_leak_across_scopes() {
         // f で X+Y=7, Y=3 → X=4。body は g(4, Z=2)。
-        // g(A, X) :- cube(A, X, X) で X_scope2 は 2 になるべき。
+        // g(A, X) :- ... で X_scope2 は 2 になるべき。
         // scope leak があると X_scope2 が 4 に汚染されて失敗する。
         let resolved = run_success(
-            "f(X+Y, Y, Z) :- g(X, Z). g(A, X) :- cube(A, X, X).",
-            "f(7, 3, 2).",
+            "f(X+Y, Y, Z, MODEL) :- g(X, Z, MODEL). g(A, X, MODEL) :- MODEL = cube(A, X, X).",
+            "f(7, 3, 2, M).",
         );
-        assert_eq!(resolved, vec!["cube(4, 2, 2)"]);
+        assert_eq!(resolved, vec!["f(7, 3, 2, cube(4, 2, 2))"]);
     }
 
     #[test]
@@ -2731,8 +2687,14 @@ mod tests {
             ),
         );
         let (min, max) = compute_term_range(&term).unwrap();
-        assert_eq!(min.unwrap().value, crate::rational::Rational::from_integer(0));
-        assert_eq!(max.unwrap().value, crate::rational::Rational::from_integer(15));
+        assert_eq!(
+            min.unwrap().value,
+            crate::rational::Rational::from_integer(0)
+        );
+        assert_eq!(
+            max.unwrap().value,
+            crate::rational::Rational::from_integer(15)
+        );
     }
 
     #[test]
@@ -2764,8 +2726,14 @@ mod tests {
             ),
         );
         let (min, max) = compute_term_range(&term).unwrap();
-        assert_eq!(min.unwrap().value, crate::rational::Rational::from_integer(-5));
-        assert_eq!(max.unwrap().value, crate::rational::Rational::from_integer(10));
+        assert_eq!(
+            min.unwrap().value,
+            crate::rational::Rational::from_integer(-5)
+        );
+        assert_eq!(
+            max.unwrap().value,
+            crate::rational::Rational::from_integer(10)
+        );
     }
 
     #[test]
@@ -2887,11 +2855,12 @@ wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(p(0, 0, 0), p(X, Y, H)).\n\
     #[test]
     fn body_eq_unifies_lists() {
         let mut db =
-            database("test :- L = [1, 2, 3], L = [A, B, C], cube(A, B, C).").expect("parse db");
-        let q = query("test.").expect("parse query").1;
+            database("test(MODEL) :- L = [1, 2, 3], L = [A, B, C], MODEL = cube(A, B, C).")
+                .expect("parse db");
+        let q = query("test(M).").expect("parse query").1;
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
-        assert_eq!(strs, vec!["cube(1, 2, 3)"]);
+        assert_eq!(strs, vec!["test(cube(1, 2, 3))"]);
     }
 
     /// body で構造体を変数に束縛し、後続の `=` で各フィールドを取り出せる。
@@ -2899,15 +2868,15 @@ wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(p(0, 0, 0), p(X, Y, H)).\n\
     #[test]
     fn body_eq_unifies_structs() {
         let mut db = database(
-            "test :- G = gp(g1, 1, 20, X@10, Y@20, T@5, 5),\n\
-                     G = gp(_, M, Z, _, _, _, _),\n\
-                     cube(M, Z, T).",
+            "test(MODEL) :- G = gp(g1, 1, 20, X@10, Y@20, T@5, 5),\n\
+                            G = gp(_, M, Z, _, _, _, _),\n\
+                            MODEL = cube(M, Z, T).",
         )
         .expect("parse db");
-        let q = query("test.").expect("parse query").1;
+        let q = query("test(M).").expect("parse query").1;
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
-        assert_eq!(strs, vec!["cube(1, 20, 5)"]);
+        assert_eq!(strs, vec!["test(cube(1, 20, 5))"]);
     }
 
     /// `=` の左右が parse 時には両方 Var でも、ランタイムで Struct に束縛されれば
@@ -2916,14 +2885,14 @@ wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(p(0, 0, 0), p(X, Y, H)).\n\
     fn body_eq_var_to_var_unifies_when_struct_bound_at_runtime() {
         let mut db = database(
             "mesh(GA, GB) :- GA = GB.\n\
-             test :- mesh(gp(g1, 1, M, X, Y), gp(g1, 1, 20, 30, 40)),\n\
-                     cube(M, X, Y).\n",
+             test(MODEL) :- mesh(gp(g1, 1, M, X, Y), gp(g1, 1, 20, 30, 40)),\n\
+                            MODEL = cube(M, X, Y).\n",
         )
         .expect("parse db");
-        let q = query("test.").expect("parse query").1;
+        let q = query("test(M).").expect("parse query").1;
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
-        assert_eq!(strs, vec!["cube(20, 30, 40)"]);
+        assert_eq!(strs, vec!["test(cube(20, 30, 40))"]);
     }
 
     /// リスト要素として埋め込まれた変数が、複数の述語呼び出しを跨いで束縛を共有する。
@@ -2934,28 +2903,18 @@ wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(p(0, 0, 0), p(X, Y, H)).\n\
     /// 続く show でも同じ B, C が値として展開され、cylinder(7, 7) / cylinder(3, 3) が出る。
     #[test]
     fn list_element_var_shared_across_predicates() {
+        // 制約 + リスト要素経由の変数共有が機能するかをチェック。
+        // 期待: B = 10-3 = 7、C = 10-B = 3。
         let db_src = "\
 constrain([_]).\n\
 constrain([A, B | Rest]) :- pair_eq(A, B), constrain([B | Rest]).\n\
 pair_eq(item(_, X), item(_, Y)) :- X + Y = 10.\n\
-show([]).\n\
-show([item(_, X) | R]) :- cylinder(X, X), show(R).\n\
-test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
-        show([item(a, 3), item(b, B), item(c, C)]).\n";
+test(B, C) :- constrain([item(a, 3), item(b, B), item(c, C)]).\n";
         let mut db = database(db_src).expect("parse db");
-        let q = query("test.").expect("parse query").1;
+        let q = query("test(B, C).").expect("parse query").1;
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
-        assert!(
-            strs.iter().any(|s| s == "cylinder(7, 7)"),
-            "B=7 should propagate through show: got {:?}",
-            strs
-        );
-        assert!(
-            strs.iter().any(|s| s == "cylinder(3, 3)"),
-            "C=3 should propagate through show: got {:?}",
-            strs
-        );
+        assert_eq!(strs, vec!["test(7, 3)"]);
     }
 
     /// 線形ソルバが歯車比 `Z1*T1 + Z2*T2 = 0` を T2 について解く。
@@ -2963,14 +2922,14 @@ test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
     /// Z1=20, Z2=40, T1=5 なら T2 = -2.5。
     #[test]
     fn linear_solver_solves_gear_ratio_for_t2() {
-        let db_src = "test(T2) :- Z1 = 20, Z2 = 40, T1 = 5,\n\
-                                 Z1 * T1 + Z2 * T2 = 0,\n\
-                                 cylinder(T2, T2).\n";
+        let db_src = "test(T2, MODEL) :- Z1 = 20, Z2 = 40, T1 = 5,\n\
+                                         Z1 * T1 + Z2 * T2 = 0,\n\
+                                         MODEL = cylinder(T2, T2).\n";
         let mut db = database(db_src).expect("parse db");
-        let q = query("test(T).").expect("parse query").1;
+        let q = query("test(T, M).").expect("parse query").1;
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
-        assert_eq!(strs, vec!["cylinder(-2.5, -2.5)"]);
+        assert_eq!(strs, vec!["test(-2.5, cylinder(-2.5, -2.5))"]);
     }
 
     /// 中心距離整合: `DX*DX + DY*DY = (M*(Z1+Z2)/2)^2` が定数だけで成り立つ場合は通る。
@@ -2978,18 +2937,18 @@ test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
     /// 30*30 + 0 = 900 = 30*30 で整合する。
     #[test]
     fn gear_distance_squared_form_matches() {
-        let db_src = "test :- M = 1, Z1 = 20, Z2 = 40,\n\
-                              X1 = 0, Y1 = 0, X2 = 30, Y2 = 0,\n\
-                              DX = X2 - X1, DY = Y2 - Y1,\n\
-                              DistSq = DX*DX + DY*DY,\n\
-                              R = M*(Z1+Z2)/2,\n\
-                              DistSq = R*R,\n\
-                              cube(M, Z1, Z2).\n";
+        let db_src = "test(MODEL) :- M = 1, Z1 = 20, Z2 = 40,\n\
+                                     X1 = 0, Y1 = 0, X2 = 30, Y2 = 0,\n\
+                                     DX = X2 - X1, DY = Y2 - Y1,\n\
+                                     DistSq = DX*DX + DY*DY,\n\
+                                     R = M*(Z1+Z2)/2,\n\
+                                     DistSq = R*R,\n\
+                                     MODEL = cube(M, Z1, Z2).\n";
         let mut db = database(db_src).expect("parse db");
-        let q = query("test.").expect("parse query").1;
+        let q = query("test(M).").expect("parse query").1;
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
-        assert_eq!(strs, vec!["cube(1, 20, 40)"]);
+        assert_eq!(strs, vec!["test(cube(1, 20, 40))"]);
     }
 
     /// 中心距離不整合: 距離が規格と合わなければ算術矛盾で実行が失敗する。
@@ -3018,39 +2977,36 @@ test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
     /// GUI でスライダーから T1 を変えた時の連動回転に対応。
     #[test]
     fn range_annotated_default_propagates_linearly() {
-        let db_src = "test(T1) :- -180 < T1 @ 0 < 180,\n\
-                                  T2 = 0 - T1,\n\
-                                  cylinder(5, T2).\n";
+        let db_src = "test(T1, MODEL) :- -180 < T1 @ 0 < 180,\n\
+                                          T2 = 0 - T1,\n\
+                                          MODEL = cylinder(5, T2).\n";
         let mut db = database(db_src).expect("parse db");
-        let q = query("test(30).").expect("parse query").1;
+        let q = query("test(30, M).").expect("parse query").1;
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
-        assert_eq!(strs, vec!["cylinder(5, -30)"]);
+        assert_eq!(strs, vec!["test(30, cylinder(5, -30))"]);
     }
 
     /// `assert_eq(L, R)` は両辺が等しければ結果に何も残さず通過する。
     #[test]
     fn assert_eq_passes_when_equal() {
-        let mut db = database(
-            "test :- X = 30, assert_eq(X*X, 900), cube(X, X, X).",
-        )
-        .expect("parse db");
-        let q = query("test.").expect("parse query").1;
+        // assert_eq が成功し続ければ test rule の head が resolve される。
+        let mut db = database("test(MODEL) :- X = 30, assert_eq(X*X, 900), MODEL = cube(X, X, X).")
+            .expect("parse db");
+        let q = query("test(M).").expect("parse query").1;
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
-        assert_eq!(strs, vec!["cube(30, 30, 30)"]);
+        assert_eq!(strs, vec!["test(cube(30, 30, 30))"]);
     }
 
     /// `assert_eq(L, R)` は両辺が異なれば RewriteError を返す。
     #[test]
     fn assert_eq_fails_when_unequal() {
-        let mut db = database("test :- assert_eq(2 + 2, 5), cube(1, 1, 1).")
-            .expect("parse db");
+        let mut db = database("test :- assert_eq(2 + 2, 5), cube(1, 1, 1).").expect("parse db");
         let q = query("test.").expect("parse query").1;
         let err = execute(&mut db, q).expect_err("assert_eq mismatch should fail");
         assert!(
-            err.error_message().contains("expected 4")
-                && err.error_message().contains("got 5"),
+            err.error_message().contains("expected 4") && err.error_message().contains("got 5"),
             "expected message to mention expected/got values: {}",
             err.error_message()
         );
@@ -3090,14 +3046,14 @@ test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
     fn linear_solver_propagates_through_rule_call() {
         let mut db = database(
             "foo(T1, T2) :- 40*T1 + 20*T2 = 0.\n\
-             test :- T1 = -10, foo(T1, T2), cylinder(T2, T2).",
+             test(MODEL) :- T1 = -10, foo(T1, T2), MODEL = cylinder(T2, T2).",
         )
         .expect("parse db");
-        let q = query("test.").expect("parse query").1;
+        let q = query("test(M).").expect("parse query").1;
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
         // T1 = -10, 40*(-10) + 20*T2 = 0 → T2 = 20
-        assert_eq!(strs, vec!["cylinder(20, 20)"]);
+        assert_eq!(strs, vec!["test(cylinder(20, 20))"]);
     }
 
     /// 線形ソルバの丸め許容: 非整除な除算でも、近似値で変数を束縛し連鎖を継続できる。
@@ -3108,25 +3064,23 @@ test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
     fn linear_solver_rounds_non_exact_division() {
         let mut db = database(
             "foo(T1, T2) :- 40*T1 + 30*T2 = 0.\n\
-             test :- T1 = -10, foo(T1, T2), cylinder(T2, T2).",
+             test(MODEL) :- T1 = -10, foo(T1, T2), MODEL = cylinder(T2, T2).",
         )
         .expect("parse db");
-        let q = query("test.").expect("parse query").1;
+        let q = query("test(M).").expect("parse query").1;
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
-        // 40*(-10) + 30*T2 = 0 → T2 = 400/30 = 13.333... → FixedPoint 13.33
-        assert_eq!(strs, vec!["cylinder(13.33, 13.33)"]);
+        // 40*(-10) + 30*T2 = 0 → T2 = 400/30 = 13.333...
+        assert_eq!(strs, vec!["test(cylinder(13.33, 13.33))"]);
     }
 
     /// assert_eq の不整合エラーが、非整除な値を含む場合に分数表記を併記する。
-    /// 旧 FixedPoint では `13.33` のような丸め値しか表示できず、誤差由来の偽の
-    /// 不整合と本物の不整合の区別が難しかった。Rational + fmt_exact なら
     /// `40/3 (≈ 13.33)` のように厳密値が見える。
     #[test]
     fn assert_eq_error_shows_exact_form_for_non_finite_decimal() {
         // 40/3 != 14 の不整合。期待値 40/3 (= 13.33...) が分数で表示される。
-        let mut db = database("test :- M = 40, D = 3, assert_eq(M/D, 14, \"ratio\").")
-            .expect("parse db");
+        let mut db =
+            database("test :- M = 40, D = 3, assert_eq(M/D, 14, \"ratio\").").expect("parse db");
         let q = query("test.").expect("parse query").1;
         let err = execute(&mut db, q).expect_err("should fail");
         let msg = err.error_message();
@@ -3202,8 +3156,7 @@ test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
         .expect("parse db");
         let mut resolver = ModuleResolver::new();
         let mut registry = FileRegistry::new();
-        let mut db =
-            resolve_modules(db_raw, &[], &mut resolver, &mut registry).expect("resolve");
+        let mut db = resolve_modules(db_raw, &[], &mut resolver, &mut registry).expect("resolve");
         let q = query("test(R).").expect("parse query").1;
         let err = execute(&mut db, q).expect_err("unknown field should fail");
         assert!(
@@ -3224,8 +3177,7 @@ test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
         .expect("parse db");
         let mut resolver = ModuleResolver::new();
         let mut registry = FileRegistry::new();
-        let mut db =
-            resolve_modules(db_raw, &[], &mut resolver, &mut registry).expect("resolve");
+        let mut db = resolve_modules(db_raw, &[], &mut resolver, &mut registry).expect("resolve");
         let q = query("test(R).").expect("parse query").1;
         let err = execute(&mut db, q).expect_err("missing required field should fail");
         assert!(

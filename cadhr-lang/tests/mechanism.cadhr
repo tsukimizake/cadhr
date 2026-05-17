@@ -2,8 +2,7 @@
 %
 % NOTE: この .cadhr は cadhr-lang/tests/mechanism_integration.rs に include_str!
 %   され、テスト走行時に db_src 先頭に連結される。ライブラリとして配布する目的
-%   ではなく、新しい translate API (点ベース) と connecting-rod 系制約のテスト
-%   フィクスチャ。
+%   ではなく、translate API (点ベース) と connecting-rod 系制約のテストフィクスチャ。
 %
 % 部品レコード:
 %   gp(Name, Module, Teeth, X, Y, Theta, Thickness)
@@ -15,17 +14,15 @@
 %     - Thickness : 軸方向の厚み
 %
 % 使い方:
-%   main :- do_mech([
-%       gp(g1, 1, 20, 0,  0, T1@0, 5),
+%   main(T1, OUT) :- do_mech([
+%       gp(g1, 1, 20, 0,  0, T1, 5),
 %       gp(g2, 1, 40, 30, 0, T2,    5),
 %       gp(g3, 1, 20, 60, 0, T3,    5)
-%   ]).
+%   ], OUT).
 %
 % NOTE on tooth counts:
-%   cadhr-lang は 2 桁固定小数点 + 完全整除を要求する線形ソルバを使うため、
-%   隣接ペアの歯数比 (Z2/Z1) で割り切れる組み合わせを選ぶ必要がある。
-%   例: Z=20, 40, 20 や Z=15, 30, 60 は OK。Z=20, 40, 30 だと
-%   T3 = -40*T2/30 が割り切れず solver が解を出せない。
+%   cadhr-lang は Rational ベースの線形ソルバを使うので、隣接ペアの歯数比による
+%   T 計算は割り切れなくても厳密に解ける (Rational のまま伝播)。
 %
 % リスト要素として埋め込まれた T1, T2, T3 は同じ節のスコープに居るため、
 % 内部の mesh/2 制約で束縛が伝播し、render_part でその値が描画に反映される。
@@ -36,9 +33,9 @@
 %
 % translate(Shape, SrcPoint, DstPoint): 歯車中心 (ローカル原点 = p(0,0,0)) を
 % ワールド上の (X, Y, 0) に運ぶ。
-render_part(gp(_, M, Z, X, Y, T, Th)) :-
+render_part(gp(_, M, Z, X, Y, T, Th), MODEL) :-
     R = M*Z/2,
-    cylinder(R, Th)
+    MODEL = cylinder(R, Th)
         |> rotate(0, 0, T)
         |> translate(p(0, 0, 0), p(X, Y, 0)).
 
@@ -53,7 +50,6 @@ render_part(gp(_, M, Z, X, Y, T, Th)) :-
 % 3. 回転比: Z1*T1 + Z2*T2 = 0
 %    (外接歯車では歯数比に反比例し、回転は逆向き)
 %    この式は通常 T1 が既知で T2 を解く形になるため `=` で線形ソルバに渡す。
-%    ソルバの線形拡張により後続のサブゴールで T2 が定数として使える。
 mesh(gp(_, M, Z1, X1, Y1, T1, _), gp(_, M, Z2, X2, Y2, T2, _)) :-
     DX = X2 - X1,
     DY = Y2 - Y1,
@@ -63,9 +59,9 @@ mesh(gp(_, M, Z1, X1, Y1, T1, _), gp(_, M, Z2, X2, Y2, T2, _)) :-
 
 % ─────── トラバーサル ───────
 % 部品リストを 1 本の chain として扱い、隣接ペアごとに mesh/2 を適用、
-% 同時に各部品を描画する。
-do_mech([G]) :- render_part(G).
-do_mech([A, B | Rest]) :-
+% 同時に各部品を描画する。出力は描画モデルのリスト。
+do_mech([G], [M]) :- render_part(G, M).
+do_mech([A, B | Rest], [M | Ms]) :-
     mesh(A, B),
-    render_part(A),
-    do_mech([B | Rest]).
+    render_part(A, M),
+    do_mech([B | Rest], Ms).
