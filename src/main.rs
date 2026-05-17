@@ -127,9 +127,7 @@ fn init() -> (Model, Task<Msg>) {
                     model.next_preview_id = id + 1;
                 }
                 let ctx = make_ctx(&model);
-                tasks.push(
-                    ui::preview::generate(&p, ctx).map(move |m| Msg::Preview(id, m)),
-                );
+                tasks.push(ui::preview::generate(&p, ctx).map(move |m| Msg::Preview(id, m)));
                 model.previews.push(p);
             }
             return (model, Task::batch(tasks));
@@ -304,9 +302,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                         model.next_preview_id = id + 1;
                     }
                     let ctx = make_ctx(model);
-                    tasks.push(
-                        ui::preview::generate(&p, ctx).map(move |m| Msg::Preview(id, m)),
-                    );
+                    tasks.push(ui::preview::generate(&p, ctx).map(move |m| Msg::Preview(id, m)));
                     model.previews.push(p);
                 }
                 return Task::batch(tasks);
@@ -500,7 +496,9 @@ mod tests {
 
     fn fresh_model() -> Model {
         Model {
-            editor: text_editor::Content::with_text("main :- cube(10, 20, 30)."),
+            editor: text_editor::Content::with_text(
+                "main :- path(p(0,0), [line_to(p(X_OUT@30,0)), line_to(p(X_OUT,Y_OUT@20)), line_to(p(0,Y_OUT))]) |> rotateToXY |> linear_extrude(10).",
+            ),
             previews: vec![],
             next_preview_id: 0,
             current_file_path: None,
