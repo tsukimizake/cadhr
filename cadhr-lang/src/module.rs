@@ -1,9 +1,37 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::parse::{Clause, FileRegistry, Term, database};
 use crate::term_processor::is_builtin_functor;
+
+/// `#use` 解決の状態を管理する。
+///
+/// `in_progress` は現在 DFS で解決中のファイル集合 (真の cycle 検出用)。
+/// `loaded` は読み込み済みファイル → そのファイルの内部 #use 解決後の clauses
+/// (prefix/expose は適用前) のキャッシュ。ダイヤモンドインポート (A から std を
+/// `#use` し、B からも std と A を `#use` するようなケース) で同じファイルが
+/// 複数回 import されても、cache を返すことで再 parse を回避しつつ cycle と
+/// 誤検出しないようにする。
+pub struct ModuleResolver {
+    in_progress: HashSet<PathBuf>,
+    loaded: HashMap<PathBuf, Vec<Clause>>,
+}
+
+impl ModuleResolver {
+    pub fn new() -> Self {
+        Self {
+            in_progress: HashSet::new(),
+            loaded: HashMap::new(),
+        }
+    }
+}
+
+impl Default for ModuleResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug)]
 pub enum ModuleError {
@@ -55,7 +83,7 @@ impl std::error::Error for ModuleError {}
 pub fn resolve_modules(
     clauses: Vec<Clause>,
     include_paths: &[PathBuf],
-    visited: &mut HashSet<PathBuf>,
+    resolver: &mut ModuleResolver,
     file_registry: &mut FileRegistry,
 ) -> Result<Vec<Clause>, ModuleError> {
     let mut result = Vec::new();
@@ -63,7 +91,8 @@ pub fn resolve_modules(
     for clause in clauses {
         match clause {
             Clause::Use { path, expose, .. } => {
-                let resolved = resolve_use(&path, &expose, include_paths, visited, file_registry)?;
+                let resolved =
+                    resolve_use(&path, &expose, include_paths, resolver, file_registry)?;
                 result.extend(resolved);
             }
             other => result.push(other),
@@ -97,7 +126,7 @@ fn resolve_use(
     module_path: &str,
     expose: &[String],
     include_paths: &[PathBuf],
-    visited: &mut HashSet<PathBuf>,
+    resolver: &mut ModuleResolver,
     file_registry: &mut FileRegistry,
 ) -> Result<Vec<Clause>, ModuleError> {
     let file_path =
@@ -114,38 +143,49 @@ fn resolve_use(
         error: e,
     })?;
 
-    if !visited.insert(canonical.clone()) {
-        return Err(ModuleError::CyclicDependency { path: canonical });
-    }
+    // 既にロード済みなら parse をスキップしてキャッシュを使う (ダイヤモンドインポート対応)。
+    // 同じファイルを別経路で `#use` した場合でも、prefix/expose は呼び出しごとに
+    // 都度適用するため、キャッシュには prefix 前の状態を保持する。
+    let inner_clauses = if let Some(cached) = resolver.loaded.get(&canonical) {
+        cached.clone()
+    } else {
+        if !resolver.in_progress.insert(canonical.clone()) {
+            return Err(ModuleError::CyclicDependency { path: canonical });
+        }
 
-    let source = std::fs::read_to_string(&file_path).map_err(|e| ModuleError::IoError {
-        path: file_path.clone(),
-        error: e,
-    })?;
+        let source = std::fs::read_to_string(&file_path).map_err(|e| ModuleError::IoError {
+            path: file_path.clone(),
+            error: e,
+        })?;
 
-    let fid = file_registry.register(file_path.display().to_string(), source.clone());
+        let fid = file_registry.register(file_path.display().to_string(), source.clone());
 
-    let mut clauses = database(&source).map_err(|e| ModuleError::ParseError {
-        path: file_path.clone(),
-        message: format!("{:?}", e),
-    })?;
+        let mut clauses = database(&source).map_err(|e| ModuleError::ParseError {
+            path: file_path.clone(),
+            message: format!("{:?}", e),
+        })?;
 
-    for clause in &mut clauses {
-        set_file_id_in_clause(clause, fid);
-    }
+        for clause in &mut clauses {
+            set_file_id_in_clause(clause, fid);
+        }
 
-    let child_include_paths: Vec<PathBuf> = file_path
-        .parent()
-        .map(|p| vec![p.to_path_buf()])
-        .unwrap_or_default();
+        let child_include_paths: Vec<PathBuf> = file_path
+            .parent()
+            .map(|p| vec![p.to_path_buf()])
+            .unwrap_or_default();
 
-    let clauses = resolve_modules(clauses, &child_include_paths, visited, file_registry)?;
+        let clauses = resolve_modules(clauses, &child_include_paths, resolver, file_registry)?;
+
+        resolver.in_progress.remove(&canonical);
+        resolver.loaded.insert(canonical.clone(), clauses.clone());
+        clauses
+    };
 
     let module_name = module_name_from_path(module_path);
     let expose_set: HashSet<&str> = expose.iter().map(|s| s.as_str()).collect();
 
     let mut result = Vec::new();
-    for clause in clauses {
+    for clause in inner_clauses {
         let prefixed = prefix_clause(&clause, &module_name);
         result.push(prefixed);
 
@@ -300,11 +340,11 @@ mod tests {
             span: None,
         }];
 
-        let mut visited = HashSet::new();
+        let mut resolver = ModuleResolver::new();
         let result = resolve_modules(
             clauses,
             &[dir.path().to_path_buf()],
-            &mut visited,
+            &mut resolver,
             &mut FileRegistry::new(),
         )?;
 
@@ -378,6 +418,30 @@ mod tests {
         assert!(functors.contains(&"parts::bolt".to_string()));
     }
 
+    /// ダイヤモンドインポート: top が a と std を use、a も std を use する。
+    /// 古い実装では visited が DFS 後に削除されないため cyclic と誤検出していた。
+    /// loaded キャッシュを使うように修正したので成功するはず。
+    #[test]
+    fn test_diamond_import() {
+        let functors = resolve_test(
+            &[
+                ("std/db.cadhr", "shared(1).\n"),
+                ("a/db.cadhr", "#use(\"../std\").\nfoo(2).\n"),
+                ("top/db.cadhr", "#use(\"../std\").\n#use(\"../a\").\nbar(3).\n"),
+            ],
+            "top",
+            &[],
+        )
+        .unwrap();
+
+        // top 経由で std::shared が直接、A::std::shared が a 経由で取れる。
+        // 同じソース由来でも別名空間に居るだけなのでエラーにならない。
+        assert!(functors.iter().any(|f| f == "top::std::shared"));
+        assert!(functors.iter().any(|f| f == "top::a::std::shared"));
+        assert!(functors.iter().any(|f| f == "top::a::foo"));
+        assert!(functors.iter().any(|f| f == "top::bar"));
+    }
+
     #[test]
     fn test_non_use_clauses_preserved() {
         let clauses = vec![Clause::Fact(Term::Struct {
@@ -386,8 +450,9 @@ mod tests {
             span: None,
         })];
 
-        let mut visited = HashSet::new();
-        let result = resolve_modules(clauses, &[], &mut visited, &mut FileRegistry::new()).unwrap();
+        let mut resolver = ModuleResolver::new();
+        let result =
+            resolve_modules(clauses, &[], &mut resolver, &mut FileRegistry::new()).unwrap();
         assert_eq!(result.len(), 1);
         assert!(
             matches!(&result[0], Clause::Fact(Term::Struct { functor, .. }) if functor == "hello")

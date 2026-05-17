@@ -3,7 +3,7 @@ use cadhr_lang::collision::check_collisions;
 use cadhr_lang::manifold_bridge::{
     ControlPoint, ConversionError, EvaluatedNode, MeshGenerator, Model3D, extract_control_points,
 };
-use cadhr_lang::module::resolve_modules;
+use cadhr_lang::module::{ModuleResolver, resolve_modules};
 use cadhr_lang::parse::{
     FileRegistry, QueryParam, SrcSpan, collect_query_params, database, parse_error_span,
     query as parse_query, substitute_query_params,
@@ -169,7 +169,7 @@ pub fn run_mesh_job(params: MeshJobParams) -> MeshJobResult {
         let mut db = resolve_modules(
             db,
             &params.include_paths,
-            &mut std::collections::HashSet::new(),
+            &mut ModuleResolver::new(),
             &mut file_registry,
         )
         .map_err(|e| (format!("Module error: {}", e), None))?;
@@ -297,7 +297,7 @@ pub fn run_collision_job(params: CollisionJobParams) -> CollisionJobResult {
             let mut db = resolve_modules(
                 db,
                 &params.include_paths,
-                &mut std::collections::HashSet::new(),
+                &mut ModuleResolver::new(),
                 &mut file_registry,
             )
             .map_err(|e| (format!("Module error: {}", e), None))?;
