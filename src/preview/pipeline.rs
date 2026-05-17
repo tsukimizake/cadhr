@@ -243,6 +243,17 @@ impl Pipeline {
         queue.write_buffer(&inst.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
 
         if mesh_version != 0 && mesh_version != inst.uploaded_version {
+            // 空メッシュ (shape が 0 件) のときは buffer を作らずクリアする。
+            // wgpu の create_buffer_init は空 slice で panic するため。
+            if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+                inst.vertex_buffer = None;
+                inst.index_buffer = None;
+                inst.index_count = 0;
+                inst.edge_index_buffer = None;
+                inst.edge_index_count = 0;
+                inst.uploaded_version = mesh_version;
+                return;
+            }
             inst.vertex_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("vbuf"),
                 contents: bytemuck::cast_slice(&mesh.vertices),
