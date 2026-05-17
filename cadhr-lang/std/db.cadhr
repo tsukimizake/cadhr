@@ -1,0 +1,6 @@
+% cadhr 標準ライブラリ。
+%
+% interpreter のデフォルトクエリは ?- main(OUT). で、OUT は output レコード
+% (models / bom / controls の 3 フィールド) として解釈される。
+
+:- record output(models=[], bom=[], controls=[]).

@@ -166,9 +166,11 @@ pub fn run_mesh_job(params: MeshJobParams) -> MeshJobResult {
             let span = parse_error_span(&params.database, &e);
             format_error("Parse error", &format!("{:?}", e), span, &file_registry)
         })?;
+        let mut effective_include_paths = cadhr_lang::default_include_paths();
+        effective_include_paths.extend(params.include_paths.iter().cloned());
         let mut db = resolve_modules(
             db,
-            &params.include_paths,
+            &effective_include_paths,
             &mut ModuleResolver::new(),
             &mut file_registry,
         )
@@ -294,9 +296,11 @@ pub fn run_collision_job(params: CollisionJobParams) -> CollisionJobResult {
                 let span = parse_error_span(&params.database, &e);
                 format_error("Parse error", &format!("{:?}", e), span, &file_registry)
             })?;
+            let mut effective_include_paths = cadhr_lang::default_include_paths();
+            effective_include_paths.extend(params.include_paths.iter().cloned());
             let mut db = resolve_modules(
                 db,
-                &params.include_paths,
+                &effective_include_paths,
                 &mut ModuleResolver::new(),
                 &mut file_registry,
             )
