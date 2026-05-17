@@ -91,6 +91,18 @@ impl ScopedEnv {
         self.info.get(&root).and_then(|i| i.value.as_ref())
     }
 
+    /// (scope, name) の同値類における canonical (root) を返す。Union-Find のルートが自身と
+    /// 異なる場合のみ Some を返す (Var-Var unify によって他の Var と連結されているケース)。
+    /// 連結が無い (root == 自身) なら None。値 (Number 等) が bind されているかは無関係。
+    pub fn canonical_var(&self, scope: ScopeId, name: &str) -> Option<(ScopeId, String)> {
+        let root = self.find_immutable(scope, name);
+        if root == (scope, name.to_string()) {
+            None
+        } else {
+            Some(root)
+        }
+    }
+
     /// canonical の annotation に merge (self 優先)。
     pub fn merge_annotation(&mut self, scope: ScopeId, name: &str, value: VarAnnotation) {
         let root = self.find_mut(scope, name);
@@ -197,7 +209,26 @@ fn resolve_inner(term: &ScopedTerm, env: &ScopedEnv, depth: usize) -> ScopedTerm
                         resolved
                     }
                 }
-                None => term.clone(),
+                // 値 bind 無し: Var-Var unify (union) によって他の Var と同値類に連結されて
+                // いるなら canonical (root) の Var に正規化する。これがないと、user-defined
+                // predicate を介して unify された別 scope の同名 Var が、後段の (name, scope)
+                // 完全一致での substitution (例: extract_control_points の bare-Var unify)
+                // に拾われず、別物として残ってしまう。
+                None => {
+                    if let Some((canon_scope, canon_name)) = env.canonical_var(sid, name) {
+                        let canon_ann = env.get_annotation(canon_scope, &canon_name);
+                        Term::Var {
+                            name: canon_name,
+                            scope: canon_scope,
+                            default_value: default_value.clone().or(canon_ann.default_value),
+                            min: min.clone().or(canon_ann.min),
+                            max: max.clone().or(canon_ann.max),
+                            span: span.or(canon_ann.span),
+                        }
+                    } else {
+                        term.clone()
+                    }
+                }
             }
         }
         Term::InfixExpr { op, left, right } => {

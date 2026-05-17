@@ -2682,6 +2682,42 @@ mod tests {
         assert_eq!(cps[0].axis_ranges[1], Some((-100.0, 100.0)));
     }
 
+    /// 上のテストと同じ multi-reference 構造のまま、bare-Var unify 後に Model3D へ変換
+    /// できる (= user-defined predicate 経由で渡された CENTER も per-axis Var に置換され、
+    /// center2d の引数として値を取り出せる) ことを保証する。
+    #[test]
+    fn test_control_2d_unify_multi_reference_mesh_generation() {
+        use crate::parse::{database, query as parse_query};
+        use crate::term_rewrite::execute;
+
+        let mut db = database(
+            "main :- battery_box |> center3d(p(0,0,0)).
+             battery_box :-
+               (((sketch([p(0,0), p(X@20,0), p(X,Y@58), p(0,Y)]) |> center2d(CENTER))
+                 - inner(CENTER)) |> rotateToYZ |> linear_extrude(20))
+                 + (inner(CENTER) |> rotateToYZ |> linear_extrude(2)),
+               control2d(-100<CENTER<100).
+             inner(CENTER) :- sketch([p(0,0), p(XIN@14.6,0), p(XIN,INNERLEN@49.8), p(0,INNERLEN)])
+                |> center2d(CENTER).",
+        )
+        .unwrap();
+        let (_, q) = parse_query("main.").unwrap();
+        let (mut resolved, _) = execute(&mut db, q).unwrap();
+        let _cps = extract_control_points(&mut resolved, &Default::default());
+        let exprs: Vec<Model3D> = resolved
+            .iter()
+            .map(|t| Model3D::from_term(t))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Model3D conversion should not fail after control2d bare-Var unify: {:?}\n\
+                     resolved terms: {:#?}",
+                    e, resolved
+                )
+            });
+        assert!(!exprs.is_empty());
+    }
+
     /// 異なるスコープで同名 (POS) を別目的に使うケース。bare-Var unify の substitute は
     /// 同一名・同一スコープに限定されるべき (別スコープの POS を巻き込まない)。
     /// foo は POS@(0,0,0) を control3d で unify、bar は別の POS をそのまま translate に
