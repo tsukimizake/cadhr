@@ -233,7 +233,7 @@ pub fn run_mesh_job(params: MeshJobParams) -> MeshJobResult {
                 } else {
                     match (param.min.as_ref(), param.max.as_ref()) {
                         (Some(min), Some(max)) => (min.value.to_f64() + max.value.to_f64()) / 2.0,
-                        _ => 0.0,
+                        _ => continue,
                     }
                 };
                 values.insert(param.name.clone(), default);

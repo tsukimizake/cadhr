@@ -328,10 +328,15 @@ fn resolve_use(
             set_file_id_in_clause(clause, fid);
         }
 
-        let child_include_paths: Vec<PathBuf> = file_path
+        // 子ファイル内の `#use(...)` を解決するときの include path:
+        // 「子ファイルの親 dir」と「呼び出し側で指定された include_paths」を併用する。
+        // 後者を入れておかないと、ライブラリ (std など) が深いネスト #use 経由から
+        // 見えなくなる。
+        let mut child_include_paths: Vec<PathBuf> = file_path
             .parent()
             .map(|p| vec![p.to_path_buf()])
             .unwrap_or_default();
+        child_include_paths.extend(include_paths.iter().cloned());
 
         let clauses =
             resolve_modules_inner(clauses, &child_include_paths, resolver, file_registry)?;
