@@ -125,6 +125,19 @@ pub fn resolve_modules(
     resolver: &mut ModuleResolver,
     file_registry: &mut FileRegistry,
 ) -> Result<Vec<Clause>, ModuleError> {
+    let mut result = resolve_modules_inner(clauses, include_paths, resolver, file_registry)?;
+    // 全ファイルの #use 解決後、record decl テーブルから getter/setter rule を生成する。
+    // 再帰の途中で生成すると同じ rule が複数回 inject されるので、トップレベルでのみ実施。
+    result.extend(generate_record_predicates(&resolver.record_decls));
+    Ok(result)
+}
+
+fn resolve_modules_inner(
+    clauses: Vec<Clause>,
+    include_paths: &[PathBuf],
+    resolver: &mut ModuleResolver,
+    file_registry: &mut FileRegistry,
+) -> Result<Vec<Clause>, ModuleError> {
     let mut result = Vec::new();
 
     for clause in clauses {
@@ -136,7 +149,7 @@ pub fn resolve_modules(
             }
             Clause::RecordDecl { name, fields, span } => {
                 register_record_decl(resolver, &name, &fields)?;
-                // decl 自体も clauses にそのまま流す。auto-gen pass で参照する。
+                // decl 自体も clauses に残す。term_rewrite で make_NAME builtin が参照する。
                 result.push(Clause::RecordDecl { name, fields, span });
             }
             other => result.push(other),
@@ -144,6 +157,81 @@ pub fn resolve_modules(
     }
 
     Ok(result)
+}
+
+/// すべての登録済み record decl について、`NAME_FIELD/2` getter と
+/// `set_FIELD_of_NAME/3` setter Fact を auto-generate して返す。
+/// (make_NAME/2 は term_rewrite で builtin として処理する。)
+fn generate_record_predicates(decls: &HashMap<String, RecordDecl>) -> Vec<Clause> {
+    let mut result = Vec::new();
+    for decl in decls.values() {
+        let arity = decl.fields.len();
+        for (i, field) in decl.fields.iter().enumerate() {
+            // Getter: NAME_FIELD(NAME(_, ..., V, ..., _), V).
+            // V を i 番目に、他は無名 (`_`)。
+            let mut record_args = (0..arity)
+                .map(|_| anon_var())
+                .collect::<Vec<Term>>();
+            record_args[i] = named_var("V");
+            let record_pat = struct_term(&decl.name, record_args);
+            result.push(Clause::Fact(struct_term(
+                &format!("{}_{}", decl.name, field.name),
+                vec![record_pat, named_var("V")],
+            )));
+
+            // Setter: set_FIELD_of_NAME(V, NAME(_/Old, Others...), NAME(V, SameOthers...)).
+            // i 番目以外は同じ変数 (両 record で共有)、i 番目は新値 V。
+            let mut r0_args = Vec::with_capacity(arity);
+            let mut r1_args = Vec::with_capacity(arity);
+            for j in 0..arity {
+                if j == i {
+                    r0_args.push(anon_var()); // 旧値は破棄
+                    r1_args.push(named_var("V"));
+                } else {
+                    let shared = named_var(&format!("F{}", j));
+                    r0_args.push(shared.clone());
+                    r1_args.push(shared);
+                }
+            }
+            let r0 = struct_term(&decl.name, r0_args);
+            let r1 = struct_term(&decl.name, r1_args);
+            result.push(Clause::Fact(struct_term(
+                &format!("set_{}_of_{}", field.name, decl.name),
+                vec![named_var("V"), r0, r1],
+            )));
+        }
+    }
+    result
+}
+
+fn anon_var() -> Term {
+    Term::Var {
+        name: "_".to_string(),
+        scope: (),
+        default_value: None,
+        min: None,
+        max: None,
+        span: None,
+    }
+}
+
+fn named_var(name: &str) -> Term {
+    Term::Var {
+        name: name.to_string(),
+        scope: (),
+        default_value: None,
+        min: None,
+        max: None,
+        span: None,
+    }
+}
+
+fn struct_term(functor: &str, args: Vec<Term>) -> Term {
+    Term::Struct {
+        functor: functor.to_string(),
+        args,
+        span: None,
+    }
 }
 
 /// record decl をテーブルに登録する。同名既存 decl があれば field 構造を比較して
@@ -245,7 +333,8 @@ fn resolve_use(
             .map(|p| vec![p.to_path_buf()])
             .unwrap_or_default();
 
-        let clauses = resolve_modules(clauses, &child_include_paths, resolver, file_registry)?;
+        let clauses =
+            resolve_modules_inner(clauses, &child_include_paths, resolver, file_registry)?;
 
         resolver.in_progress.remove(&canonical);
         resolver.loaded.insert(canonical.clone(), clauses.clone());

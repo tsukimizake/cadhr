@@ -4,8 +4,8 @@ use std::fmt;
 
 use crate::constraint::{ArithEq, ArithExpr, solve_constraints};
 use crate::parse::{
-    ArithOp, Bound, Clause, QueryParam, ScopeId, ScopedTerm, SrcSpan, Term, VarAnnotation,
-    first_span, list, number, struc, var,
+    ArithOp, Bound, Clause, QueryParam, RecordField, ScopeId, ScopedTerm, SrcSpan, Term,
+    VarAnnotation, first_span, list, number, struc, var,
 };
 use crate::term_processor::{
     all_builtin_functors, is_builtin_functor, is_builtin_functor_with_arity, should_resolve_args,
@@ -1522,11 +1522,134 @@ fn try_rewrite_single_with_result(
     None
 }
 
+/// db から `Clause::RecordDecl` を抽出して name → fields の辞書を作る。
+/// make_NAME/2 builtin が field 位置と default 値を参照するために使う。
+fn extract_record_decls(db: &[Clause]) -> HashMap<String, Vec<RecordField>> {
+    let mut result = HashMap::new();
+    for clause in db {
+        if let Clause::RecordDecl { name, fields, .. } = clause {
+            result.insert(name.clone(), fields.clone());
+        }
+    }
+    result
+}
+
+/// `make_NAME(Spec, R)` builtin の本体。
+/// - `Spec` は `[field_name(value), ...]` 形式の List
+/// - 各 field について Spec を検索、見つからなければ default、default も無ければエラー
+/// - 構築した `NAME(v1, v2, ...)` を `R` と unify
+fn handle_make_record(
+    record_name: &str,
+    fields: &[RecordField],
+    spec_term: &ScopedTerm,
+    target_term: &ScopedTerm,
+    scope: ScopeId,
+    shared_env: &mut ScopedEnv,
+    span: Option<SrcSpan>,
+) -> Result<Vec<ScopedTerm>, RewriteError> {
+    let spec_resolved = resolve(spec_term, shared_env);
+    let items = match &spec_resolved {
+        Term::List { items, tail } => {
+            if tail.is_some() {
+                return Err(RewriteError {
+                    message: format!(
+                        "make_{} spec list must not have a tail",
+                        record_name
+                    ),
+                    goal: spec_resolved.clone(),
+                });
+            }
+            items.clone()
+        }
+        _ => {
+            return Err(RewriteError {
+                message: format!("make_{} spec must be a list", record_name),
+                goal: spec_resolved,
+            });
+        }
+    };
+
+    // Spec を field 名で索引化。重複指定はエラー (誤記検出)。
+    let mut by_field: HashMap<String, ScopedTerm> = HashMap::new();
+    for item in items {
+        let item_resolved = resolve(&item, shared_env);
+        match &item_resolved {
+            Term::Struct {
+                functor,
+                args,
+                ..
+            } if args.len() == 1 => {
+                if by_field.contains_key(functor) {
+                    return Err(RewriteError {
+                        message: format!(
+                            "make_{} spec contains duplicate field `{}`",
+                            record_name, functor
+                        ),
+                        goal: item_resolved.clone(),
+                    });
+                }
+                by_field.insert(functor.clone(), args[0].clone());
+            }
+            _ => {
+                return Err(RewriteError {
+                    message: format!(
+                        "make_{} spec items must be `field(value)` structs",
+                        record_name
+                    ),
+                    goal: item_resolved,
+                });
+            }
+        }
+    }
+
+    let mut record_args: Vec<ScopedTerm> = Vec::with_capacity(fields.len());
+    for field in fields {
+        if let Some(value) = by_field.remove(&field.name) {
+            record_args.push(value);
+        } else if let Some(default) = &field.default {
+            // default は unscoped (parse 時の `()` scope) なので、現在の scope を割り当てる。
+            record_args.push(assign_scope_to_term(default.clone(), scope, shared_env));
+        } else {
+            return Err(RewriteError {
+                message: format!(
+                    "make_{} missing field `{}` and no default available",
+                    record_name, field.name
+                ),
+                goal: spec_resolved,
+            });
+        }
+    }
+
+    if !by_field.is_empty() {
+        let unknown: Vec<_> = by_field.keys().cloned().collect();
+        return Err(RewriteError {
+            message: format!(
+                "make_{} spec contains unknown field(s): {}",
+                record_name,
+                unknown.join(", ")
+            ),
+            goal: spec_resolved,
+        });
+    }
+
+    let built = Term::Struct {
+        functor: record_name.to_string(),
+        args: record_args,
+        span,
+    };
+    unify(target_term.clone(), built, shared_env).map_err(|e| RewriteError {
+        message: format!("make_{} unify failed: {}", record_name, e.message),
+        goal: target_term.clone(),
+    })?;
+    Ok(vec![])
+}
+
 /// 項を深さ優先で再帰的に書き換える
 /// 書き換えが成功すれば書き換え後の項のリストを返す（複数になる場合がある）
 /// other_goals は書き換え中に発生した変数束縛を反映するため
 fn rewrite_term_recursive(
     db: &[Clause],
+    record_decls: &HashMap<String, Vec<RecordField>>,
     clause_counter: &mut usize,
     term: ScopedTerm,
     other_goals: &mut Vec<ScopedTerm>,
@@ -1540,6 +1663,27 @@ fn rewrite_term_recursive(
     if let Term::Struct { functor, args, span } = &term {
         if functor == "assert_eq" && (args.len() == 2 || args.len() == 3) {
             return handle_assert_eq(args, *span, shared_env);
+        }
+
+        // make_NAME(Spec, R): record decl テーブルに NAME があれば builtin として処理。
+        if args.len() == 2 {
+            if let Some(record_name) = functor.strip_prefix("make_") {
+                if let Some(fields) = record_decls.get(record_name) {
+                    let scope = match &args[1] {
+                        Term::Var { scope, .. } => *scope,
+                        _ => 0,
+                    };
+                    return handle_make_record(
+                        record_name,
+                        fields,
+                        &args[0],
+                        &args[1],
+                        scope,
+                        shared_env,
+                        *span,
+                    );
+                }
+            }
         }
     }
 
@@ -1573,8 +1717,14 @@ fn rewrite_term_recursive(
     {
         if is_builtin_functor_with_arity(functor, args.len()) {
             if should_resolve_args(functor) {
-                let resolved =
-                    resolve_builtin_fact_args(db, clause_counter, term, other_goals, shared_env)?;
+                let resolved = resolve_builtin_fact_args(
+                    db,
+                    record_decls,
+                    clause_counter,
+                    term,
+                    other_goals,
+                    shared_env,
+                )?;
                 return Ok(vec![resolved]);
             } else {
                 return Ok(vec![term]);
@@ -1594,6 +1744,7 @@ fn rewrite_term_recursive(
             let resolved_term = if functor_name.is_some_and(|f| should_resolve_args(f)) {
                 resolve_builtin_fact_args(
                     db,
+                    record_decls,
                     clause_counter,
                     resolved_term,
                     other_goals,
@@ -1625,8 +1776,14 @@ fn rewrite_term_recursive(
                 // しか伝播しないため、ここで明示的に行う必要がある。
                 propagate_defaults_to(&b, &mut remaining_body);
 
-                let resolved =
-                    rewrite_term_recursive(db, clause_counter, b, other_goals, shared_env)?;
+                let resolved = rewrite_term_recursive(
+                    db,
+                    record_decls,
+                    clause_counter,
+                    b,
+                    other_goals,
+                    shared_env,
+                )?;
                 all_resolved.extend(resolved);
 
                 // 再帰中に other_goals に新しい Eq が追加されたり、shared_env が
@@ -1642,10 +1799,22 @@ fn rewrite_term_recursive(
     // ルールにマッチしない場合、サブタームを再帰的に書き換える
     match term {
         Term::InfixExpr { op, left, right } => {
-            let new_left_terms =
-                rewrite_term_recursive(db, clause_counter, *left, other_goals, shared_env)?;
-            let new_right_terms =
-                rewrite_term_recursive(db, clause_counter, *right, other_goals, shared_env)?;
+            let new_left_terms = rewrite_term_recursive(
+                db,
+                record_decls,
+                clause_counter,
+                *left,
+                other_goals,
+                shared_env,
+            )?;
+            let new_right_terms = rewrite_term_recursive(
+                db,
+                record_decls,
+                clause_counter,
+                *right,
+                other_goals,
+                shared_env,
+            )?;
 
             // メタデータ(bom等)やcontrol2d/control3dをother_goalsへ分離し、シェイプだけ残す
             let (left_shapes, left_meta): (Vec<_>, Vec<_>) =
@@ -1732,6 +1901,7 @@ fn rewrite_term_recursive(
 /// リテラル/変数はそのまま、リストは中身を再帰的に解決、それ以外は書き換えて1つに解決する。
 fn resolve_builtin_arg(
     db: &[Clause],
+    record_decls: &HashMap<String, Vec<RecordField>>,
     clause_counter: &mut usize,
     term: ScopedTerm,
     other_goals: &mut Vec<ScopedTerm>,
@@ -1742,7 +1912,16 @@ fn resolve_builtin_arg(
         Term::List { items, tail } => {
             let resolved_items = items
                 .into_iter()
-                .map(|item| resolve_builtin_arg(db, clause_counter, item, other_goals, shared_env))
+                .map(|item| {
+                    resolve_builtin_arg(
+                        db,
+                        record_decls,
+                        clause_counter,
+                        item,
+                        other_goals,
+                        shared_env,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Term::List {
                 items: resolved_items,
@@ -1756,7 +1935,16 @@ fn resolve_builtin_arg(
         } if is_builtin_functor(&functor) => {
             let resolved_args = args
                 .into_iter()
-                .map(|arg| resolve_builtin_arg(db, clause_counter, arg, other_goals, shared_env))
+                .map(|arg| {
+                    resolve_builtin_arg(
+                        db,
+                        record_decls,
+                        clause_counter,
+                        arg,
+                        other_goals,
+                        shared_env,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Term::Struct {
                 functor,
@@ -1765,9 +1953,22 @@ fn resolve_builtin_arg(
             })
         }
         Term::InfixExpr { op, left, right } => {
-            let new_left = resolve_builtin_arg(db, clause_counter, *left, other_goals, shared_env)?;
-            let new_right =
-                resolve_builtin_arg(db, clause_counter, *right, other_goals, shared_env)?;
+            let new_left = resolve_builtin_arg(
+                db,
+                record_decls,
+                clause_counter,
+                *left,
+                other_goals,
+                shared_env,
+            )?;
+            let new_right = resolve_builtin_arg(
+                db,
+                record_decls,
+                clause_counter,
+                *right,
+                other_goals,
+                shared_env,
+            )?;
             Ok(Term::InfixExpr {
                 op,
                 left: Box::new(new_left),
@@ -1775,13 +1976,18 @@ fn resolve_builtin_arg(
             })
         }
         other => {
-            let mut resolved =
-                rewrite_term_recursive(db, clause_counter, other, other_goals, shared_env)?;
+            let mut resolved = rewrite_term_recursive(
+                db,
+                record_decls,
+                clause_counter,
+                other,
+                other_goals,
+                shared_env,
+            )?;
             if resolved.len() > 1 {
                 let mut shape = Vec::new();
                 for t in resolved {
-                    if is_control_term(&t) || is_metadata_term(&t)
-                    {
+                    if is_control_term(&t) || is_metadata_term(&t) {
                         other_goals.push(t);
                     } else {
                         shape.push(t);
@@ -1804,6 +2010,7 @@ fn resolve_builtin_arg(
 
 fn resolve_builtin_fact_args(
     db: &[Clause],
+    record_decls: &HashMap<String, Vec<RecordField>>,
     clause_counter: &mut usize,
     term: ScopedTerm,
     other_goals: &mut Vec<ScopedTerm>,
@@ -1820,7 +2027,16 @@ fn resolve_builtin_fact_args(
 
     let resolved_args = args
         .into_iter()
-        .map(|arg| resolve_builtin_arg(db, clause_counter, arg, other_goals, shared_env))
+        .map(|arg| {
+            resolve_builtin_arg(
+                db,
+                record_decls,
+                clause_counter,
+                arg,
+                other_goals,
+                shared_env,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Term::Struct {
@@ -1840,6 +2056,9 @@ pub fn execute(
     let mut db_with_builtins = db.to_vec();
     db_with_builtins.extend(builtin_cad_facts());
 
+    // record decl テーブルを db から抽出。make_NAME builtin の引数解決に使う。
+    let record_decls = extract_record_decls(&db_with_builtins);
+
     let scoped_query: Vec<ScopedTerm> = query
         .into_iter()
         .map(|t| assign_scope_to_term(t, 0, &mut shared_env))
@@ -1849,6 +2068,7 @@ pub fn execute(
         let mut other_goals = Vec::new();
         let resolved = rewrite_term_recursive(
             &db_with_builtins,
+            &record_decls,
             &mut clause_counter,
             term,
             &mut other_goals,
@@ -1904,6 +2124,21 @@ mod tests {
             execute(&mut db, q).is_err(),
             "Expected failure, got success"
         );
+    }
+
+    /// `:- record ...` 宣言を含む db をテストするヘルパ。
+    /// resolve_modules を介して auto-generated getter/setter を db に展開してから execute する。
+    fn run_with_records(db_src: &str, query_src: &str) -> Vec<String> {
+        use crate::module::{ModuleResolver, resolve_modules};
+        use crate::parse::FileRegistry;
+        let db_raw = database(db_src).expect("failed to parse db");
+        let mut resolver = ModuleResolver::new();
+        let mut registry = FileRegistry::new();
+        let mut db = resolve_modules(db_raw, &[], &mut resolver, &mut registry)
+            .expect("resolve modules");
+        let q = query(query_src).expect("failed to parse query").1;
+        let (resolved, _env) = execute(&mut db, q).expect("Expected success");
+        resolved.iter().map(|t| format!("{:?}", t)).collect()
     }
 
     // ===== unify tests =====
@@ -2912,6 +3147,90 @@ test :- constrain([item(a, 3), item(b, B), item(c, C)]),\n\
         assert!(
             err.error_message().contains("cannot evaluate"),
             "expected 'cannot evaluate' in: {}",
+            err.error_message()
+        );
+    }
+
+    // ===== record tests =====
+    //
+    // make_NAME / NAME_FIELD / set_FIELD_of_NAME の正しさは、束縛された変数を
+    // assert_eq で観測することで間接的に確認する (現状の暗黙 Model セマンティクスでは
+    // 述語の引数束縛が直接 result list に出ないため)。
+
+    #[test]
+    fn record_getter_extracts_field_by_position() {
+        // R = point(3, 4) → point_x(R, X) → X = 3
+        let db = ":- record point(x=0, y=0).\n\
+                  test :- R = point(3, 4), point_x(R, X), assert_eq(X, 3).";
+        run_with_records(db, "test.");
+    }
+
+    #[test]
+    fn record_setter_replaces_one_field() {
+        // R0 = point(1, 2), set_x_of_point(9, R0, R1) → R1 = point(9, 2)
+        let db = ":- record point(x=0, y=0).\n\
+                  test :- R0 = point(1, 2), set_x_of_point(9, R0, R1), \
+                  point_x(R1, X), point_y(R1, Y), assert_eq(X, 9), assert_eq(Y, 2).";
+        run_with_records(db, "test.");
+    }
+
+    #[test]
+    fn make_record_uses_defaults_for_omitted_fields() {
+        // make_point([x(3)], R) → R = point(3, 0) (y は default 0)
+        let db = ":- record point(x=0, y=0).\n\
+                  test :- make_point([x(3)], R), point_x(R, X), point_y(R, Y), \
+                  assert_eq(X, 3), assert_eq(Y, 0).";
+        run_with_records(db, "test.");
+    }
+
+    #[test]
+    fn make_record_all_fields_specified() {
+        let db = ":- record point(x=0, y=0).\n\
+                  test :- make_point([x(3), y(4)], R), point_x(R, X), point_y(R, Y), \
+                  assert_eq(X, 3), assert_eq(Y, 4).";
+        run_with_records(db, "test.");
+    }
+
+    #[test]
+    fn make_record_rejects_unknown_field() {
+        use crate::module::{ModuleResolver, resolve_modules};
+        use crate::parse::FileRegistry;
+        let db_raw = database(
+            ":- record point(x=0, y=0).\n\
+             test(R) :- make_point([z(99)], R).",
+        )
+        .expect("parse db");
+        let mut resolver = ModuleResolver::new();
+        let mut registry = FileRegistry::new();
+        let mut db =
+            resolve_modules(db_raw, &[], &mut resolver, &mut registry).expect("resolve");
+        let q = query("test(R).").expect("parse query").1;
+        let err = execute(&mut db, q).expect_err("unknown field should fail");
+        assert!(
+            err.error_message().contains("unknown field"),
+            "expected unknown field error, got: {}",
+            err.error_message()
+        );
+    }
+
+    #[test]
+    fn make_record_missing_field_no_default_fails() {
+        use crate::module::{ModuleResolver, resolve_modules};
+        use crate::parse::FileRegistry;
+        let db_raw = database(
+            ":- record point(x, y=0).\n\
+             test(R) :- make_point([], R).",
+        )
+        .expect("parse db");
+        let mut resolver = ModuleResolver::new();
+        let mut registry = FileRegistry::new();
+        let mut db =
+            resolve_modules(db_raw, &[], &mut resolver, &mut registry).expect("resolve");
+        let q = query("test(R).").expect("parse query").1;
+        let err = execute(&mut db, q).expect_err("missing required field should fail");
+        assert!(
+            err.error_message().contains("missing field"),
+            "expected missing field error, got: {}",
             err.error_message()
         );
     }
