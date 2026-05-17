@@ -2,8 +2,17 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::parse::{Clause, FileRegistry, Term, database};
+use crate::parse::{Clause, FileRegistry, RecordField, Term, database};
 use crate::term_processor::is_builtin_functor;
+
+/// `:- record NAME(...).` を実行時参照しやすい形に保管したもの。
+/// `make_NAME/2` builtin の引数解決と `NAME_FIELD/2` / `set_FIELD_of_NAME/3`
+/// 自動生成の両方で参照される。
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordDecl {
+    pub name: String,
+    pub fields: Vec<RecordField>,
+}
 
 /// `#use` 解決の状態を管理する。
 ///
@@ -16,6 +25,9 @@ use crate::term_processor::is_builtin_functor;
 pub struct ModuleResolver {
     in_progress: HashSet<PathBuf>,
     loaded: HashMap<PathBuf, Vec<Clause>>,
+    /// resolve_modules を通じて収集された record 宣言。グローバル名前空間。
+    /// 同名 decl の重複は field 構造が一致すれば idempotent、不一致ならエラー。
+    pub record_decls: HashMap<String, RecordDecl>,
 }
 
 impl ModuleResolver {
@@ -23,6 +35,7 @@ impl ModuleResolver {
         Self {
             in_progress: HashSet::new(),
             loaded: HashMap::new(),
+            record_decls: HashMap::new(),
         }
     }
 }
@@ -50,6 +63,13 @@ pub enum ModuleError {
         path: PathBuf,
         error: std::io::Error,
     },
+    /// 同名 record decl が異なる field 構造で複数定義された。
+    /// ダイヤモンドインポートで同一ソース由来の場合は idempotent なので発生しない。
+    RecordDeclConflict {
+        name: String,
+        first: Vec<RecordField>,
+        second: Vec<RecordField>,
+    },
 }
 
 impl fmt::Display for ModuleError {
@@ -74,6 +94,25 @@ impl fmt::Display for ModuleError {
             ModuleError::IoError { path, error } => {
                 write!(f, "IO error reading {}: {}", path.display(), error)
             }
+            ModuleError::RecordDeclConflict {
+                name,
+                first,
+                second,
+            } => {
+                let field_summary = |fs: &[RecordField]| {
+                    fs.iter()
+                        .map(|f| f.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                write!(
+                    f,
+                    "record decl conflict for `{}`: first=({}), second=({})",
+                    name,
+                    field_summary(first),
+                    field_summary(second),
+                )
+            }
         }
     }
 }
@@ -95,11 +134,43 @@ pub fn resolve_modules(
                     resolve_use(&path, &expose, include_paths, resolver, file_registry)?;
                 result.extend(resolved);
             }
+            Clause::RecordDecl { name, fields, span } => {
+                register_record_decl(resolver, &name, &fields)?;
+                // decl 自体も clauses にそのまま流す。auto-gen pass で参照する。
+                result.push(Clause::RecordDecl { name, fields, span });
+            }
             other => result.push(other),
         }
     }
 
     Ok(result)
+}
+
+/// record decl をテーブルに登録する。同名既存 decl があれば field 構造を比較して
+/// 完全一致なら idempotent (黙って許容)、不一致ならエラー。
+fn register_record_decl(
+    resolver: &mut ModuleResolver,
+    name: &str,
+    fields: &[RecordField],
+) -> Result<(), ModuleError> {
+    if let Some(existing) = resolver.record_decls.get(name) {
+        if existing.fields == fields {
+            return Ok(());
+        }
+        return Err(ModuleError::RecordDeclConflict {
+            name: name.to_string(),
+            first: existing.fields.clone(),
+            second: fields.to_vec(),
+        });
+    }
+    resolver.record_decls.insert(
+        name.to_string(),
+        RecordDecl {
+            name: name.to_string(),
+            fields: fields.to_vec(),
+        },
+    );
+    Ok(())
 }
 
 fn find_module_file(module_path: &str, include_paths: &[PathBuf]) -> Option<PathBuf> {
@@ -203,7 +274,7 @@ fn clause_head_functor(clause: &Clause) -> Option<String> {
     match clause {
         Clause::Fact(term) => term_functor(term),
         Clause::Rule { head, .. } => term_functor(head),
-        Clause::Use { .. } => None,
+        Clause::Use { .. } | Clause::RecordDecl { .. } => None,
     }
 }
 
@@ -221,7 +292,9 @@ fn prefix_clause(clause: &Clause, module_name: &str) -> Clause {
             head: prefix_term(head, module_name),
             body: body.iter().map(|t| prefix_term(t, module_name)).collect(),
         },
-        Clause::Use { .. } => clause.clone(),
+        // RecordDecl はグローバル decl テーブルに乗るので prefix しない。
+        // Use directive はクライアントが直接使うことがないのでそのまま。
+        Clause::Use { .. } | Clause::RecordDecl { .. } => clause.clone(),
     }
 }
 
@@ -272,6 +345,16 @@ fn set_file_id_in_clause(clause: &mut Clause, file_id: u16) {
         Clause::Use { span, .. } => {
             if let Some(s) = span {
                 s.file_id = file_id;
+            }
+        }
+        Clause::RecordDecl { fields, span, .. } => {
+            if let Some(s) = span {
+                s.file_id = file_id;
+            }
+            for field in fields {
+                if let Some(default) = &mut field.default {
+                    set_file_id_in_term(default, file_id);
+                }
             }
         }
     }
@@ -416,6 +499,72 @@ mod tests {
         .unwrap();
 
         assert!(functors.contains(&"parts::bolt".to_string()));
+    }
+
+    /// ダイヤモンドインポートで同じ record decl が複数経路から来ても、
+    /// field 構造が一致するので idempotent に扱われる。
+    #[test]
+    fn test_diamond_import_record_decl_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let std_path = dir.path().join("std/db.cadhr");
+        let a_path = dir.path().join("a/db.cadhr");
+        let top_path = dir.path().join("top/db.cadhr");
+        for (full, contents) in &[
+            (&std_path, ":- record output(models=[], bom=[]).\n"),
+            (&a_path, "#use(\"../std\").\n"),
+            (&top_path, "#use(\"../std\").\n#use(\"../a\").\n"),
+        ] {
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, contents).unwrap();
+        }
+
+        let clauses = vec![Clause::Use {
+            path: "top".to_string(),
+            expose: vec![],
+            span: None,
+        }];
+
+        let mut resolver = ModuleResolver::new();
+        let _ = resolve_modules(
+            clauses,
+            &[dir.path().to_path_buf()],
+            &mut resolver,
+            &mut FileRegistry::new(),
+        )
+        .expect("diamond record decl should be idempotent");
+        assert!(resolver.record_decls.contains_key("output"));
+    }
+
+    /// 同名 record を field 構造の異なる形で 2 つ定義するとエラー。
+    #[test]
+    fn test_record_decl_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a/db.cadhr");
+        let b_path = dir.path().join("b/db.cadhr");
+        let top_path = dir.path().join("top/db.cadhr");
+        for (full, contents) in &[
+            (&a_path, ":- record output(models=[]).\n"),
+            (&b_path, ":- record output(models=[], bom=[]).\n"),
+            (&top_path, "#use(\"../a\").\n#use(\"../b\").\n"),
+        ] {
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, contents).unwrap();
+        }
+
+        let clauses = vec![Clause::Use {
+            path: "top".to_string(),
+            expose: vec![],
+            span: None,
+        }];
+
+        let mut resolver = ModuleResolver::new();
+        let result = resolve_modules(
+            clauses,
+            &[dir.path().to_path_buf()],
+            &mut resolver,
+            &mut FileRegistry::new(),
+        );
+        assert!(matches!(result, Err(ModuleError::RecordDeclConflict { .. })));
     }
 
     /// ダイヤモンドインポート: top が a と std を use、a も std を use する。

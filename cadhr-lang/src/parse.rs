@@ -286,6 +286,21 @@ impl<Scope: PartialEq> PartialEq for Term<Scope> {
 }
 
 #[derive(Clone, PartialEq)]
+pub struct RecordField<Scope = ()> {
+    pub name: String,
+    pub default: Option<Term<Scope>>,
+}
+
+impl<S> fmt::Debug for RecordField<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.default {
+            Some(d) => write!(f, "{}={:?}", self.name, d),
+            None => write!(f, "{}", self.name),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub enum Clause<Scope = ()> {
     Fact(Term<Scope>),
     Rule {
@@ -295,6 +310,16 @@ pub enum Clause<Scope = ()> {
     Use {
         path: String,
         expose: Vec<String>,
+        span: Option<SrcSpan>,
+    },
+    /// `:- record NAME(FIELD, FIELD=DEFAULT, ...).` ディレクティブ。
+    /// SWI-Prolog の library(record) を参考に、名前付き field をもつレコードを宣言する。
+    /// resolve_modules 時に decl テーブルに登録され、`NAME_FIELD/2` (getter) と
+    /// `set_FIELD_of_NAME/3` (setter) が Rule として自動 inject される。
+    /// `make_NAME/2` は decl テーブルを参照する builtin として処理される。
+    RecordDecl {
+        name: String,
+        fields: Vec<RecordField<Scope>>,
         span: Option<SrcSpan>,
     },
 }
@@ -389,6 +414,19 @@ impl fmt::Debug for Clause {
                 write!(f, "#use(\"{}\"", path)?;
                 if !expose.is_empty() {
                     write!(f, ", expose({:?})", expose)?;
+                }
+                write!(f, ").")
+            }
+            Clause::RecordDecl { name, fields, .. } => {
+                write!(f, ":- record {}(", name)?;
+                for (idx, field) in fields.iter().enumerate() {
+                    if idx > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", field.name)?;
+                    if let Some(default) = &field.default {
+                        write!(f, "={:?}", default)?;
+                    }
                 }
                 write!(f, ").")
             }
@@ -962,6 +1000,41 @@ fn use_expose_list(input: &str) -> PResult<'_, Vec<String>> {
     .parse(input)
 }
 
+/// `:- record NAME(FIELD, FIELD=DEFAULT, ...).` を Clause::RecordDecl にパースする。
+/// FIELD は atom、DEFAULT は任意の term (パイプ式まで)。
+fn record_directive(input: &str) -> PResult<'_, Clause> {
+    let (input, _) = space_or_comment0(input)?;
+    let start = input.as_ptr() as usize;
+    let (input, _) = tag(":-")(input)?;
+    let (input, _) = ws(tag("record")).parse(input)?;
+    let (input, name) = ws(atom).parse(input)?;
+    let (input, _) = char('(').parse(input)?;
+    let (input, fields) = separated_list0(
+        ws(char(',')),
+        ws(map(
+            pair(atom, opt(preceded(ws(char('=')), term))),
+            |(name, default)| RecordField { name, default },
+        )),
+    )
+    .parse(input)?;
+    let (input, _) = cut(ws(char(')'))).parse(input)?;
+    let end = input.as_ptr() as usize;
+    let (input, _) = cut(ws(char('.'))).parse(input)?;
+    let span = SrcSpan {
+        start,
+        end,
+        file_id: 0,
+    };
+    Ok((
+        input,
+        Clause::RecordDecl {
+            name,
+            fields,
+            span: Some(span),
+        },
+    ))
+}
+
 fn use_directive(input: &str) -> PResult<'_, Clause> {
     let (input, _) = space_or_comment0(input)?;
     let start = input.as_ptr() as usize;
@@ -1011,6 +1084,7 @@ fn has_range_in_term(term: &Term) -> bool {
 pub(super) fn clause_parser(input: &str) -> PResult<'_, Clause> {
     let (input, clause) = alt((
         use_directive,
+        record_directive,
         ws(terminated(
             alt((
                 map(
@@ -1027,7 +1101,7 @@ pub(super) fn clause_parser(input: &str) -> PResult<'_, Clause> {
     let head = match &clause {
         Clause::Rule { head, .. } => Some(head),
         Clause::Fact(head) => Some(head),
-        Clause::Use { .. } => None,
+        Clause::Use { .. } | Clause::RecordDecl { .. } => None,
     };
     if let Some(head) = head {
         if has_range_in_term(head) {
@@ -1095,6 +1169,17 @@ fn fix_spans_in_clause(clause: &mut Clause, base: usize) {
             if let Some(s) = span {
                 s.start = s.start.wrapping_sub(base);
                 s.end = s.end.wrapping_sub(base);
+            }
+        }
+        Clause::RecordDecl { fields, span, .. } => {
+            if let Some(s) = span {
+                s.start = s.start.wrapping_sub(base);
+                s.end = s.end.wrapping_sub(base);
+            }
+            for field in fields.iter_mut() {
+                if let Some(default) = &mut field.default {
+                    fix_spans_in_term(default, base);
+                }
             }
         }
     }
@@ -1272,6 +1357,41 @@ mod tests {
                 ],
             },
         );
+    }
+
+    #[test]
+    fn parse_record_decl_no_defaults() {
+        let (_, parsed) = clause_parser(":- record point(x, y).").unwrap();
+        match parsed {
+            Clause::RecordDecl { name, fields, .. } => {
+                assert_eq!(name, "point");
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name, "x");
+                assert!(fields[0].default.is_none());
+                assert_eq!(fields[1].name, "y");
+                assert!(fields[1].default.is_none());
+            }
+            _ => panic!("expected RecordDecl, got {:?}", parsed),
+        }
+    }
+
+    #[test]
+    fn parse_record_decl_with_defaults() {
+        let (_, parsed) =
+            clause_parser(":- record output(models=[], bom=[], controls=[]).").unwrap();
+        match parsed {
+            Clause::RecordDecl { name, fields, .. } => {
+                assert_eq!(name, "output");
+                assert_eq!(fields.len(), 3);
+                for field in &fields {
+                    assert!(matches!(
+                        &field.default,
+                        Some(Term::List { items, tail }) if items.is_empty() && tail.is_none()
+                    ));
+                }
+            }
+            _ => panic!("expected RecordDecl, got {:?}", parsed),
+        }
     }
 
     #[test]

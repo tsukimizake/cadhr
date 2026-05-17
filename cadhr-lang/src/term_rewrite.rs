@@ -1405,6 +1405,17 @@ fn assign_scope_to_clause(
                 .collect(),
         },
         Clause::Use { path, expose, span } => Clause::Use { path, expose, span },
+        Clause::RecordDecl { name, fields, span } => Clause::RecordDecl {
+            name,
+            fields: fields
+                .into_iter()
+                .map(|f| crate::parse::RecordField {
+                    name: f.name,
+                    default: f.default.map(|d| assign_scope_to_term(d, scope_id, env)),
+                })
+                .collect(),
+            span,
+        },
     }
 }
 
@@ -1490,7 +1501,7 @@ fn try_rewrite_single_with_result(
         let (head, body) = match scoped {
             Clause::Fact(t) => (t, vec![]),
             Clause::Rule { head, body } => (head, body),
-            Clause::Use { .. } => continue,
+            Clause::Use { .. } | Clause::RecordDecl { .. } => continue,
         };
 
         let mut trial_env = shared_env.clone();
