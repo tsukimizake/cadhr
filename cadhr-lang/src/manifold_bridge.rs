@@ -7,7 +7,7 @@ use crate::parse::{ArithOp, Bound, SrcSpan, Term, term_as_number};
 use crate::rational::Rational;
 use manifold_rs::{Manifold, Mesh};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Path as StdPath, PathBuf};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy)]
@@ -88,8 +88,8 @@ pub enum Model3D {
         path: String,
     },
     SweepExtrude {
-        profile_data: Vec<(f64, f64)>,
-        path_data: Vec<(f64, f64)>,
+        profile: PlacedSketch,
+        path: Path,
     },
     Center3D {
         model: Box<Model3D>,
@@ -99,9 +99,11 @@ pub enum Model3D {
     },
 }
 
-/// 平面非依存の2Dプロファイル。
-/// rotateTo* は含まれないため、Union/Difference/Intersection/Center2D を自由に組み合わせて良い。
-/// 3D操作 (linear_extrude等) は `PlacedSketch` を要求し、その内部で `Model2D` が使われる。
+/// 閉じた2Dプロファイル。extrude / boolean / center2d の入力に使える。
+/// `Sketch` の `points` は構築時に必ず CCW・閉路 (last != first 状態で保存) ・自己交差なし
+/// が保証されている。rotateTo* は含まれないため、Union/Difference/Intersection/Center2D を
+/// 自由に組み合わせて良い。3D操作 (linear_extrude等) は `PlacedSketch` を要求し、その内部
+/// で `Model2D` が使われる。
 #[derive(Debug, Clone)]
 pub enum Model2D {
     Sketch {
@@ -109,9 +111,6 @@ pub enum Model2D {
     },
     Circle {
         radius: f64,
-    },
-    Path {
-        points: Vec<(f64, f64)>,
     },
     Union(Box<Model2D>, Box<Model2D>),
     Difference(Box<Model2D>, Box<Model2D>),
@@ -121,6 +120,15 @@ pub enum Model2D {
         x: f64,
         y: f64,
     },
+}
+
+/// 開いた進行方向付き polyline。sweep_extrude の path 引数専用。
+/// extrude / boolean / rotateTo* には渡せない (型システムで弾く)。
+/// `points` は曲線セグメント (bezier_to) を tessellate した後の頂点列。
+/// 閉路化・CCW化・自己交差チェックは行わない (開いた path を許容するため)。
+#[derive(Debug, Clone)]
+pub struct Path {
+    pub points: Vec<(f64, f64)>,
 }
 
 /// 3D空間内のいずれかの平面に配置された2Dプロファイル。
@@ -155,7 +163,7 @@ pub const BUILTIN_FUNCTORS: &[(&str, &[usize])] = &[
     ("scale", &[4]),
     ("rotate", &[4]),
     ("p", &[2, 3]),
-    ("sketch", &[1]),
+    ("sketch", &[2]),
     ("rotateToXY", &[1]),
     ("rotateToYZ", &[1]),
     ("rotateToXZ", &[1]),
@@ -321,6 +329,16 @@ pub enum ConversionError {
     MissingPlaneSpecification {
         functor: String,
     },
+    /// `sketch(...)` で自己交差する閉路が指定された場合のエラー。
+    /// 検出位置 (どのセグメントとどのセグメントが交差したか) を含む。
+    SelfIntersectingSketch {
+        segment_a: usize,
+        segment_b: usize,
+    },
+    /// `sketch(...)` で頂点数不足や重複頂点による潰れたセグメントを検出した場合。
+    DegenerateSketch {
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for ConversionError {
@@ -370,6 +388,19 @@ impl fmt::Display for ConversionError {
                     "{} requires an explicit plane placement on its profile; wrap the 2D profile with rotateToXY / rotateToYZ / rotateToXZ.",
                     functor
                 )
+            }
+            ConversionError::SelfIntersectingSketch {
+                segment_a,
+                segment_b,
+            } => {
+                write!(
+                    f,
+                    "sketch outline is self-intersecting (segments {} and {} cross). sketch must define a simple closed polygon.",
+                    segment_a, segment_b
+                )
+            }
+            ConversionError::DegenerateSketch { reason } => {
+                write!(f, "sketch is degenerate: {}", reason)
             }
         }
     }
@@ -825,8 +856,28 @@ impl<'a, S> Args<'a, S> {
         &self.args[i]
     }
 
-    fn term_2d(&self, i: usize) -> Result<Model2D, ConversionError> {
+    /// 閉じた2Dプロファイル (extrude / boolean / center2d / rotateTo* に渡せるもの) を読む。
+    /// `path(...)` (開いた polyline) が渡されたら型エラーになる。
+    /// 現状の Model3D 経路は全て `term_placed` (PlacedSketch) を通って入るので未使用だが、
+    /// 「Model2D を直接受け取る将来の API 用 + テスト用」として保持。
+    #[allow(dead_code)]
+    fn term_sketch(&self, i: usize) -> Result<Model2D, ConversionError> {
+        if let Term::Struct { functor, .. } = &self.args[i] {
+            if functor == "path" {
+                return Err(ConversionError::TypeMismatch {
+                    functor: self.functor.to_string(),
+                    arg_index: i,
+                    expected: "closed 2D profile (sketch / circle / boolean / center2d), not path",
+                });
+            }
+        }
         Model2D::from_term(&self.args[i])
+    }
+
+    /// 開いた path (sweep_extrude の path 引数専用) を読む。
+    /// sketch / circle / boolean などの閉じた profile が渡されたら型エラーになる。
+    fn term_path(&self, i: usize) -> Result<Path, ConversionError> {
+        Path::from_term(&self.args[i], self.functor, i)
     }
 
     fn term_placed(&self, i: usize) -> Result<PlacedSketch, ConversionError> {
@@ -864,25 +915,110 @@ fn pairs_to_flat(pairs: &[(f64, f64)]) -> Vec<f64> {
     pairs.iter().flat_map(|&(x, y)| [x, y]).collect()
 }
 
-fn extract_polygon_points<S>(
-    list_term: &Term<S>,
-    functor: &str,
-) -> Result<Vec<(f64, f64)>, ConversionError> {
-    match list_term {
-        Term::List { items, .. } => {
-            let mut points = Vec::with_capacity(items.len());
-            for (i, item) in items.iter().enumerate() {
-                let pt = extract_point_2d_at(item, functor, i)?;
-                points.push(pt);
-            }
-            Ok(points)
+/// 入力点列を「閉路だが先頭点と末尾点は重複しない」状態に正規化する。
+/// 末尾点と先頭点が一致していたら末尾を落とす (ユーザーが明示的に閉じた場合の重複排除)。
+/// 末尾点が先頭点と異なる場合はそのまま (auto-close: 暗黙の最終セグメントが先頭点へ戻る)。
+fn close_polygon_loop(mut points: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    const EPS: f64 = 1e-12;
+    if points.len() >= 2 {
+        let first = points[0];
+        let last = *points.last().unwrap();
+        if (first.0 - last.0).abs() < EPS && (first.1 - last.1).abs() < EPS {
+            points.pop();
         }
-        _ => Err(ConversionError::TypeMismatch {
-            functor: functor.to_string(),
-            arg_index: 0,
-            expected: "list of p(x, y)",
-        }),
     }
+    points
+}
+
+/// 閉路として解釈した点列の simplicity (= 自己交差なし、退化セグメントなし) を検証する。
+/// `points` は閉路を表すが末尾点と先頭点は重複しない状態 (segment i = points[i]→points[(i+1) % n])。
+/// 隣接セグメント (共有端点) の合流は無視する。閉路の `last—first` セグメントとその両端も
+/// 隣接判定の対象にする。
+fn check_simple_polygon(points: &[(f64, f64)]) -> Result<(), ConversionError> {
+    let n = points.len();
+    if n < 3 {
+        return Err(ConversionError::DegenerateSketch {
+            reason: "needs at least 3 distinct vertices",
+        });
+    }
+    const EPS: f64 = 1e-12;
+    for i in 0..n {
+        let a = points[i];
+        let b = points[(i + 1) % n];
+        if (a.0 - b.0).abs() < EPS && (a.1 - b.1).abs() < EPS {
+            return Err(ConversionError::DegenerateSketch {
+                reason: "consecutive duplicate vertices produce a zero-length segment",
+            });
+        }
+    }
+    for i in 0..n {
+        let a1 = points[i];
+        let a2 = points[(i + 1) % n];
+        // 隣接セグメント (i, i+1) は端点 a2 を共有するのでスキップ。
+        // 閉路では last (= n-1) と first (= 0) も隣接。
+        let skip_until = if i == 0 { n - 1 } else { i + 1 };
+        for j in (i + 2)..n {
+            if j == skip_until {
+                continue;
+            }
+            let b1 = points[j];
+            let b2 = points[(j + 1) % n];
+            if segments_cross(a1, a2, b1, b2, EPS) {
+                return Err(ConversionError::SelfIntersectingSketch {
+                    segment_a: i,
+                    segment_b: j,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 線分 a1-a2 と b1-b2 が proper に交差するか判定。
+/// 共有端点・端点が他方の線分上に乗っている (T-junction) も交差として扱う。
+fn segments_cross(
+    a1: (f64, f64),
+    a2: (f64, f64),
+    b1: (f64, f64),
+    b2: (f64, f64),
+    eps: f64,
+) -> bool {
+    let d1 = orient(b1, b2, a1);
+    let d2 = orient(b1, b2, a2);
+    let d3 = orient(a1, a2, b1);
+    let d4 = orient(a1, a2, b2);
+
+    if ((d1 > eps && d2 < -eps) || (d1 < -eps && d2 > eps))
+        && ((d3 > eps && d4 < -eps) || (d3 < -eps && d4 > eps))
+    {
+        return true;
+    }
+    // 端点が他方の線分の interior にある場合 (= 同一直線で重なる)
+    if d1.abs() <= eps && on_segment(b1, b2, a1, eps) {
+        return true;
+    }
+    if d2.abs() <= eps && on_segment(b1, b2, a2, eps) {
+        return true;
+    }
+    if d3.abs() <= eps && on_segment(a1, a2, b1, eps) {
+        return true;
+    }
+    if d4.abs() <= eps && on_segment(a1, a2, b2, eps) {
+        return true;
+    }
+    false
+}
+
+fn orient(p: (f64, f64), q: (f64, f64), r: (f64, f64)) -> f64 {
+    (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+}
+
+fn on_segment(p: (f64, f64), q: (f64, f64), r: (f64, f64), eps: f64) -> bool {
+    // 共線であることを呼び出し側で確認済み。bbox 内に厳密に含まれる (端点とは一致しない) ことだけ確認。
+    let in_x = r.0 > p.0.min(q.0) + eps && r.0 < p.0.max(q.0) - eps;
+    let in_y = r.1 > p.1.min(q.1) + eps && r.1 < p.1.max(q.1) - eps;
+    // 水平/垂直線分の場合は片方の軸が degenerate。OR で許容する。
+    in_x || in_y
 }
 
 /// `term` を 2D 点として抽出する。`p(number, number)` リテラルのみを受け入れる。
@@ -969,18 +1105,23 @@ fn extract_point_3d<S>(
     Ok((out[0], out[1], out[2]))
 }
 
-fn extract_path_points<S>(
+/// `path(Start, Segments)` および `sketch(Start, Segments)` の共通パーサ。
+/// 戻り値は tessellate 済みの頂点列 (先頭は Start、以降は各セグメントを評価した点)。
+/// 閉路化・CCW化・自己交差チェックは呼び出し側 (Sketch のみ実施) の責任。
+fn extract_segment_points<S>(
     start_term: &Term<S>,
     segments_term: &Term<S>,
+    owner_tag: FunctorTag,
 ) -> Result<Vec<(f64, f64)>, ConversionError> {
-    let mut current = extract_point_2d(start_term, FunctorTag::Path, 0)?;
+    let owner_name = owner_tag.to_string();
+    let mut current = extract_point_2d(start_term, owner_tag, 0)?;
     let mut points = vec![current];
 
     let segments = match segments_term {
         Term::List { items, .. } => items,
         _ => {
             return Err(ConversionError::TypeMismatch {
-                functor: "path".to_string(),
+                functor: owner_name.clone(),
                 arg_index: 1,
                 expected: "list of line_to/bezier_to segments",
             });
@@ -1026,7 +1167,7 @@ fn extract_path_points<S>(
             }
             _ => {
                 return Err(ConversionError::TypeMismatch {
-                    functor: "path".to_string(),
+                    functor: owner_name.clone(),
                     arg_index: i + 1,
                     expected: "line_to(p) or bezier_to(cp,end) or bezier_to(cp1,cp2,end)",
                 });
@@ -1081,11 +1222,14 @@ impl Model2D {
             .map_err(|_| ConversionError::UnknownPrimitive(functor.to_string()))?;
 
         match tag {
-            FunctorTag::Sketch if a.len() == 1 => {
-                let points = extract_polygon_points(&a.args[0], a.functor)?;
+            FunctorTag::Sketch if a.len() == 2 => {
+                let raw = extract_segment_points(&a.args[0], &a.args[1], FunctorTag::Sketch)?;
+                let mut points = close_polygon_loop(raw);
+                check_simple_polygon(&points)?;
+                ensure_ccw(&mut points);
                 Ok(Model2D::Sketch { points })
             }
-            FunctorTag::Sketch => Err(a.arity_error("1")),
+            FunctorTag::Sketch => Err(a.arity_error("2")),
 
             FunctorTag::Circle if a.len() == 1 => Ok(Model2D::Circle { radius: a.f64(0)? }),
             FunctorTag::Circle if a.len() == 2 => {
@@ -1094,11 +1238,12 @@ impl Model2D {
             }
             FunctorTag::Circle => Err(a.arity_error("1 or 2")),
 
-            FunctorTag::Path if a.len() == 2 => {
-                let points = extract_path_points(&a.args[0], &a.args[1])?;
-                Ok(Model2D::Path { points })
-            }
-            FunctorTag::Path => Err(a.arity_error("2")),
+            // path は Model2D に含まれない (型システムで sweep_extrude 専用に閉じ込めている)。
+            FunctorTag::Path => Err(ConversionError::TypeMismatch {
+                functor: a.functor.to_string(),
+                arg_index: 0,
+                expected: "closed 2D profile, not an open path",
+            }),
 
             FunctorTag::Union if a.len() == 2 => {
                 let l = Model2D::parse_2d_op_arg(&a.args[0], "union")?;
@@ -1152,10 +1297,9 @@ impl Model2D {
 
     fn to_polygon_rings(&self) -> Option<Vec<Vec<f64>>> {
         match self {
-            Model2D::Sketch { points } | Model2D::Path { points } => {
-                let mut pts = points.clone();
-                ensure_ccw(&mut pts);
-                Some(vec![pairs_to_flat(&pts)])
+            Model2D::Sketch { points } => {
+                // points は構築時に CCW 化済なので clone のみ。
+                Some(vec![pairs_to_flat(points)])
             }
             Model2D::Circle { radius } => {
                 let points: Vec<f64> = (0..DEFAULT_SEGMENTS)
@@ -1205,6 +1349,47 @@ impl Model2D {
                 Some(translated)
             }
         }
+    }
+}
+
+impl Path {
+    /// `path(Start, Segments)` Term から開いた polyline を構築する。
+    /// 構築時の検証は最低限 (頂点数2以上) のみで、自己交差や閉路性はチェックしない。
+    fn from_term<S>(
+        term: &Term<S>,
+        consumer: &str,
+        arg_index: usize,
+    ) -> Result<Self, ConversionError> {
+        let Term::Struct { functor, args, .. } = term else {
+            return Err(ConversionError::TypeMismatch {
+                functor: consumer.to_string(),
+                arg_index,
+                expected: "path(Start, [segments])",
+            });
+        };
+        if functor != "path" {
+            return Err(ConversionError::TypeMismatch {
+                functor: consumer.to_string(),
+                arg_index,
+                expected: "path(Start, [segments])",
+            });
+        }
+        if args.len() != 2 {
+            return Err(ConversionError::ArityMismatch {
+                functor: "path".to_string(),
+                expected: "2".to_string(),
+                got: args.len(),
+            });
+        }
+        let points = extract_segment_points(&args[0], &args[1], FunctorTag::Path)?;
+        if points.len() < 2 {
+            return Err(ConversionError::TypeMismatch {
+                functor: "path".to_string(),
+                arg_index: 1,
+                expected: "path with at least one segment (2+ points)",
+            });
+        }
+        Ok(Path { points })
     }
 }
 
@@ -1302,19 +1487,6 @@ fn polygon_boolean_2d(
         rings.push(polygons.get_as_slice(i).to_vec());
     }
     Some(rings)
-}
-
-fn polygon_rings_or_err_model2d(
-    profile: &Model2D,
-    functor: &str,
-) -> Result<Vec<Vec<f64>>, ConversionError> {
-    profile
-        .to_polygon_rings()
-        .ok_or_else(|| ConversionError::TypeMismatch {
-            functor: functor.to_string(),
-            arg_index: 0,
-            expected: "polygon data",
-        })
 }
 
 fn polygon_rings_or_err(
@@ -1504,23 +1676,9 @@ impl Model3D {
             FunctorTag::Stl => Err(a.arity_error("1")),
 
             FunctorTag::SweepExtrude if a.len() == 2 => {
-                let profile_2d = a.term_2d(0)?;
-                let path_2d = a.term_2d(1)?;
-                let profile_rings = polygon_rings_or_err_model2d(&profile_2d, "sweep_extrude")?;
-                let path_rings =
-                    path_2d
-                        .to_polygon_rings()
-                        .ok_or_else(|| ConversionError::TypeMismatch {
-                            functor: "sweep_extrude".to_string(),
-                            arg_index: 1,
-                            expected: "path data",
-                        })?;
-                let profile_data = flat_to_pairs(&profile_rings[0]);
-                let path_data = flat_to_pairs(&path_rings[0]);
-                Ok(Model3D::SweepExtrude {
-                    profile_data,
-                    path_data,
-                })
+                let profile = a.term_placed(0)?;
+                let path = a.term_path(1)?;
+                Ok(Model3D::SweepExtrude { profile, path })
             }
             FunctorTag::SweepExtrude => Err(a.arity_error("2")),
 
@@ -1571,11 +1729,16 @@ impl Model3D {
                     height: 0.001,
                 })
             }
-            FunctorTag::Sketch | FunctorTag::Circle | FunctorTag::Path => {
+            FunctorTag::Sketch | FunctorTag::Circle => {
                 Err(ConversionError::MissingPlaneSpecification {
                     functor: functor.to_string(),
                 })
             }
+            FunctorTag::Path => Err(ConversionError::TypeMismatch {
+                functor: functor.to_string(),
+                arg_index: 0,
+                expected: "path is only usable as the second argument of sweep_extrude",
+            }),
         }
     }
 
@@ -1642,13 +1805,14 @@ impl Model3D {
                 Ok(apply_plane_rotation(m, profile))
             }
 
-            Model3D::SweepExtrude {
-                profile_data,
-                path_data,
-            } => {
-                let (verts, indices) = crate::sweep::sweep_extrude_mesh(profile_data, path_data)?;
+            Model3D::SweepExtrude { profile, path } => {
+                let rings = polygon_rings_or_err(profile, "sweep_extrude")?;
+                let profile_data = flat_to_pairs(&rings[0]);
+                let (verts, indices) =
+                    crate::sweep::sweep_extrude_mesh(&profile_data, &path.points)?;
                 let mesh = Mesh::new(&verts, &indices);
-                Ok(Manifold::from_mesh(mesh))
+                let m = Manifold::from_mesh(mesh);
+                Ok(apply_plane_rotation(m, profile))
             }
 
             Model3D::Center3D { model, x, y, z } => {
@@ -1675,7 +1839,7 @@ impl Model3D {
             }
 
             Model3D::Stl { path } => {
-                let raw = Path::new(path);
+                let raw = StdPath::new(path);
                 let resolved = if raw.is_absolute() {
                     PathBuf::from(path)
                 } else {
@@ -2126,24 +2290,188 @@ mod tests {
         assert!(matches!(result, Err(ConversionError::UnknownPrimitive(_))));
     }
 
+    /// 旧 `sketch([p,p,...])` API のテスト用ヘルパ。新仕様の `sketch(Start, [line_to(p),...])`
+    /// を生成する。`pts` は閉路の頂点列で、末尾の auto-close は新 sketch 側が処理する。
     fn make_polygon_term(pts: Vec<(i64, i64)>) -> Term {
-        let points: Vec<Term> = pts
-            .into_iter()
-            .map(|(x, y)| struc("p".into(), vec![number_int(x), number_int(y)]))
+        assert!(
+            pts.len() >= 3,
+            "sketch requires at least 3 vertices, got {}",
+            pts.len()
+        );
+        let (sx, sy) = pts[0];
+        let start = struc("p".into(), vec![number_int(sx), number_int(sy)]);
+        let segments: Vec<Term> = pts[1..]
+            .iter()
+            .map(|&(x, y)| {
+                struc(
+                    "line_to".into(),
+                    vec![struc("p".into(), vec![number_int(x), number_int(y)])],
+                )
+            })
             .collect();
-        struc("sketch".into(), vec![crate::parse::list(points, None)])
+        struc(
+            "sketch".into(),
+            vec![start, crate::parse::list(segments, None)],
+        )
     }
 
     #[test]
     fn test_polygon_conversion() {
-        let term = make_polygon_term(vec![(1, 0), (0, 0), (0, 1), (1, 1)]);
+        // CCW 入力: そのまま保存される。auto-close で末尾頂点と先頭頂点は重複しないこと。
+        let term = make_polygon_term(vec![(0, 0), (1, 0), (1, 1), (0, 1)]);
         let expr = Model2D::from_term(&term).unwrap();
         match expr {
             Model2D::Sketch { points } => {
-                assert_eq!(points, vec![(1.0, 0.0), (0.0, 0.0), (0.0, 1.0), (1.0, 1.0)]);
+                assert_eq!(points, vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
             }
             _ => panic!("Expected Sketch"),
         }
+    }
+
+    /// CW で書いた sketch が構築時に CCW に正規化されること。
+    #[test]
+    fn test_sketch_cw_input_is_normalized_to_ccw() {
+        // 時計回り (CW): (0,0)->(0,1)->(1,1)->(1,0)
+        let term = make_polygon_term(vec![(0, 0), (0, 1), (1, 1), (1, 0)]);
+        let expr = Model2D::from_term(&term).unwrap();
+        match expr {
+            Model2D::Sketch { points } => {
+                // ensure_ccw が呼ばれて反転されている
+                assert_eq!(points, vec![(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]);
+            }
+            _ => panic!("Expected Sketch"),
+        }
+    }
+
+    /// 末尾セグメントの終点を始点に明示的に戻した場合、重複頂点が増えないこと。
+    #[test]
+    fn test_sketch_explicit_close_dedupes_last_vertex() {
+        // 明示的に始点に戻す: 4 line_to + 末尾は始点と一致 → 重複排除されて 4 頂点。
+        let start: Term = struc("p".into(), vec![number_int(0), number_int(0)]);
+        let segments: Vec<Term> = vec![
+            line_to_term(1, 0),
+            line_to_term(1, 1),
+            line_to_term(0, 1),
+            // 明示的に始点に戻る
+            line_to_term(0, 0),
+        ];
+        let term: Term = struc(
+            "sketch".into(),
+            vec![start, crate::parse::list(segments, None)],
+        );
+        let expr = Model2D::from_term(&term).unwrap();
+        match expr {
+            Model2D::Sketch { points } => {
+                assert_eq!(points.len(), 4, "explicit close must not duplicate first vertex");
+                assert_eq!(points, vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
+            }
+            _ => panic!("Expected Sketch"),
+        }
+    }
+
+    /// 砂時計型 (自己交差) の sketch は構築時に拒否される。
+    #[test]
+    fn test_sketch_rejects_self_intersection() {
+        // (0,0)->(10,10)->(10,0)->(0,10)->close で X 字に交差する。
+        let term = make_polygon_term(vec![(0, 0), (10, 10), (10, 0), (0, 10)]);
+        let err = Model2D::from_term(&term).unwrap_err();
+        assert!(
+            matches!(err, ConversionError::SelfIntersectingSketch { .. }),
+            "expected SelfIntersectingSketch, got {:?}",
+            err
+        );
+    }
+
+    /// 重複した連続頂点 (退化セグメント) は構築時に拒否される。
+    #[test]
+    fn test_sketch_rejects_consecutive_duplicate_vertex() {
+        let term = make_polygon_term(vec![(0, 0), (1, 0), (1, 0), (1, 1), (0, 1)]);
+        let err = Model2D::from_term(&term).unwrap_err();
+        assert!(
+            matches!(err, ConversionError::DegenerateSketch { .. }),
+            "expected DegenerateSketch, got {:?}",
+            err
+        );
+    }
+
+    /// 頂点数 < 3 の sketch は構築時に拒否される。
+    #[test]
+    fn test_sketch_rejects_degenerate_two_vertices() {
+        let term = make_polygon_term(vec![(0, 0), (1, 0), (1, 0)]);
+        // この場合は重複頂点で先に DegenerateSketch になる。頂点数だけ少ないケースは
+        // segment_points が enforce する (line_to 1個のみ → 2点 → close後も2点未満)。
+        let err = Model2D::from_term(&term).unwrap_err();
+        assert!(
+            matches!(err, ConversionError::DegenerateSketch { .. }),
+            "expected DegenerateSketch, got {:?}",
+            err
+        );
+    }
+
+    /// path を sketch のスロット (linear_extrude の profile) に渡すと型エラーになること。
+    /// PlacedSketch::from_term の内部で Model2D::from_term が呼ばれ、Path は Model2D に
+    /// 含まれないので TypeMismatch で弾かれる。
+    #[test]
+    fn test_path_rejected_in_extrude_profile() {
+        let path = xy(make_path_term(
+            (0, 0),
+            vec![line_to_term(10, 0), line_to_term(10, 10), line_to_term(0, 10)],
+        ));
+        let term = struc("linear_extrude".into(), vec![path, number_int(5)]);
+        let err = Model3D::from_term(&term).unwrap_err();
+        assert!(
+            matches!(err, ConversionError::TypeMismatch { .. }),
+            "expected TypeMismatch, got {:?}",
+            err
+        );
+    }
+
+    /// path を boolean (`+`) の引数に渡すと型エラーになること。
+    #[test]
+    fn test_path_rejected_in_boolean() {
+        use crate::parse::ArithOp;
+        use crate::parse::arith_expr;
+
+        let path = make_path_term((0, 0), vec![line_to_term(10, 0), line_to_term(0, 10)]);
+        let poly = make_polygon_term(vec![(0, 0), (5, 0), (5, 5)]);
+        let union_term = arith_expr(ArithOp::Add, path, poly);
+        let err = Model2D::from_term(&union_term).unwrap_err();
+        assert!(
+            matches!(err, ConversionError::TypeMismatch { .. }),
+            "expected TypeMismatch, got {:?}",
+            err
+        );
+    }
+
+    /// sketch を sweep_extrude の path 引数に渡すと型エラーになること。
+    #[test]
+    fn test_sketch_rejected_in_sweep_path_slot() {
+        let profile = xy(make_polygon_term(vec![(0, 0), (5, 0), (5, 5), (0, 5)]));
+        let bogus_path = make_polygon_term(vec![(0, 0), (10, 0), (10, 10)]);
+        let term = struc("sweep_extrude".into(), vec![profile, bogus_path]);
+        let err = Model3D::from_term(&term).unwrap_err();
+        assert!(
+            matches!(err, ConversionError::TypeMismatch { .. }),
+            "expected TypeMismatch, got {:?}",
+            err
+        );
+    }
+
+    /// sweep_extrude の profile に rotateTo* がないと MissingPlaneSpecification になる。
+    #[test]
+    fn test_sweep_extrude_requires_plane_on_profile() {
+        let profile = make_polygon_term(vec![(0, 0), (5, 0), (5, 5), (0, 5)]);
+        let path = make_path_term((0, 0), vec![line_to_term(0, 20)]);
+        let term = struc("sweep_extrude".into(), vec![profile, path]);
+        let err = Model3D::from_term(&term).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConversionError::MissingPlaneSpecification { ref functor } if functor == "sweep_extrude"
+            ),
+            "expected MissingPlaneSpecification(sweep_extrude), got {:?}",
+            err
+        );
     }
 
     #[test]
@@ -2343,10 +2671,11 @@ mod tests {
 
     #[test]
     fn test_chained_difference_with_path() {
-        // polygon - polygon をPathと組み合わせて使う
+        // polygon - polygon をPathと組み合わせて使う。
+        // sweep_extrude の profile は PlacedSketch 必須なので rotateToXY で包む。
         let poly = make_polygon_term(vec![(0, 0), (10, 0), (10, 10), (0, 10)]);
         let hole = make_polygon_term(vec![(2, 2), (8, 2), (8, 8), (2, 8)]);
-        let diff = struc("difference".into(), vec![poly, hole]);
+        let diff = xy(struc("difference".into(), vec![poly, hole]));
         let path = make_path_term((0, 0), vec![line_to_term(10, 5), line_to_term(20, 0)]);
         let sweep = struc("sweep_extrude".into(), vec![diff, path]);
         let expr = Model3D::from_term(&sweep).unwrap();
@@ -2464,7 +2793,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- linear_extrude(rotateToXY(sketch([p(0, 0), p(0, 40), p(30, 0)])), X@10), control3d(p(X, 0, 0), \"width\")."
+            "main :- linear_extrude(rotateToXY(sketch(p(0, 0), [line_to(p(0, 40)), line_to(p(30, 0))])), X@10), control3d(p(X, 0, 0), \"width\")."
         ).unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (mut resolved, _) = execute(&mut db, q).unwrap();
@@ -2487,7 +2816,7 @@ mod tests {
 
         // X=なし: controlのVar座標が0にフォールバックし、extrude側にも0が代入される
         let mut db = database(
-            "main :- linear_extrude(rotateToXY(sketch([p(0, 0), p(0, 40), p(30, 0)])), X), control3d(p(X, -10, -10)).",
+            "main :- linear_extrude(rotateToXY(sketch(p(0, 0), [line_to(p(0, 40)), line_to(p(30, 0))])), X), control3d(p(X, -10, -10)).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -2509,7 +2838,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- sketch([p(0,0), p(0,40), p(30,0)]) |> rotateToXY |> linear_extrude(X+1), control3d(p(X, -10, -10)).",
+            "main :- sketch(p(0,0), [line_to(p(0,40)), line_to(p(30,0))]) |> rotateToXY |> linear_extrude(X+1), control3d(p(X, -10, -10)).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -2526,7 +2855,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let src = "main :- sketch([p(0,0), p(0,40), p(30,0)]) |> rotateToXY |> linear_extrude(X+1), control3d(p(X, -10, -10)).";
+        let src = "main :- sketch(p(0,0), [line_to(p(0,40)), line_to(p(30,0))]) |> rotateToXY |> linear_extrude(X+1), control3d(p(X, -10, -10)).";
         let mut db = database(src).unwrap();
         let (_, q) = parse_query("main.").unwrap();
 
@@ -2667,11 +2996,11 @@ mod tests {
         let mut db = database(
             "main :- battery_box |> center3d(p(0,0,0)).
              battery_box :-
-               (((sketch([p(0,0), p(X@20,0), p(X,Y@58), p(0,Y)]) |> center2d(CENTER))
+               (((sketch(p(0,0), [line_to(p(X@20,0)), line_to(p(X,Y@58)), line_to(p(0,Y))]) |> center2d(CENTER))
                  - inner(CENTER)) |> rotateToYZ |> linear_extrude(20))
                  + (inner(CENTER) |> rotateToYZ |> linear_extrude(2)),
                control2d(-100<CENTER<100).
-             inner(CENTER) :- sketch([p(0,0), p(XIN@14.6,0), p(XIN,INNERLEN@49.8), p(0,INNERLEN)])
+             inner(CENTER) :- sketch(p(0,0), [line_to(p(XIN@14.6,0)), line_to(p(XIN,INNERLEN@49.8)), line_to(p(0,INNERLEN))])
                 |> center2d(CENTER).",
         )
         .unwrap();
@@ -2699,11 +3028,11 @@ mod tests {
         let mut db = database(
             "main :- battery_box |> center3d(p(0,0,0)).
              battery_box :-
-               (((sketch([p(0,0), p(X@20,0), p(X,Y@58), p(0,Y)]) |> center2d(CENTER))
+               (((sketch(p(0,0), [line_to(p(X@20,0)), line_to(p(X,Y@58)), line_to(p(0,Y))]) |> center2d(CENTER))
                  - inner(CENTER)) |> rotateToYZ |> linear_extrude(20))
                  + (inner(CENTER) |> rotateToYZ |> linear_extrude(2)),
                control2d(-100<CENTER<100).
-             inner(CENTER) :- sketch([p(0,0), p(XIN@14.6,0), p(XIN,INNERLEN@49.8), p(0,INNERLEN)])
+             inner(CENTER) :- sketch(p(0,0), [line_to(p(XIN@14.6,0)), line_to(p(XIN,INNERLEN@49.8)), line_to(p(0,INNERLEN))])
                 |> center2d(CENTER).",
         )
         .unwrap();
@@ -2955,9 +3284,13 @@ mod tests {
         )
     }
 
+    /// path を sweep_extrude の path 引数経由で構築できること & 期待した頂点列が
+    /// 得られること。`Args::term_path` 経由でないと Path 値は得られないので、sweep_extrude
+    /// 経由でテストする。
     #[test]
     fn test_path_line_to_only() {
-        let term = make_path_term(
+        let profile = xy(make_polygon_term(vec![(0, 0), (1, 0), (1, 1)]));
+        let path = make_path_term(
             (0, 0),
             vec![
                 line_to_term(10, 0),
@@ -2965,55 +3298,61 @@ mod tests {
                 line_to_term(0, 10),
             ],
         );
-        let expr = Model2D::from_term(&term).unwrap();
+        let term = struc("sweep_extrude".into(), vec![profile, path]);
+        let expr = Model3D::from_term(&term).unwrap();
         match &expr {
-            Model2D::Path { points } => {
-                assert_eq!(points.len(), 4);
+            Model3D::SweepExtrude { path, .. } => {
+                assert_eq!(path.points.len(), 4);
                 assert_eq!(
-                    points,
-                    &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+                    path.points,
+                    vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
                 );
             }
-            _ => panic!("Expected Path"),
+            _ => panic!("Expected SweepExtrude"),
         }
     }
 
     #[test]
     fn test_path_quadratic_bezier() {
-        let term = make_path_term((0, 0), vec![bezier_to_quad_term((5, 10), (10, 0))]);
-        let expr = Model2D::from_term(&term).unwrap();
+        let profile = xy(make_polygon_term(vec![(0, 0), (1, 0), (1, 1)]));
+        let path = make_path_term((0, 0), vec![bezier_to_quad_term((5, 10), (10, 0))]);
+        let term = struc("sweep_extrude".into(), vec![profile, path]);
+        let expr = Model3D::from_term(&term).unwrap();
         match &expr {
-            Model2D::Path { points } => {
+            Model3D::SweepExtrude { path, .. } => {
                 // start(1) + 16 bezier steps = 17 points
-                assert_eq!(points.len(), 17);
-                assert_eq!(points[0], (0.0, 0.0));
-                assert_close!(points[16].0, 10.0);
-                assert_close!(points[16].1, 0.0);
+                assert_eq!(path.points.len(), 17);
+                assert_eq!(path.points[0], (0.0, 0.0));
+                assert_close!(path.points[16].0, 10.0);
+                assert_close!(path.points[16].1, 0.0);
             }
-            _ => panic!("Expected Path"),
+            _ => panic!("Expected SweepExtrude"),
         }
     }
 
     #[test]
     fn test_path_cubic_bezier() {
-        let term = make_path_term(
+        let profile = xy(make_polygon_term(vec![(0, 0), (1, 0), (1, 1)]));
+        let path = make_path_term(
             (0, 0),
             vec![bezier_to_cubic_term((5, 10), (10, 10), (10, 0))],
         );
-        let expr = Model2D::from_term(&term).unwrap();
+        let term = struc("sweep_extrude".into(), vec![profile, path]);
+        let expr = Model3D::from_term(&term).unwrap();
         match &expr {
-            Model2D::Path { points } => {
-                assert_eq!(points.len(), 17);
-                assert_close!(points[16].0, 10.0);
-                assert_close!(points[16].1, 0.0);
+            Model3D::SweepExtrude { path, .. } => {
+                assert_eq!(path.points.len(), 17);
+                assert_close!(path.points[16].0, 10.0);
+                assert_close!(path.points[16].1, 0.0);
             }
-            _ => panic!("Expected Path"),
+            _ => panic!("Expected SweepExtrude"),
         }
     }
 
     #[test]
     fn test_path_mixed_segments() {
-        let term = make_path_term(
+        let profile = xy(make_polygon_term(vec![(0, 0), (1, 0), (1, 1)]));
+        let path = make_path_term(
             (0, 0),
             vec![
                 line_to_term(10, 0),
@@ -3021,58 +3360,20 @@ mod tests {
                 bezier_to_cubic_term((5, 15), (0, 10), (0, 0)),
             ],
         );
-        let expr = Model2D::from_term(&term).unwrap();
+        let term = struc("sweep_extrude".into(), vec![profile, path]);
+        let expr = Model3D::from_term(&term).unwrap();
         match &expr {
-            Model2D::Path { points } => {
+            Model3D::SweepExtrude { path, .. } => {
                 // start(1) + line(1) + quad(16) + cubic(16) = 34 points
-                assert_eq!(points.len(), 34);
+                assert_eq!(path.points.len(), 34);
             }
-            _ => panic!("Expected Path"),
+            _ => panic!("Expected SweepExtrude"),
         }
-    }
-
-    #[test]
-    fn test_path_evaluate() {
-        // pathを3Dとして評価する (薄いextrude) にも平面指定が必要
-        let term = xy(make_path_term(
-            (0, 0),
-            vec![
-                line_to_term(10, 0),
-                bezier_to_quad_term((15, 5), (10, 10)),
-                line_to_term(0, 10),
-            ],
-        ));
-        let expr = Model3D::from_term(&term).unwrap();
-        let mesh = expr.to_mesh(&[]).unwrap();
-        assert!(mesh.vertices().len() > 0);
-    }
-
-    #[test]
-    fn test_path_extrude() {
-        let path = xy(make_path_term(
-            (0, 0),
-            vec![
-                line_to_term(10, 0),
-                line_to_term(10, 10),
-                line_to_term(0, 10),
-            ],
-        ));
-        let term = struc("linear_extrude".into(), vec![path, number_int(5)]);
-        let expr = Model3D::from_term(&term).unwrap();
-        match &expr {
-            Model3D::LinearExtrude { profile, height } => {
-                assert!(matches!(profile.profile, Model2D::Path { .. }));
-                assert_eq!(*height, 5.0);
-            }
-            _ => panic!("Expected LinearExtrude"),
-        }
-        let mesh = expr.to_mesh(&[]).unwrap();
-        assert!(mesh.vertices().len() > 0);
     }
 
     #[test]
     fn test_sweep_extrude_line() {
-        let profile = make_polygon_term(vec![(0, 0), (5, 0), (5, 5), (0, 5)]);
+        let profile = xy(make_polygon_term(vec![(0, 0), (5, 0), (5, 5), (0, 5)]));
         let path = make_path_term((0, 0), vec![line_to_term(0, 20)]);
         let term = struc("sweep_extrude".into(), vec![profile, path]);
         let expr = Model3D::from_term(&term).unwrap();
@@ -3083,7 +3384,7 @@ mod tests {
 
     #[test]
     fn test_sweep_extrude_curve() {
-        let profile = make_polygon_term(vec![(0, 0), (3, 0), (0, 3)]);
+        let profile = xy(make_polygon_term(vec![(0, 0), (3, 0), (0, 3)]));
         let path = make_path_term(
             (0, 0),
             vec![bezier_to_cubic_term((5, 0), (10, 10), (10, 20))],
@@ -3180,7 +3481,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- sketch([p(10,20), p(20,20), p(20,30), p(10,30)]) |> center2d(p(0, 0)) |> rotateToYZ |> linear_extrude(2).",
+            "main :- sketch(p(10,20), [line_to(p(20,20)), line_to(p(20,30)), line_to(p(10,30))]) |> center2d(p(0, 0)) |> rotateToYZ |> linear_extrude(2).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -3210,7 +3511,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- sketch([p(0,0), p(10,0), p(10,4), p(0,4)]) |> center2d(p(0, 0)) |> rotateToXY |> linear_extrude(1).",
+            "main :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))]) |> center2d(p(0, 0)) |> rotateToXY |> linear_extrude(1).",
         )
         .unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -3235,7 +3536,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "inner_part(CENTER) :- sketch([p(0,0), p(10,0), p(10,4), p(0,4)]) |> center2d(CENTER).
+            "inner_part(CENTER) :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))]) |> center2d(CENTER).
              main :- inner_part(CENTER) |> rotateToXY |> linear_extrude(1).",
         )
         .unwrap();
@@ -3291,7 +3592,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db = database(
-            "main :- sketch([p(0,0), p(10,0), p(10,4), p(0,4)])
+            "main :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))])
                |> center2d(CENTER) |> rotateToXY |> linear_extrude(1),
                CENTER = p(10, 20).",
         )
@@ -3353,7 +3654,7 @@ mod tests {
     fn test_rotate_to_yz_basic() {
         // 10x10の正方形をrotateToYZしてZ方向(=push後の+X)に2押し出し
         let exprs = run_main(
-            "main :- sketch([p(0,0), p(10,0), p(10,10), p(0,10)]) |> rotateToYZ |> linear_extrude(2).",
+            "main :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToYZ |> linear_extrude(2).",
         )
         .unwrap();
         assert_eq!(exprs.len(), 1);
@@ -3370,7 +3671,7 @@ mod tests {
     fn test_rotate_to_xz_basic() {
         // 10x10の正方形をrotateToXZ → 押し出しは+Y方向に2
         let exprs = run_main(
-            "main :- sketch([p(0,0), p(10,0), p(10,10), p(0,10)]) |> rotateToXZ |> linear_extrude(2).",
+            "main :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToXZ |> linear_extrude(2).",
         )
         .unwrap();
         assert_eq!(exprs.len(), 1);
@@ -3425,25 +3726,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rotate_to_xz_path_orientation() {
-        // path で矩形を作って rotateToXZ |> linear_extrude したとき、
-        // メッシュの法線が外向き (= 符号付き体積が正) であることを検証する。
-        // Y反転後にensure_ccwを呼ばないと面が裏返り、符号付き体積が負になる。
-        let exprs = run_main(
-            "main :- path(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToXZ |> linear_extrude(2).",
-        )
-        .unwrap();
-        let node = build_evaluated_node(&exprs[0], &[]).unwrap();
-        let volume = signed_mesh_volume(&node);
-        // 10 * 10 * 2 = 200 が期待値。反転していると -200 になる。
-        assert_close!(volume, 200.0);
-    }
-
-    #[test]
     fn test_rotate_to_xz_sketch_orientation() {
         // sketch 版でも同様に法線が外向きであること (回帰防止)。
         let exprs = run_main(
-            "main :- sketch([p(0,0), p(10,0), p(10,10), p(0,10)]) |> rotateToXZ |> linear_extrude(2).",
+            "main :- sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToXZ |> linear_extrude(2).",
         )
         .unwrap();
         let node = build_evaluated_node(&exprs[0], &[]).unwrap();
@@ -3455,7 +3741,7 @@ mod tests {
     fn test_rotate_to_xy_places_on_xy() {
         // rotateToXY を明示すると XY 平面の押し出し (押し出し方向は +Z)
         let exprs = run_main(
-            "main :- sketch([p(0,0), p(4,0), p(4,3), p(0,3)]) |> rotateToXY |> linear_extrude(2).",
+            "main :- sketch(p(0,0), [line_to(p(4,0)), line_to(p(4,3)), line_to(p(0,3))]) |> rotateToXY |> linear_extrude(2).",
         )
         .unwrap();
         let node = build_evaluated_node(&exprs[0], &[]).unwrap();
@@ -3473,7 +3759,7 @@ mod tests {
         use crate::term_rewrite::execute;
 
         let mut db =
-            database("main :- sketch([p(0,0), p(4,0), p(4,3), p(0,3)]) |> linear_extrude(2).")
+            database("main :- sketch(p(0,0), [line_to(p(4,0)), line_to(p(4,3)), line_to(p(0,3))]) |> linear_extrude(2).")
                 .unwrap();
         let (_, q) = parse_query("main.").unwrap();
         let (resolved, _) = execute(&mut db, q).unwrap();
@@ -3493,7 +3779,7 @@ mod tests {
         // (a - b) |> rotateToYZ |> linear_extrude
         // 今回の battery_case のバグ再現ケースが正しく動くこと
         let exprs = run_main(
-            "main :- (sketch([p(0,0), p(20,0), p(20,58), p(0,58)]) - sketch([p(2.7,4.1), p(17.3,4.1), p(17.3,53.9), p(2.7,53.9)])) |> rotateToYZ |> linear_extrude(20).",
+            "main :- (sketch(p(0,0), [line_to(p(20,0)), line_to(p(20,58)), line_to(p(0,58))]) - sketch(p(2.7,4.1), [line_to(p(17.3,4.1)), line_to(p(17.3,53.9)), line_to(p(2.7,53.9))])) |> rotateToYZ |> linear_extrude(20).",
         )
         .unwrap();
         assert_eq!(exprs.len(), 1);
@@ -3544,19 +3830,19 @@ mod tests {
     #[test]
     fn test_boolean_after_rotate_errors() {
         expect_sealed(
-            "main :- (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) + sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> linear_extrude(1).",
+            "main :- (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> linear_extrude(1).",
             "+",
         );
         expect_sealed(
-            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) + (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) |> linear_extrude(1).",
+            "main :- sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) |> linear_extrude(1).",
             "+",
         );
         expect_sealed(
-            "main :- (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) + (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) |> linear_extrude(1).",
+            "main :- (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) |> linear_extrude(1).",
             "+",
         );
         expect_sealed(
-            "main :- (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) + (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToXZ) |> linear_extrude(1).",
+            "main :- (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToXZ) |> linear_extrude(1).",
             "+",
         );
     }
@@ -3564,7 +3850,7 @@ mod tests {
     #[test]
     fn test_difference_after_rotate_errors() {
         expect_sealed(
-            "main :- (sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ) - sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> linear_extrude(1).",
+            "main :- (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) - sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> linear_extrude(1).",
             "-",
         );
     }
@@ -3572,7 +3858,7 @@ mod tests {
     #[test]
     fn test_center2d_after_rotate_errors() {
         expect_sealed(
-            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ |> center2d(p(0, 0)) |> linear_extrude(1).",
+            "main :- sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> center2d(p(0, 0)) |> linear_extrude(1).",
             "center2d",
         );
     }
@@ -3590,9 +3876,9 @@ mod tests {
         let src = "\
 main :- battery_box.
 battery_box :-
-  (sketch([p(0,0), p(20,0), p(20,58), p(0,58)]) |> center2d(p(0,0)))
+  (sketch(p(0,0), [line_to(p(20,0)), line_to(p(20,58)), line_to(p(0,58))]) |> center2d(p(0,0)))
   - honi |> rotateToYZ |> linear_extrude(20).
-honi :- sketch([p(0,0), p(14.6,0), p(14.6,49.8), p(0,49.8)]) |> center2d(p(0,0)).
+honi :- sketch(p(0,0), [line_to(p(14.6,0)), line_to(p(14.6,49.8)), line_to(p(0,49.8))]) |> center2d(p(0,0)).
 ";
         let mut db = database(src).unwrap();
         let (_, q) = parse_query("main.").unwrap();
@@ -3616,15 +3902,15 @@ honi :- sketch([p(0,0), p(14.6,0), p(14.6,49.8), p(0,49.8)]) |> center2d(p(0,0))
     #[test]
     fn test_double_rotate_errors() {
         expect_sealed(
-            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ |> rotateToXZ |> linear_extrude(1).",
+            "main :- sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToXZ |> linear_extrude(1).",
             "rotateToXZ",
         );
         expect_sealed(
-            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ |> rotateToYZ |> linear_extrude(1).",
+            "main :- sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToYZ |> linear_extrude(1).",
             "rotateToYZ",
         );
         expect_sealed(
-            "main :- sketch([p(0,0), p(1,0), p(1,1), p(0,1)]) |> rotateToYZ |> rotateToXY |> linear_extrude(1).",
+            "main :- sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToXY |> linear_extrude(1).",
             "rotateToXY",
         );
     }

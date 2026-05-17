@@ -2422,12 +2422,12 @@ mod tests {
     #[test]
     fn body_eq_constraint_with_rule() {
         let resolved = run_success(
-            "cut(SLIT, W, H) :- X=(W-SLIT)/2, sketch([p(X, 0), p(SLIT+W, 0), p(SLIT+W, H-20), p(X, H-20)]).",
+            "cut(SLIT, W, H) :- X=(W-SLIT)/2, sketch(p(X, 0), [line_to(p(SLIT+W, 0)), line_to(p(SLIT+W, H-20)), line_to(p(X, H-20))]).",
             "cut(18, 40, 120).",
         );
         assert_eq!(
             resolved,
-            vec!["sketch([p(11, 0), p(58, 0), p(58, 100), p(11, 100)])"]
+            vec!["sketch(p(11, 0), [line_to(p(58, 0)), line_to(p(58, 100)), line_to(p(11, 100))])"]
         );
     }
 
