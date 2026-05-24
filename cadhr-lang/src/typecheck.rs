@@ -392,6 +392,72 @@ pub fn infer_term<S>(
     }
 }
 
+// ============================================================
+// Clause レベル: 関数定義をシグネチャと照合する
+// ============================================================
+
+/// `Clause::Rule` / `Clause::Fact` を型検査する。
+///
+/// 1. head 引数の `type_annotation` を TypeEnv に追加。range のみで型注釈なしの
+///    引数は `Number` 型として扱う (range が型を兼ねる)。
+/// 2. body の各 goal を `infer_term` で推論。Eq は両辺 unify、それ以外は構造の整合のみ。
+/// 3. 推論できなかった α が残っていてもこの関数では OK (型変数は Var で良い)。
+///    本体内で「推論不能」が確定したエラー (`MissingSignature` 等) は伝播する。
+///
+/// 返り値の型: 現状は `()`。`return_type` フィールドの活用は呼び出し規約が
+/// 確定してから (Task #8 で interpreter と統合する際) 実装する。LANG_SPEC §7 の
+/// 「返り値は head 引数として明示的に渡す」規約に合わせて、最後の head 引数を
+/// return_type と unify する方向で詰める予定。
+pub fn infer_clause<S: Clone>(
+    clause: &crate::parse::Clause<S>,
+    builtins: &HashMap<(String, usize), BuiltinSig>,
+) -> Result<(), TypeError> {
+    use crate::parse::{Clause, Term};
+    let (head, body) = match clause {
+        Clause::Fact { head, .. } => (head, [].as_slice()),
+        Clause::Rule { head, body, .. } => (head, body.as_slice()),
+        Clause::Use { .. } | Clause::RecordDecl { .. } => return Ok(()),
+    };
+
+    let mut subst = Substitution::new();
+    let mut var_gen = VarGen::new();
+    let mut env = TypeEnv::new();
+
+    // head の Var 引数を TypeEnv に登録。
+    if let Term::Struct { args, .. } = head {
+        for arg in args {
+            if let Term::Var {
+                name,
+                type_annotation,
+                min,
+                max,
+                ..
+            } = arg
+            {
+                let ty = match type_annotation {
+                    Some(t) => t.clone(),
+                    None if min.is_some() || max.is_some() => Type::Number,
+                    None => var_gen.fresh(),
+                };
+                env.insert(name.clone(), ty);
+            }
+        }
+    }
+
+    let mut ctx = InferCtx {
+        env,
+        subst: &mut subst,
+        var_gen: &mut var_gen,
+        builtins,
+    };
+
+    for goal in body {
+        // goal の型は Bool 想定 (Eq, predicate call)。型エラーがあれば伝播。
+        let _ = infer_term(goal, &mut ctx)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +759,82 @@ mod tests {
         };
         let ty = infer_term(&expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Number);
+    }
+
+    #[test]
+    fn infer_clause_typed_rule_ok() {
+        use crate::parse::{Clause, struc};
+        let b = initial_builtin_signatures();
+        // my_box(Size: Number) :- B = cube(Size, Size, Size).
+        let head = struc::<()>(
+            "my_box".to_string(),
+            vec![Term::Var {
+                name: "Size".to_string(),
+                scope: (),
+                default_value: None,
+                min: None,
+                max: None,
+                span: None,
+                type_annotation: Some(Type::Number),
+            }],
+        );
+        let body = vec![Term::Eq {
+            left: Box::new(var("B".to_string())),
+            right: Box::new(struc::<()>(
+                "cube".to_string(),
+                vec![
+                    var("Size".to_string()),
+                    var("Size".to_string()),
+                    var("Size".to_string()),
+                ],
+            )),
+        }];
+        let clause = Clause::<()>::Rule {
+            head,
+            body,
+            return_type: Some(Type::Shape3D),
+        };
+        infer_clause(&clause, &b).unwrap();
+    }
+
+    #[test]
+    fn infer_clause_type_mismatch_in_body() {
+        use crate::parse::{Clause, struc};
+        let b = initial_builtin_signatures();
+        // bad(X: Number) :- B = cube(X, X, circle(1)).  ← circle returns Shape2D, cube wants Number
+        let head = struc::<()>(
+            "bad".to_string(),
+            vec![Term::Var {
+                name: "X".to_string(),
+                scope: (),
+                default_value: None,
+                min: None,
+                max: None,
+                span: None,
+                type_annotation: Some(Type::Number),
+            }],
+        );
+        let body = vec![Term::Eq {
+            left: Box::new(var("B".to_string())),
+            right: Box::new(struc::<()>(
+                "cube".to_string(),
+                vec![
+                    var("X".to_string()),
+                    var("X".to_string()),
+                    struc::<()>(
+                        "circle".to_string(),
+                        vec![number(Rational::from_integer(1))],
+                    ),
+                ],
+            )),
+        }];
+        let clause = Clause::<()>::Rule {
+            head,
+            body,
+            return_type: None,
+        };
+        let r = infer_clause(&clause, &b);
+        assert!(matches!(r, Err(TypeError::Mismatch { .. })));
     }
 
     #[test]
