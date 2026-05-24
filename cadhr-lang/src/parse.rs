@@ -136,6 +136,14 @@ pub enum Term<Scope = ()> {
         left: Box<Term<Scope>>,
         right: Box<Term<Scope>>,
     },
+    /// `record_expr.field_name` — LANG_SPEC §4.4 の静的フィールドアクセス構文。
+    /// パーサーで postfix の `.atom` から構築される。Task #7 で record native 化が
+    /// 完了するまでは evaluator が auto-generated getter にフォールバックする。
+    FieldAccess {
+        record: Box<Term<Scope>>,
+        field: String,
+        span: Option<SrcSpan>,
+    },
 }
 
 pub type ScopeId = usize;
@@ -213,6 +221,7 @@ pub fn first_span<S>(term: &Term<S>) -> Option<SrcSpan> {
             }
             tail.as_ref().and_then(|t| first_span(t))
         }
+        Term::FieldAccess { record, span, .. } => span.or_else(|| first_span(record)),
         _ => None,
     }
 }
@@ -274,6 +283,18 @@ impl<Scope: PartialEq> PartialEq for Term<Scope> {
                 },
             ) => i1 == i2 && t1 == t2,
             (Term::StringLit { value: v1 }, Term::StringLit { value: v2 }) => v1 == v2,
+            (
+                Term::FieldAccess {
+                    record: r1,
+                    field: f1,
+                    ..
+                },
+                Term::FieldAccess {
+                    record: r2,
+                    field: f2,
+                    ..
+                },
+            ) => r1 == r2 && f1 == f2,
             (
                 Term::Eq {
                     left: l1,
@@ -402,6 +423,9 @@ impl<Scope> fmt::Debug for Term<Scope> {
                 write!(f, "]")
             }
             Term::StringLit { value } => write!(f, "\"{}\"", value),
+            Term::FieldAccess { record, field, .. } => {
+                write!(f, "{:?}.{}", record, field)
+            }
             Term::Eq { left, right } => {
                 write!(f, "constraint({:?} = {:?})", left, right)
             }
@@ -998,7 +1022,7 @@ fn atom_term(input: &str) -> PResult<'_, Term> {
 
 fn primary_term(input: &str) -> PResult<'_, Term> {
     // annotated_var_term は number_term より先に試行（0 < X のような形式を正しくパースするため）
-    alt((
+    let (input, base) = alt((
         list_term,
         paren_term,
         string_literal,
@@ -1006,7 +1030,20 @@ fn primary_term(input: &str) -> PResult<'_, Term> {
         number_term,
         atom_term,
     ))
-    .parse(input)
+    .parse(input)?;
+    // postfix `.field` — record_expr.field_name (LANG_SPEC §4.4)
+    //
+    // `.` の直後に空白なしで atom が続く場合のみマッチ。clause 終端の `.\n parent(...)`
+    // のようなケースでは `\n` が間に挟まるため field access として吸われない。
+    // 数値の小数点 (`3.5`) と衝突しないよう、ここに来る前に number_term が完全な
+    // 数値を消費している前提。
+    let (input, accesses) = many0(preceded(char('.'), unquoted_atom)).parse(input)?;
+    let term = accesses.into_iter().fold(base, |acc, field| Term::FieldAccess {
+        record: Box::new(acc),
+        field,
+        span: None,
+    });
+    Ok((input, term))
 }
 
 fn mul_op(input: &str) -> PResult<'_, ArithOp> {
@@ -1327,6 +1364,13 @@ fn fix_spans_in_term(term: &mut Term, base: usize) {
         Term::Eq { left, right } => {
             fix_spans_in_term(left, base);
             fix_spans_in_term(right, base);
+        }
+        Term::FieldAccess { record, span, .. } => {
+            if let Some(s) = span {
+                s.start = s.start.wrapping_sub(base);
+                s.end = s.end.wrapping_sub(base);
+            }
+            fix_spans_in_term(record, base);
         }
         _ => {}
     }
@@ -2229,6 +2273,73 @@ mod tests {
     fn parse_record_decl_trailing_comma() {
         let (_, clause) = clause_parser("#record p { x: Number, y: Number, }.").unwrap();
         assert!(matches!(clause, Clause::RecordDecl { .. }));
+    }
+
+    #[test]
+    fn parse_field_access_simple() {
+        let (_, clause) = clause_parser("main(M) :- M = OUT.models.").unwrap();
+        match clause {
+            Clause::Rule { body, .. } => {
+                let goal = &body[0];
+                let rhs = match goal {
+                    Term::Eq { right, .. } => right.as_ref(),
+                    _ => panic!("Expected Eq"),
+                };
+                match rhs {
+                    Term::FieldAccess { record, field, .. } => {
+                        assert_eq!(field, "models");
+                        assert!(matches!(record.as_ref(), Term::Var { name, .. } if name == "OUT"));
+                    }
+                    _ => panic!("Expected FieldAccess, got {:?}", rhs),
+                }
+            }
+            _ => panic!("Expected Rule"),
+        }
+    }
+
+    #[test]
+    fn parse_field_access_chained() {
+        // OUT.bom.first みたいに連鎖できることを確認
+        let (_, clause) = clause_parser("hoge :- X = R.a.b.").unwrap();
+        match clause {
+            Clause::Rule { body, .. } => match &body[0] {
+                Term::Eq { right, .. } => match right.as_ref() {
+                    Term::FieldAccess {
+                        record: inner,
+                        field,
+                        ..
+                    } => {
+                        assert_eq!(field, "b");
+                        match inner.as_ref() {
+                            Term::FieldAccess {
+                                record: r2,
+                                field: f2,
+                                ..
+                            } => {
+                                assert_eq!(f2, "a");
+                                assert!(matches!(r2.as_ref(), Term::Var { name, .. } if name == "R"));
+                            }
+                            other => panic!("Expected nested FieldAccess, got {:?}", other),
+                        }
+                    }
+                    _ => panic!("Expected FieldAccess"),
+                },
+                _ => panic!("Expected Eq"),
+            },
+            _ => panic!("Expected Rule"),
+        }
+    }
+
+    #[test]
+    fn parse_clause_terminator_after_var_not_consumed_as_field() {
+        // `hoge(X).` — X の後ろの `.` は clause 終端であって field access ではない
+        let (_, clause) = clause_parser("hoge(X).").unwrap();
+        match clause {
+            Clause::Fact { head: Term::Struct { args, .. }, .. } => {
+                assert!(matches!(&args[0], Term::Var { name, .. } if name == "X"));
+            }
+            _ => panic!("Expected Fact"),
+        }
     }
 
     #[test]

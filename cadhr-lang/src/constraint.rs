@@ -373,6 +373,12 @@ impl ArithExpr {
             Term::StringLit { .. } => Err(ConversionError {
                 message: "cannot convert string literal to arithmetic expression".to_string(),
             }),
+            Term::FieldAccess { field, .. } => Err(ConversionError {
+                message: format!(
+                    "cannot convert record field access '.{}' to arithmetic expression",
+                    field
+                ),
+            }),
         }
     }
 

@@ -420,6 +420,9 @@ fn collect_default_var_bindings(
             collect_default_var_bindings(left, bindings);
             collect_default_var_bindings(right, bindings);
         }
+        Term::FieldAccess { record, .. } => {
+            collect_default_var_bindings(record, bindings);
+        }
     }
 }
 
@@ -498,7 +501,8 @@ fn try_fold_number_literals<S>(term: &Term<S>) -> Option<crate::rational::Ration
         | Term::Struct { .. }
         | Term::List { .. }
         | Term::StringLit { .. }
-        | Term::Eq { .. } => None,
+        | Term::Eq { .. }
+        | Term::FieldAccess { .. } => None,
     }
 }
 
@@ -531,7 +535,8 @@ pub fn try_eval_to_number<S>(term: &Term<S>) -> Option<crate::rational::Rational
         | Term::Struct { .. }
         | Term::List { .. }
         | Term::StringLit { .. }
-        | Term::Eq { .. } => None,
+        | Term::Eq { .. }
+        | Term::FieldAccess { .. } => None,
     }
 }
 
@@ -562,6 +567,9 @@ pub fn fold_number_literals_in_place<S>(term: &mut Term<S>) {
                 fold_number_literals_in_place(left.as_mut());
                 fold_number_literals_in_place(right.as_mut());
             }
+            Term::FieldAccess { record, .. } => {
+                fold_number_literals_in_place(record.as_mut());
+            }
             Term::Number { .. } | Term::Var { .. } | Term::StringLit { .. } => {}
         }
     }
@@ -589,6 +597,9 @@ fn occurs_check_scoped(var_name: &str, var_scope: ScopeId, term: &ScopedTerm) ->
         Term::Eq { left, right } => {
             occurs_check_scoped(var_name, var_scope, left)
                 || occurs_check_scoped(var_name, var_scope, right)
+        }
+        Term::FieldAccess { record, .. } => {
+            occurs_check_scoped(var_name, var_scope, record)
         }
         Term::Number { .. } | Term::StringLit { .. } => false,
     }
@@ -1531,6 +1542,11 @@ fn assign_scope_to_term(term: Term, scope_id: ScopeId, env: &mut ScopedEnv) -> S
             left: Box::new(assign_scope_to_term(*left, scope_id, env)),
             right: Box::new(assign_scope_to_term(*right, scope_id, env)),
         },
+        Term::FieldAccess { record, field, span } => Term::FieldAccess {
+            record: Box::new(assign_scope_to_term(*record, scope_id, env)),
+            field,
+            span,
+        },
     }
 }
 
@@ -2245,6 +2261,9 @@ fn collect_default_annotations_in_term(
             collect_default_annotations_in_term(left, collected)?;
             collect_default_annotations_in_term(right, collected)?;
         }
+        Term::FieldAccess { record, .. } => {
+            collect_default_annotations_in_term(record, collected)?;
+        }
     }
     Ok(())
 }
@@ -2279,6 +2298,9 @@ fn strip_default_annotations(term: &mut Term) {
         Term::Eq { left, right } => {
             strip_default_annotations(left);
             strip_default_annotations(right);
+        }
+        Term::FieldAccess { record, .. } => {
+            strip_default_annotations(record);
         }
     }
 }

@@ -310,6 +310,15 @@ pub fn infer_term<S>(
             // Eq は goal なので戻り値型は意味的に不要。型システムでは Bool を返す。
             Ok(Type::Bool)
         }
+        Term::FieldAccess { record: _, field, .. } => {
+            // TODO(Task #7): record decl テーブルを ctx に渡し、
+            // record の型 → 該当 field の型 を返す実装にする。
+            // 現状は record native 評価が未着手のため AmbiguousType を返して
+            // 推論器が止まることを優先する (silent fallback 禁止)。
+            Err(TypeError::AmbiguousType {
+                context: format!("field access .{}: record decl table not yet available", field),
+            })
+        }
     }
 }
 
