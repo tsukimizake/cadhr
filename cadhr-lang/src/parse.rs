@@ -103,6 +103,7 @@ pub enum Term<Scope = ()> {
     },
     Number {
         value: crate::rational::Rational,
+        span: Option<SrcSpan>,
     },
     /// 中置演算子式: left op right (算術演算 or CSG演算)
     InfixExpr {
@@ -173,7 +174,7 @@ impl VarAnnotation {
 /// Number または Var(default_value付き) から Rational と SrcSpan を取り出す。
 pub fn term_as_number<S>(term: &Term<S>) -> Option<(crate::rational::Rational, Option<SrcSpan>)> {
     match term {
-        Term::Number { value } => Some((value.clone(), None)),
+        Term::Number { value, span } => Some((value.clone(), *span)),
         Term::Var {
             default_value: Some(value),
             span,
@@ -234,7 +235,7 @@ impl<Scope: PartialEq> PartialEq for Term<Scope> {
                     ..
                 },
             ) => n1 == n2 && s1 == s2 && dv1 == dv2 && min1 == min2 && max1 == max2,
-            (Term::Number { value: v1 }, Term::Number { value: v2 }) => v1 == v2,
+            (Term::Number { value: v1, .. }, Term::Number { value: v2, .. }) => v1 == v2,
             (
                 Term::InfixExpr {
                     op: o1,
@@ -348,7 +349,7 @@ impl<Scope> fmt::Debug for Term<Scope> {
                 }
                 Ok(())
             }
-            Term::Number { value } => write!(f, "{}", value),
+            Term::Number { value, .. } => write!(f, "{}", value),
             Term::InfixExpr { op, left, right } => {
                 let op_str = match op {
                     ArithOp::Add => "+",
@@ -497,12 +498,17 @@ pub fn annotated_var(
 }
 
 pub fn number<S>(value: crate::rational::Rational) -> Term<S> {
-    Term::Number { value }
+    Term::Number { value, span: None }
+}
+
+pub fn number_with_span<S>(value: crate::rational::Rational, span: Option<SrcSpan>) -> Term<S> {
+    Term::Number { value, span }
 }
 
 pub fn number_int<S>(value: i64) -> Term<S> {
     Term::Number {
         value: crate::rational::Rational::from_integer(value),
+        span: None,
     }
 }
 
@@ -710,7 +716,21 @@ fn paren_term(input: &str) -> PResult<'_, Term> {
 }
 
 fn number_term(input: &str) -> PResult<'_, Term> {
-    map(ws(fixed_number), number).parse(input)
+    let (input, _) = space_or_comment0(input)?;
+    let value_start = input.as_ptr() as usize;
+    let (input, value) = fixed_number(input)?;
+    let value_end = input.as_ptr() as usize;
+    Ok((
+        input,
+        number_with_span(
+            value,
+            Some(SrcSpan {
+                start: value_start,
+                end: value_end,
+                file_id: 0,
+            }),
+        ),
+    ))
 }
 
 /// 比較演算子 (<, <=, >, >=)
@@ -1563,7 +1583,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
             Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
-                Term::Number { value } => assert_eq!(*value, crate::rational::Rational::from_integer(42)),
+                Term::Number { value, .. } => assert_eq!(*value, crate::rational::Rational::from_integer(42)),
                 _ => panic!("Expected Number"),
             },
             _ => panic!("Expected Fact"),
@@ -1576,7 +1596,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
             Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
-                Term::Number { value } => assert_eq!(*value, crate::rational::Rational::from_ratio(10001, 100)),
+                Term::Number { value, .. } => assert_eq!(*value, crate::rational::Rational::from_ratio(10001, 100)),
                 _ => panic!("Expected Number"),
             },
             _ => panic!("Expected Fact"),
@@ -1589,7 +1609,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
             Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
-                Term::Number { value } => assert_eq!(*value, crate::rational::Rational::from_ratio(-350, 100)),
+                Term::Number { value, .. } => assert_eq!(*value, crate::rational::Rational::from_ratio(-350, 100)),
                 _ => panic!("Expected Number"),
             },
             _ => panic!("Expected Fact"),

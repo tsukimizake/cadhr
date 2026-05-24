@@ -129,6 +129,7 @@ fn try_eval(expr: &ArithExpr) -> Option<Rational> {
 fn try_solve_for_var(expr: &ArithExpr, target: &Rational) -> Option<(String, Rational)> {
     match expr {
         ArithExpr::Var(name) => Some((name.clone(), target.clone())),
+        ArithExpr::RangeVar { name, .. } => Some((name.clone(), target.clone())),
         ArithExpr::BinOp { op, left, right } => {
             match (try_eval(left), try_eval(right)) {
                 // c OP right = target → right を解く
@@ -175,7 +176,7 @@ fn try_solve_for_var(expr: &ArithExpr, target: &Rational) -> Option<(String, Rat
 
 fn substitute_in_expr(expr: &ArithExpr, bindings: &HashMap<String, Rational>) -> ArithExpr {
     match expr {
-        ArithExpr::Var(name) => {
+        ArithExpr::Var(name) | ArithExpr::RangeVar { name, .. } => {
             if let Some(value) = bindings.get(name) {
                 ArithExpr::Num(value.clone())
             } else {
@@ -347,7 +348,7 @@ impl ArithExpr {
                 })
             }
             Term::Var { name, .. } => Ok(ArithExpr::Var(name.clone())),
-            Term::Number { value } => Ok(ArithExpr::Num(value.clone())),
+            Term::Number { value, .. } => Ok(ArithExpr::Num(value.clone())),
             Term::InfixExpr { op, left, right } => {
                 let left = ArithExpr::try_from_term(left)?;
                 let right = ArithExpr::try_from_term(right)?;

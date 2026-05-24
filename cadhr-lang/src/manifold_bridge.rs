@@ -675,6 +675,7 @@ pub fn extract_control_points<S: Clone + PartialEq + fmt::Debug>(
                     vscope.clone(),
                     Term::Number {
                         value: Rational::from_f64(val),
+                        span: None,
                     },
                 ));
             }
@@ -765,6 +766,7 @@ fn apply_var_overrides_to_term<S>(
             if let Some(&val) = overrides.get(name) {
                 *term = Term::Number {
                     value: Rational::from_f64(val),
+                    span: None,
                 };
             }
         }
@@ -1983,19 +1985,18 @@ impl<S> crate::term_processor::TermProcessor<S> for MeshGenerator {
             ));
         }
 
-        let nodes: Vec<EvaluatedNode> = exprs
-            .iter()
-            .map(|e| build_evaluated_node(e, &self.include_paths))
-            .collect::<Result<Vec<_>, _>>()?;
+        if exprs.len() > 1 {
+            return Err(ConversionError::UnknownPrimitive(
+                "multiple mesh terms found: use + for explicit union".to_string(),
+            ));
+        }
 
-        let manifold = exprs
-            .iter()
-            .map(|e| e.evaluate(&self.include_paths))
-            .reduce(|acc, m| Ok(acc?.union(&m?)))
-            .unwrap()?;
+        let model = &exprs[0];
+        let nodes = build_evaluated_node(model, &self.include_paths)?;
+        let manifold = model.evaluate(&self.include_paths)?;
 
         let with_normals = manifold.calculate_normals(0, 30.0);
-        Ok((with_normals.to_mesh(), nodes))
+        Ok((with_normals.to_mesh(), vec![nodes]))
     }
 }
 
@@ -3161,7 +3162,7 @@ mod tests {
         // box(10) → cube(10,10,10) / box(20) → cube(20,20,20) は変わらないこと。
         let mut resolved = execute_main_args(
             "box(N, M) :- M = cube(N, N, N).\n\
-             main(L) :- box(10, S1), box(20, S2), L = [S1, S2, control3d(p(X, 0, 0))].",
+             main(L) :- box(10, S1), box(20, S2), L = [S1 + S2, control3d(p(X, 0, 0))].",
         );
 
         let mut overrides = HashMap::new();
@@ -3170,8 +3171,7 @@ mod tests {
 
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
-        // shape は 2 つ残る
-        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved.len(), 1);
         let (mesh, _) = generate_mesh_and_tree_from_terms(&resolved, &[]).unwrap();
         assert!(mesh.vertices().len() > 0);
     }

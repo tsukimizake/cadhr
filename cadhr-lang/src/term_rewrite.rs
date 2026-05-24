@@ -189,7 +189,7 @@ fn resolve_inner(term: &ScopedTerm, env: &ScopedEnv, depth: usize) -> ScopedTerm
             let has_annotation = default_value.is_some() || min.is_some() || max.is_some();
             let sid = *scope;
             match env.get(sid, name) {
-                Some(Term::Number { value: new_val }) if has_annotation => Term::Var {
+                Some(Term::Number { value: new_val, .. }) if has_annotation => Term::Var {
                     name: name.clone(),
                     scope: *scope,
                     default_value: Some(new_val.clone()),
@@ -471,7 +471,7 @@ fn propagate_defaults_across_body(body: &mut [ScopedTerm]) {
 /// ここで Number に変換すると置換が抜け落ちる。
 fn try_fold_number_literals<S>(term: &Term<S>) -> Option<crate::rational::Rational> {
     match term {
-        Term::Number { value } => Some(value.clone()),
+        Term::Number { value, .. } => Some(value.clone()),
         Term::InfixExpr { op, left, right } => {
             let l = try_fold_number_literals(left)?;
             let r = try_fold_number_literals(right)?;
@@ -498,7 +498,7 @@ fn try_fold_number_literals<S>(term: &Term<S>) -> Option<crate::rational::Ration
 /// unify 中では使わず、最終的な数値抽出（メッシュ生成など）で使う。
 pub fn try_eval_to_number<S>(term: &Term<S>) -> Option<crate::rational::Rational> {
     match term {
-        Term::Number { value } => Some(value.clone()),
+        Term::Number { value, .. } => Some(value.clone()),
         Term::Var {
             default_value: Some(value),
             ..
@@ -653,7 +653,7 @@ type Range = (Option<Bound>, Option<Bound>);
 
 fn compute_term_range<S>(term: &Term<S>) -> Result<Range, String> {
     match term {
-        Term::Number { value } => Ok((
+        Term::Number { value, .. } => Ok((
             Some(Bound {
                 value: value.clone(),
                 inclusive: true,
@@ -997,17 +997,20 @@ pub fn unify(
                     ..
                 },
             ) if n1 == n2 && s1 == s2 => {}
+            // wildcard はどんな項とも unify 成功し束縛を作らない。
+            // 通常の Var ハンドラより先に処理しないと、`unify(X, _)` で X が `_` に
+            // 束縛されて以降の解決で名前 `_` の偽の制約が発生してしまう。
+            (Term::Var { name, .. }, _) if name == "_" => {}
+            (_, Term::Var { name, .. }) if name == "_" => {}
             // Var vs Number
             (Term::Var { name, scope, .. }, Term::Number { .. }) => {
-                if name != "_" {
-                    env.insert(*scope, name.clone(), t2.clone());
-                }
+                env.insert(*scope, name.clone(), t2.clone());
             }
             (Term::Number { .. }, Term::Var { .. }) => {
                 stack.push((t2, t1));
             }
             // Var vs other
-            (Term::Var { name, scope, .. }, _) if name != "_" => {
+            (Term::Var { name, scope, .. }, _) => {
                 if occurs_check_scoped(name, *scope, &t2) {
                     return Err(UnifyError {
                         message: format!("occurs check failed: {} occurs in {:?}", name, t2),
@@ -1021,19 +1024,15 @@ pub fn unify(
                     scope: s2,
                     ..
                 } = &t2
-                    && n2 != "_"
                 {
                     env.union(*scope, name, *s2, n2);
                 }
                 env.insert(*scope, name.clone(), t2.clone());
             }
-            (_, Term::Var { name, .. }) if name != "_" => {
+            (_, Term::Var { .. }) => {
                 stack.push((t2, t1));
             }
-            // wildcard
-            (Term::Var { name, .. }, _) if name == "_" => {}
-            (_, Term::Var { name, .. }) if name == "_" => {}
-            (Term::Number { value: v1 }, Term::Number { value: v2 }) => {
+            (Term::Number { value: v1, .. }, Term::Number { value: v2, .. }) => {
                 if v1 != v2 {
                     return Err(UnifyError {
                         message: format!("number mismatch: {} != {}", v1, v2),
@@ -1349,11 +1348,29 @@ fn solve_arithmetic_equations(
 ) -> Result<(), RewriteError> {
     let mut eqs = Vec::new();
     let mut constraint_indices = Vec::new();
+    // `X = Number` 形式の Eq で、Number 側が span を持っていれば、その span を変数の
+    // 束縛 Number に継承する。control point の write-back は Number.span から
+    // ソースの該当箇所を特定するため、`@N` lowering 経由でも span 伝播を保つ必要がある。
+    let mut number_spans: HashMap<String, Option<SrcSpan>> = HashMap::new();
     for (i, goal) in goals.iter().enumerate() {
         if let Term::Eq { left, right } = goal {
             let left_expr = ArithExpr::try_from_term(left);
             let right_expr = ArithExpr::try_from_term(right);
             if let (Ok(l), Ok(r)) = (left_expr, right_expr) {
+                if let (
+                    Term::Var { name, .. },
+                    Term::Number { span: Some(s), .. },
+                ) = (left.as_ref(), right.as_ref())
+                {
+                    number_spans.entry(name.clone()).or_insert(Some(*s));
+                }
+                if let (
+                    Term::Number { span: Some(s), .. },
+                    Term::Var { name, .. },
+                ) = (left.as_ref(), right.as_ref())
+                {
+                    number_spans.entry(name.clone()).or_insert(Some(*s));
+                }
                 eqs.push(ArithEq::new(l, r));
                 constraint_indices.push(i);
             }
@@ -1386,7 +1403,8 @@ fn solve_arithmetic_equations(
             let mut scoped_env = ScopedEnv::new();
             for (var_name, value) in &result.bindings {
                 if let Some(&scope) = var_scopes.get(var_name) {
-                    let term_value = number(value.clone());
+                    let span = number_spans.get(var_name).copied().flatten();
+                    let term_value = crate::parse::number_with_span(value.clone(), span);
                     scoped_env.insert(scope, var_name.clone(), term_value.clone());
                     // 等式は解消されて消えるので、束縛を shared_env に残さないと
                     // 後続のサブゴール展開で同じ Var を解決できなくなる。
@@ -1464,7 +1482,7 @@ fn assign_scope_to_term(term: Term, scope_id: ScopeId, env: &mut ScopedEnv) -> S
                 span,
             }
         }
-        Term::Number { value } => Term::Number { value },
+        Term::Number { value, span } => Term::Number { value, span },
         Term::InfixExpr { op, left, right } => Term::InfixExpr {
             op,
             left: Box::new(assign_scope_to_term(*left, scope_id, env)),
@@ -1578,21 +1596,28 @@ fn handle_make_record(
     };
 
     // Spec を field 名で索引化。重複指定はエラー (誤記検出)。
+    // モジュール内で書かれた `f(value)` は `mod::f(value)` に prefix されているので、
+    // 最後の `::` 以降をフィールド名として扱う。
     let mut by_field: HashMap<String, ScopedTerm> = HashMap::new();
     for item in items {
         let item_resolved = resolve(&item, shared_env);
         match &item_resolved {
             Term::Struct { functor, args, .. } if args.len() == 1 => {
-                if by_field.contains_key(functor) {
+                let field_name = functor
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(functor.as_str())
+                    .to_string();
+                if by_field.contains_key(&field_name) {
                     return Err(RewriteError {
                         message: format!(
                             "make_{} spec contains duplicate field `{}`",
-                            record_name, functor
+                            record_name, field_name
                         ),
                         goal: item_resolved.clone(),
                     });
                 }
-                by_field.insert(functor.clone(), args[0].clone());
+                by_field.insert(field_name, args[0].clone());
             }
             _ => {
                 return Err(RewriteError {
@@ -1674,25 +1699,40 @@ fn rewrite_term_recursive(
             return handle_assert_eq(args, *span, shared_env);
         }
 
-        // make_NAME(Spec, R): record decl テーブルに NAME があれば builtin として処理。
-        if args.len() == 2 {
-            if let Some(record_name) = functor.strip_prefix("make_") {
-                if let Some(fields) = record_decls.get(record_name) {
-                    let scope = match &args[1] {
-                        Term::Var { scope, .. } => *scope,
-                        _ => 0,
-                    };
-                    return handle_make_record(
-                        record_name,
-                        fields,
-                        &args[0],
-                        &args[1],
-                        scope,
-                        shared_env,
-                        *span,
-                    );
+        // __make_record__("NAME", Spec, R): auto-generated `make_NAME` rule の本体。
+        // 第 1 引数 (StringLit) で record 名を、第 2/3 引数で spec/target を受ける。
+        if functor == "__make_record__" && args.len() == 3 {
+            let record_name = match &args[0] {
+                Term::StringLit { value } => value.clone(),
+                other => {
+                    return Err(RewriteError {
+                        message: format!(
+                            "__make_record__: 1st arg must be a string literal of the record name, got {:?}",
+                            other
+                        ),
+                        goal: term.clone(),
+                    });
                 }
-            }
+            };
+            let fields = record_decls.get(&record_name).cloned().ok_or_else(|| {
+                RewriteError {
+                    message: format!("__make_record__: unknown record `{}`", record_name),
+                    goal: term.clone(),
+                }
+            })?;
+            let scope = match &args[2] {
+                Term::Var { scope, .. } => *scope,
+                _ => 0,
+            };
+            return handle_make_record(
+                &record_name,
+                &fields,
+                &args[1],
+                &args[2],
+                scope,
+                shared_env,
+                *span,
+            );
         }
     }
 
@@ -1841,9 +1881,11 @@ fn rewrite_term_recursive(
                         op,
                         left: Box::new(new_left_terms.pop().unwrap_or(Term::Number {
                             value: crate::rational::Rational::zero(),
+                            span: None,
                         })),
                         right: Box::new(new_right_terms.pop().unwrap_or(Term::Number {
                             value: crate::rational::Rational::zero(),
+                            span: None,
                         })),
                     },
                 });
@@ -1991,6 +2033,7 @@ fn resolve_builtin_arg(
                     message: "builtin argument resolved to non-singleton".to_string(),
                     goal: resolved.into_iter().next().unwrap_or(Term::Number {
                         value: crate::rational::Rational::zero(),
+                        span: None,
                     }),
                 });
             }
@@ -2037,15 +2080,208 @@ fn resolve_builtin_fact_args(
     })
 }
 
+/// Body 内に集めた `@-default` 注釈情報。lowering で Eq goal と Var 復元に使う。
+struct LoweredAnnotation {
+    value: crate::rational::Rational,
+    value_span: Option<SrcSpan>,
+    min: Option<Bound>,
+    max: Option<Bound>,
+    var_span: Option<SrcSpan>,
+}
+
+/// `Var@N` 注釈を `Var = N` の Eq goal として body 先頭に注入し、Var 側の
+/// `default_value` を剥がす。`X@N` を「外側の `X = N` を書くシンタックスシュガー」
+/// として実装するのが意図。
+///
+/// - 同一名で異なる default が body 内に複数あればエラー
+/// - 同一名で同じ default が複数あれば、最初の値・最初の min/max/span を採用
+/// - Eq の RHS の `Number` には元の `@N` リテラル位置の span を継承させ、
+///   control point write-back 経路 (Number.span 経由) が動くようにする
+/// - `min` / `max` 注釈はそのまま Eq の LHS の Var に残す (range check 維持)
+pub fn lower_default_annotations(body: &mut Vec<Term>) -> Result<(), RewriteError> {
+    let mut collected: HashMap<String, LoweredAnnotation> = HashMap::new();
+    if let Err((name, existing, new_val, term)) =
+        collect_default_annotations(body, &mut collected)
+    {
+        let mut dummy_env = ScopedEnv::new();
+        return Err(RewriteError {
+            message: format!(
+                "variable `{}` has conflicting default annotations: {} vs {}",
+                name, existing, new_val
+            ),
+            goal: assign_scope_to_term(term, 0, &mut dummy_env),
+        });
+    }
+
+    if collected.is_empty() {
+        return Ok(());
+    }
+
+    for term in body.iter_mut() {
+        strip_default_annotations(term);
+    }
+
+    let mut eq_goals: Vec<Term> = Vec::with_capacity(collected.len());
+    for (name, info) in collected {
+        eq_goals.push(Term::Eq {
+            left: Box::new(Term::Var {
+                name,
+                scope: (),
+                default_value: None,
+                min: info.min,
+                max: info.max,
+                span: info.var_span,
+            }),
+            right: Box::new(Term::Number {
+                value: info.value,
+                span: info.value_span,
+            }),
+        });
+    }
+
+    let original = std::mem::take(body);
+    body.extend(eq_goals);
+    body.extend(original);
+    Ok(())
+}
+
+fn collect_default_annotations(
+    body: &[Term],
+    collected: &mut HashMap<String, LoweredAnnotation>,
+) -> Result<(), (String, crate::rational::Rational, crate::rational::Rational, Term)> {
+    for term in body {
+        collect_default_annotations_in_term(term, collected)?;
+    }
+    Ok(())
+}
+
+fn collect_default_annotations_in_term(
+    term: &Term,
+    collected: &mut HashMap<String, LoweredAnnotation>,
+) -> Result<(), (String, crate::rational::Rational, crate::rational::Rational, Term)> {
+    match term {
+        Term::Var {
+            name,
+            default_value: Some(value),
+            min,
+            max,
+            span,
+            ..
+        } if name != "_" => match collected.get_mut(name) {
+            Some(existing) => {
+                if existing.value != *value {
+                    return Err((
+                        name.clone(),
+                        existing.value.clone(),
+                        value.clone(),
+                        term.clone(),
+                    ));
+                }
+                if existing.min.is_none() {
+                    existing.min = min.clone();
+                }
+                if existing.max.is_none() {
+                    existing.max = max.clone();
+                }
+                if existing.var_span.is_none() {
+                    existing.var_span = *span;
+                }
+                if existing.value_span.is_none() {
+                    existing.value_span = *span;
+                }
+            }
+            None => {
+                collected.insert(
+                    name.clone(),
+                    LoweredAnnotation {
+                        value: value.clone(),
+                        value_span: *span,
+                        min: min.clone(),
+                        max: max.clone(),
+                        var_span: *span,
+                    },
+                );
+            }
+        },
+        Term::Var { .. } | Term::Number { .. } | Term::StringLit { .. } => {}
+        Term::Struct { args, .. } => {
+            for a in args {
+                collect_default_annotations_in_term(a, collected)?;
+            }
+        }
+        Term::List { items, tail } => {
+            for it in items {
+                collect_default_annotations_in_term(it, collected)?;
+            }
+            if let Some(t) = tail {
+                collect_default_annotations_in_term(t, collected)?;
+            }
+        }
+        Term::InfixExpr { left, right, .. } => {
+            collect_default_annotations_in_term(left, collected)?;
+            collect_default_annotations_in_term(right, collected)?;
+        }
+        Term::Eq { left, right } => {
+            collect_default_annotations_in_term(left, collected)?;
+            collect_default_annotations_in_term(right, collected)?;
+        }
+    }
+    Ok(())
+}
+
+fn strip_default_annotations(term: &mut Term) {
+    match term {
+        Term::Var {
+            name,
+            default_value,
+            ..
+        } if name != "_" => {
+            *default_value = None;
+        }
+        Term::Var { .. } | Term::Number { .. } | Term::StringLit { .. } => {}
+        Term::Struct { args, .. } => {
+            for a in args.iter_mut() {
+                strip_default_annotations(a);
+            }
+        }
+        Term::List { items, tail } => {
+            for it in items.iter_mut() {
+                strip_default_annotations(it);
+            }
+            if let Some(t) = tail.as_mut() {
+                strip_default_annotations(t);
+            }
+        }
+        Term::InfixExpr { left, right, .. } => {
+            strip_default_annotations(left);
+            strip_default_annotations(right);
+        }
+        Term::Eq { left, right } => {
+            strip_default_annotations(left);
+            strip_default_annotations(right);
+        }
+    }
+}
+
 pub fn execute(
     db: &mut [Clause],
-    query: Vec<Term>,
+    mut query: Vec<Term>,
 ) -> Result<(Vec<ScopedTerm>, ScopedEnv), RewriteError> {
     let mut clause_counter: usize = 0;
     let mut shared_env = ScopedEnv::new();
     let mut results = Vec::new();
     let mut db_with_builtins = db.to_vec();
     db_with_builtins.extend(builtin_cad_facts());
+
+    // 全 rule body と query を `Var@N` → `Var = N` の Eq goal に展開してから実行。
+    // これにより `@N` が InfixExpr の中に直接埋まっているケースでも、外側に `X = N`
+    // と書いたのと同じ伝播経路に乗る。
+    for clause in db_with_builtins.iter_mut() {
+        if let Clause::Rule { body, .. } = clause {
+            lower_default_annotations(body)?;
+        }
+    }
+    lower_default_annotations(&mut query)?;
 
     // record decl テーブルを db から抽出。make_NAME builtin の引数解決に使う。
     let record_decls = extract_record_decls(&db_with_builtins);
@@ -2056,6 +2292,16 @@ pub fn execute(
         .collect();
 
     for term in scoped_query {
+        // Eq ゴール (lowering で query に注入された `X = N` も含む) は
+        // rewrite_term_recursive では処理できないので、resolve_equality_goals に
+        // 直接渡す。bind がその場で shared_env に入って後続 goal で参照できる。
+        if matches!(term, Term::Eq { .. }) {
+            let mut just_eq = vec![term];
+            resolve_equality_goals(&mut just_eq, &mut shared_env)?;
+            results.extend(just_eq);
+            continue;
+        }
+
         let mut other_goals = Vec::new();
         let resolved = rewrite_term_recursive(
             &db_with_builtins,
@@ -2253,8 +2499,9 @@ mod tests {
 
     #[test]
     fn default_var_matches_annotated_value() {
+        // `X@25` は `X = 25` のシンタックスシュガーとして body に展開され、X は数値 25 に解決される。
         let resolved = run_success("f(25).", "f(X@25).");
-        assert_eq!(resolved, vec!["f(X@25)"]);
+        assert_eq!(resolved, vec!["f(25)"]);
     }
 
     #[test]
@@ -2264,6 +2511,7 @@ mod tests {
 
     #[test]
     fn default_var_propagates_within_rule_body() {
+        // W@5 / X@25 はそれぞれ W = 5 / X = 25 として lowering され、出力上は数値に置換される。
         let resolved = run_success(
             "cut(W, MODEL) :- MODEL = cube(W, 50, 260). main(MODEL) :- cut(W@5, CUT), MODEL = cube(X@25, 50, 300) - (CUT |> translate(p(0, 0, 0), p(X / 2 - W, 0, 0))).",
             "main(M).",
@@ -2271,7 +2519,7 @@ mod tests {
         assert_eq!(
             resolved,
             vec![
-                "main((cube(X@25, 50, 300) - translate(cube(5, 50, 260), p(0, 0, 0), p(7.5, 0, 0))))"
+                "main((cube(25, 50, 300) - translate(cube(5, 50, 260), p(0, 0, 0), p(7.5, 0, 0))))"
             ]
         );
     }
@@ -2972,19 +3220,191 @@ test(B, C) :- constrain([item(a, 3), item(b, B), item(c, C)]).\n";
         );
     }
 
-    /// 範囲注釈付きデフォルトの線形伝播: `-180 < T1 @ 0 < 180` で T1 にデフォルト 0 と
-    /// 範囲制約を与え、`T2 = 0 - T1` で T2 が連動する。query で T1=30 を渡すと T2=-30。
-    /// GUI でスライダーから T1 を変えた時の連動回転に対応。
+    /// 範囲注釈付きデフォルトの線形伝播: body 局所の T1 に範囲 + default 0 を与え、
+    /// `T2 = 0 - T1` を介して T2 = 0 が伝播する。`@N` は `X = N` のシンタックスシュガー
+    /// として lowering されるため、`T1 @ 0` は `T1 = 0` と同じ意味になる。
     #[test]
     fn range_annotated_default_propagates_linearly() {
-        let db_src = "test(T1, MODEL) :- -180 < T1 @ 0 < 180,\n\
-                                          T2 = 0 - T1,\n\
-                                          MODEL = cylinder(5, T2).\n";
+        let db_src = "test(MODEL) :- -180 < T1 @ 0 < 180,\n\
+                                     T2 = 0 - T1,\n\
+                                     MODEL = cylinder(5, T2).\n";
         let mut db = database(db_src).expect("parse db");
-        let q = query("test(30, M).").expect("parse query").1;
+        let q = query("test(M).").expect("parse query").1;
         let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
         let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
-        assert_eq!(strs, vec!["test(30, cylinder(5, -30))"]);
+        assert_eq!(strs, vec!["test(cylinder(5, 0))"]);
+    }
+
+    /// `@N` は `X = N` のシンタックスシュガーなので、head 経由で別の値に縛られている
+    /// 変数に body で `@N` を付けると衝突して失敗する。
+    #[test]
+    fn head_var_annotated_in_body_conflicts_with_caller() {
+        let db_src = "test(T1, MODEL) :- -180 < T1 @ 0 < 180,\n\
+                                          MODEL = cylinder(5, T1).\n";
+        let mut db = database(db_src).expect("parse db");
+        let q = query("test(30, M).").expect("parse query").1;
+        let result = execute(&mut db, q);
+        assert!(
+            result.is_err(),
+            "expected conflict between caller T1=30 and body annotation T1@0, got {:?}",
+            result
+        );
+    }
+
+    /// `@N` 付き Var が InfixExpr の内部に埋まっているケースでも、`X = N` の
+    /// シンタックスシュガーとして展開されて算術式が評価できる。
+    /// (`line_to(p(HOOK_L - HOOK_LEN@4, ...))` のような実用パターン)
+    #[test]
+    fn annotation_inside_infix_expr_resolves() {
+        let resolved = run_success(
+            "test(MODEL) :- MODEL = cube(HOOK_L@13 - HOOK_LEN@4, 50, 60).",
+            "test(M).",
+        );
+        assert_eq!(resolved, vec!["test(cube(9, 50, 60))"]);
+    }
+
+    /// 深いネスト位置 (sketch の line_to の p() の中) でも @N が解決される。
+    #[test]
+    fn annotation_inside_deeply_nested_struct() {
+        let resolved = run_success(
+            "test(MODEL) :- MODEL = sketch(p(0, 0), [line_to(p(X@10, Y@20)), line_to(p(X - W@3, Y))]).",
+            "test(M).",
+        );
+        assert_eq!(
+            resolved,
+            vec!["test(sketch(p(0, 0), [line_to(p(10, 20)), line_to(p(7, 20))]))"]
+        );
+    }
+
+    /// 同じ名前に異なる @default 値を付けると衝突エラーになる。
+    #[test]
+    fn conflicting_annotations_in_same_body_fail() {
+        let mut db = database("test(MODEL) :- MODEL = cube(X@10, X@20, 30).")
+            .expect("parse db");
+        let q = query("test(M).").expect("parse query").1;
+        let result = execute(&mut db, q);
+        assert!(
+            result.is_err(),
+            "expected conflict between X@10 and X@20, got {:?}",
+            result
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("conflicting default annotations"),
+            "expected conflict error message, got: {}",
+            err_msg
+        );
+    }
+
+    /// 同じ名前・同じ default 値を複数箇所に書くのは OK。
+    #[test]
+    fn duplicate_same_annotation_ok() {
+        let resolved = run_success(
+            "test(MODEL) :- MODEL = cube(X@10, X@10, X@10).",
+            "test(M).",
+        );
+        assert_eq!(resolved, vec!["test(cube(10, 10, 10))"]);
+    }
+
+    /// `0 < X@5 < 10` のように range 付きの @default も Eq goal lowering 後に
+    /// min/max 制約が維持される (= 範囲外の caller value を弾く)。
+    #[test]
+    fn range_annotation_preserved_after_lowering() {
+        // Body 内で `0 < X@5 < 10` と書き、X は body 局所なので 5 に解決される。
+        let resolved = run_success(
+            "test(MODEL) :- 0 < X@5 < 10, MODEL = cube(X, X, X).",
+            "test(M).",
+        );
+        assert_eq!(resolved, vec!["test(cube(5, 5, 5))"]);
+    }
+
+    /// ユーザーの実コード相当: `xz` の sketch 内に `HOOK_LEN@4` などの注釈付き
+    /// 変数が InfixExpr の中に直接書かれているケース。lowering 経由で全て数値に
+    /// 解決される。
+    #[test]
+    fn user_code_pattern_xz_sketch_resolves() {
+        let resolved = run_success(
+            "xz(X_OUTER, Z_OUTER, MODEL) :- \
+               HOOK_L = 13, HOOK_W = 7, HOOK_R = HOOK_L + HOOK_W, \
+               MODEL = sketch(p(2, 0), [\
+                 line_to(p(X_OUTER, 0)), \
+                 line_to(p(X_OUTER, TOP_Z@7)), \
+                 line_to(p(HOOK_R, TOP_Z)), \
+                 line_to(p(HOOK_R, Z_OUTER)), \
+                 line_to(p(HOOK_L, Z_OUTER)), \
+                 line_to(p(HOOK_L - HOOK_LEN@4, Z_OUTER)), \
+                 line_to(p(HOOK_L - HOOK_LEN, Z_OUTER - HOOK_WIDTH@3)), \
+                 line_to(p(HOOK_L, Z_OUTER - HOOK_WIDTH)), \
+                 line_to(p(HOOK_L, TOP_Z)), \
+                 line_to(p(LOW_W@12, LOW_H@2)), \
+                 line_to(p(2, LOW_H))\
+               ]).",
+            "xz(80, 15, M).",
+        );
+        // 期待値: 全ての @N 注釈付き変数が解決され、p(...) の座標が全て数値になる。
+        assert_eq!(
+            resolved,
+            vec![
+                "xz(80, 15, sketch(p(2, 0), [\
+                    line_to(p(80, 0)), \
+                    line_to(p(80, 7)), \
+                    line_to(p(20, 7)), \
+                    line_to(p(20, 15)), \
+                    line_to(p(13, 15)), \
+                    line_to(p(9, 15)), \
+                    line_to(p(9, 12)), \
+                    line_to(p(13, 12)), \
+                    line_to(p(13, 7)), \
+                    line_to(p(12, 2)), \
+                    line_to(p(2, 2))\
+                  ]))"
+            ]
+        );
+    }
+
+    /// Eq goal lowering で挿入された Number は、元の `@N` リテラル位置の span を
+    /// 継承する。これにより control point の write-back が `@N` の `N` 部分を
+    /// 正しく書き換えられる。
+    #[test]
+    fn lowering_propagates_span_from_annotation_to_number() {
+        let db_src = "test(MODEL) :- MODEL = cube(X@10, X, X).";
+        let mut db = database(db_src).expect("parse db");
+        let q = query("test(M).").expect("parse query").1;
+        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
+        // resolved 中の最初の Number の span が元の `10` リテラルを指していることを確認。
+        fn find_first_number_span<S>(term: &Term<S>) -> Option<SrcSpan> {
+            match term {
+                Term::Number { span, .. } => *span,
+                Term::Struct { args, .. } => {
+                    for a in args {
+                        if let Some(s) = find_first_number_span(a) {
+                            return Some(s);
+                        }
+                    }
+                    None
+                }
+                Term::List { items, tail } => {
+                    for it in items {
+                        if let Some(s) = find_first_number_span(it) {
+                            return Some(s);
+                        }
+                    }
+                    tail.as_ref().and_then(|t| find_first_number_span(t))
+                }
+                Term::InfixExpr { left, right, .. } | Term::Eq { left, right } => {
+                    find_first_number_span(left).or_else(|| find_first_number_span(right))
+                }
+                _ => None,
+            }
+        }
+        let span = find_first_number_span(&resolved[0])
+            .expect("expected at least one Number with span in resolved result");
+        let snippet = &db_src[span.start..span.end];
+        assert_eq!(
+            snippet, "10",
+            "span should point to `10` in source, got `{}`",
+            snippet
+        );
     }
 
     /// `assert_eq(L, R)` は両辺が等しければ結果に何も残さず通過する。
