@@ -476,19 +476,24 @@ fn prefix_term(
     module_name: &str,
     record_decls: &HashMap<String, RecordDecl>,
 ) -> Term {
-    match term     Term::St         functor,         args,            span,
+    match term {
+        Term::Struct {
+            functor,
+            args,
+            span,
         } => {
             let prefixed_functor = if is_builtin_functor(functor)
                 || is_record_constructor(functor, record_decls)
             {
                 functor.clone()
             } else {
-                format!("{}::{}", 
-               module_name, functor){
-                    functor: prefixed_functor,
-                    args: args
-                        .iter()
-                        .map(|a| prefix_term(a, module_name, record_decls))
+                format!("{}::{}", module_name, functor)
+            };
+            Term::Struct {
+                functor: prefixed_functor,
+                args: args
+                    .iter()
+                    .map(|a| prefix_term(a, module_name, record_decls))
                     .collect(),
                 span: *span,
             }
@@ -623,9 +628,6 @@ mod tests {
             .collect();
         Ok(functors)
     }
-                   
-                    ..
-               
 
     #[test]
     fn test_basic_module_resolution() {
@@ -647,8 +649,12 @@ mod tests {
             "bolts",
             &["m5"],
         )
-        .unwrap();"m5"
-           ])assert!(!functors.contains(&"m6".to_string()));
+        .unwrap();
+
+        assert!(functors.contains(&"bolts::m5".to_string()));
+        assert!(functors.contains(&"m5".to_string()));
+        assert!(functors.contains(&"bolts::m6".to_string()));
+        assert!(!functors.contains(&"m6".to_string()));
     }
 
     #[test]
@@ -677,8 +683,12 @@ mod tests {
             "sub/parts",
             &[],
         )
-        .unwrap();s &[
-           ])ダイヤモンドインポートで同じ record decl が複数経路から来ても、
+        .unwrap();
+
+        assert!(functors.contains(&"parts::bolt".to_string()));
+    }
+
+    /// ダイヤモンドインポートで同じ record decl が複数経路から来ても、
     /// field 構造が一致するので idempotent に扱われる。
     #[test]
     fn test_diamond_import_record_decl_idempotent() {
@@ -722,8 +732,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let std_path = dir.path().join("std/db.cadhr");
         fs::create_dir_all(std_path.parent().unwrap()).unwrap();
-        fs::write(&parse::{database, query};
-        use crate::term_rewrite::execute
+        fs::write(&std_path, ":- record point(x=0, y=0).\n").unwrap();
+
         // user db: std を expose([point]) で use し、派生述語が unprefixed で使えるか確認。
         let user_src = "#use(\"std\", expose([point])).\n\
                         test :- make_point([x(3), y(4)], R), point_x(R, X), assert_eq(X, 3).";
@@ -868,10 +878,7 @@ mod tests {
             "top",
             &[],
         )
-        .unwrap()
-                    "top/db.cadhr",
-                   
-                
+        .unwrap();
 
         // top 経由で std::shared が直接、A::std::shared が a 経由で取れる。
         // 同じソース由来でも別名空間に居るだけなのでエラーにならない。

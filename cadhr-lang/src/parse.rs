@@ -1242,13 +1242,58 @@ pub fn query(input: &str) -> PResult<'_, Vec<Term>> {
     Ok((rest, terms))
 }
 
-/// query変数のパラメータ情報（UIスライダー用）
+/// クエリから取り出した「素の」Var 情報。range 推定の入出力に使う中間型。
+/// `min`/`max`/`default_value` が全て None でも保持される。
 #[derive(Clone, Debug)]
 pub struct QueryParam {
     pub name: String,
     pub min: Option<Bound>,
     pub max: Option<Bound>,
     pub default_value: Option<crate::rational::Rational>,
+}
+
+/// スライダー化が確定した query Var。`SliderParam::from_query_param` でしか
+/// 構築できず、`min`/`max`/`default_value` の少なくとも 1 つが Some であることを
+/// 型レベルで保証する。出力束縛変数 (`main(OUT)` の OUT 等) はこの型に変換できない。
+/// UI / interpreter はこの型だけを受け取るので、誤って bare な Var をスライダー化
+/// することがコンパイル時に防がれる。
+#[derive(Clone, Debug)]
+pub struct SliderParam {
+    name: String,
+    min: Option<Bound>,
+    max: Option<Bound>,
+    default_value: Option<crate::rational::Rational>,
+}
+
+impl SliderParam {
+    pub fn from_query_param(p: QueryParam) -> Option<Self> {
+        if p.default_value.is_some() || p.min.is_some() || p.max.is_some() {
+            Some(SliderParam {
+                name: p.name,
+                min: p.min,
+                max: p.max,
+                default_value: p.default_value,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn min(&self) -> Option<&Bound> {
+        self.min.as_ref()
+    }
+
+    pub fn max(&self) -> Option<&Bound> {
+        self.max.as_ref()
+    }
+
+    pub fn default_value(&self) -> Option<&crate::rational::Rational> {
+        self.default_value.as_ref()
+    }
 }
 
 fn collect_query_params_from_term(term: &Term, params: &mut Vec<QueryParam>) {
