@@ -14,6 +14,7 @@ pub mod rational;
 pub mod sweep;
 pub mod term_processor;
 pub mod term_rewrite;
+pub mod typecheck;
 pub mod types;
 
 /// 標準ライブラリ (`std/db.cadhr`) を探すための既定 include path。
