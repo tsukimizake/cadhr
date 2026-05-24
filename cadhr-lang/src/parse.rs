@@ -5,7 +5,7 @@ use nom::{
     character::complete::{char, digit1, multispace1},
     combinator::{cut, map, map_res, opt, recognize, value},
     multi::{many0, separated_list0, separated_list1},
-    sequence::{delimited, pair, preceded, separated_pair, terminated},
+    sequence::{delimited, pair, preceded, terminated},
 };
 use std::fmt;
 
@@ -713,6 +713,67 @@ fn fixed_number(input: &str) -> PResult<'_, crate::rational::Rational> {
     .parse(input)
 }
 
+// ============================================================
+// Type 式パーサー (LANG_SPEC §5.1)
+// ============================================================
+//
+// `Number`, `List(Shape3D)`, `Point3D`, `T` (型変数) などをパース。
+// Type::Record か Type::Forall かはパース時には区別せず、未知の大文字始まり
+// 識別子は Type::Forall(name) として一旦保存し、型推論器が record decl 表と
+// 突き合わせて Type::Record に書き換える。
+
+fn builtin_type_name(name: &str) -> Option<crate::types::Type> {
+    use crate::types::Type;
+    match name {
+        "Number" => Some(Type::Number),
+        "Atom" => Some(Type::Atom),
+        "String" => Some(Type::String),
+        "Bool" => Some(Type::Bool),
+        "Shape2D" => Some(Type::Shape2D),
+        "Shape3D" => Some(Type::Shape3D),
+        "PlacedShape2D" => Some(Type::PlacedShape2D),
+        "Path2D" => Some(Type::Path2D),
+        "Point2D" => Some(Type::Point2D),
+        "Point3D" => Some(Type::Point3D),
+        "Plane" => Some(Type::Plane),
+        _ => None,
+    }
+}
+
+/// 型名/型変数識別子。大文字始まりも小文字始まりも受け入れる
+/// (atom より広い: `Number`, `T`, `Shape3D` など全部 OK)。
+fn type_ident(input: &str) -> PResult<'_, String> {
+    use nom::character::complete::satisfy;
+    map(
+        recognize(pair(
+            satisfy(|c: char| c.is_ascii_alphabetic() || c == '_'),
+            take_while(is_id_continue),
+        )),
+        |s: &str| s.to_string(),
+    )
+    .parse(input)
+}
+
+/// `List(T)` などの applied 型をパース。
+fn applied_type(input: &str) -> PResult<'_, crate::types::Type> {
+    use crate::types::Type;
+    let (input, head) = ws(type_ident).parse(input)?;
+    if head == "List" {
+        let (input, inner) = delimited(ws(char('(')), type_expr, cut(ws(char(')')))).parse(input)?;
+        Ok((input, Type::list_of(inner)))
+    } else if let Some(t) = builtin_type_name(&head) {
+        Ok((input, t))
+    } else {
+        // 未知の大文字始まり identifier → 量化型変数として扱う。Record 型なら
+        // 後段の resolver が `Type::Record(name)` に書き換える。
+        Ok((input, Type::Forall(head)))
+    }
+}
+
+pub(super) fn type_expr(input: &str) -> PResult<'_, crate::types::Type> {
+    ws(applied_type).parse(input)
+}
+
 // Terms
 fn list_term(input: &str) -> PResult<'_, Term> {
     ws(delimited(
@@ -790,7 +851,24 @@ fn default_value_suffix(input: &str) -> PResult<'_, (crate::rational::Rational, 
 }
 
 /// annotated_var: `X@25`, `0<X@20<50`, `0<X<10`, `X<10`, `0<X` など
-/// left_bound? Variable (@value)? right_bound?
+/// `: Type` 注釈をパースする。`:-` (rule head/body 区切り) と衝突しないよう、
+/// `:` の直後が `-` でないことを確認してから type_expr を読む。
+fn type_annotation_suffix(input: &str) -> PResult<'_, crate::types::Type> {
+    let (input, _) = space_or_comment0(input)?;
+    let (input, _) = char(':')(input)?;
+    // `:-` のような他構文との曖昧性を排除する。
+    if let Some(c) = input.chars().next() {
+        if c == '-' || c == ':' || c == '=' {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+    }
+    type_expr(input)
+}
+
+/// left_bound? Variable (@value)? right_bound? (: Type)?
 fn annotated_var_term(input: &str) -> PResult<'_, Term> {
     // 左側: (num op)?
     let (input, left) = opt((ws(fixed_number), comp_op)).parse(input)?;
@@ -807,6 +885,8 @@ fn annotated_var_term(input: &str) -> PResult<'_, Term> {
     let (input, default_with_span) = opt(default_value_suffix).parse(input)?;
     // 右側: (op num)?
     let (input, right) = opt((comp_op, ws(fixed_number))).parse(input)?;
+    // 型注釈: (: Type)?
+    let (input, type_annotation) = opt(type_annotation_suffix).parse(input)?;
 
     let min = match left {
         Some((val, CompOp::Lt)) => Some(Bound {
@@ -850,7 +930,7 @@ fn annotated_var_term(input: &str) -> PResult<'_, Term> {
         ),
     };
 
-    if min.is_none() && max.is_none() && default_value.is_none() {
+    if min.is_none() && max.is_none() && default_value.is_none() && type_annotation.is_none() {
         Ok((input, var_with_span(name, var_name_span)))
     } else {
         Ok((
@@ -862,7 +942,7 @@ fn annotated_var_term(input: &str) -> PResult<'_, Term> {
                 min,
                 max,
                 span,
-                type_annotation: None,
+                type_annotation,
             },
         ))
     }
@@ -1039,27 +1119,65 @@ fn use_expose_list(input: &str) -> PResult<'_, Vec<String>> {
     .parse(input)
 }
 
-/// `:- record NAME(FIELD, FIELD=DEFAULT, ...).` を Clause::RecordDecl にパースする。
-/// FIELD は atom、DEFAULT は任意の term (パイプ式まで)。
+/// `field` または `field: Type` または `field = default` または `field: Type = default` を
+/// 1 つの RecordField にパースする。新仕様 §4.4。
+fn record_field(input: &str) -> PResult<'_, RecordField> {
+    let (input, name) = ws(atom).parse(input)?;
+    let (input, ty) = opt(type_annotation_suffix).parse(input)?;
+    let (input, default) = opt(preceded(ws(char('=')), term)).parse(input)?;
+    Ok((
+        input,
+        RecordField {
+            name,
+            default,
+            ty,
+        },
+    ))
+}
+
+/// 旧形式 `:- record NAME(FIELD, FIELD=DEFAULT, ...).` および新形式
+/// `#record NAME { FIELD: TYPE = DEFAULT, ... }.` の両方をパースする。
+/// 新仕様 §4.4 に従って `#record { ... }` 形式を優先採用するが、std/db.cadhr 等
+/// 既存ソースの移行が完了するまで旧形式も維持する。
 fn record_directive(input: &str) -> PResult<'_, Clause> {
+    alt((record_directive_new, record_directive_legacy)).parse(input)
+}
+
+fn record_directive_new(input: &str) -> PResult<'_, Clause> {
+    let (input, _) = space_or_comment0(input)?;
+    let start = input.as_ptr() as usize;
+    let (input, _) = tag("#record")(input)?;
+    let (input, name) = ws(atom).parse(input)?;
+    let (input, _) = ws(char('{')).parse(input)?;
+    let (input, fields) = separated_list0(ws(char(',')), ws(record_field)).parse(input)?;
+    // 末尾カンマ (trailing comma) を許容
+    let (input, _) = opt(ws(char(','))).parse(input)?;
+    let (input, _) = cut(ws(char('}'))).parse(input)?;
+    let end = input.as_ptr() as usize;
+    let (input, _) = cut(ws(char('.'))).parse(input)?;
+    let span = SrcSpan {
+        start,
+        end,
+        file_id: 0,
+    };
+    Ok((
+        input,
+        Clause::RecordDecl {
+            name,
+            fields,
+            span: Some(span),
+        },
+    ))
+}
+
+fn record_directive_legacy(input: &str) -> PResult<'_, Clause> {
     let (input, _) = space_or_comment0(input)?;
     let start = input.as_ptr() as usize;
     let (input, _) = tag(":-")(input)?;
     let (input, _) = ws(tag("record")).parse(input)?;
     let (input, name) = ws(atom).parse(input)?;
     let (input, _) = char('(').parse(input)?;
-    let (input, fields) = separated_list0(
-        ws(char(',')),
-        ws(map(
-            pair(atom, opt(preceded(ws(char('=')), term))),
-            |(name, default)| RecordField {
-                name,
-                default,
-                ty: None,
-            },
-        )),
-    )
-    .parse(input)?;
+    let (input, fields) = separated_list0(ws(char(',')), ws(record_field)).parse(input)?;
     let (input, _) = cut(ws(char(')'))).parse(input)?;
     let end = input.as_ptr() as usize;
     let (input, _) = cut(ws(char('.'))).parse(input)?;
@@ -1124,6 +1242,14 @@ fn has_range_in_term(term: &Term) -> bool {
     }
 }
 
+/// `-> Type` 戻り値型をパース。新仕様 §4.3 では必須だが、旧構文との互換のため
+/// optional として扱う。型推論器 (Task #5) が省略可否を判定する。
+fn return_type_suffix(input: &str) -> PResult<'_, crate::types::Type> {
+    let (input, _) = space_or_comment0(input)?;
+    let (input, _) = tag("->")(input)?;
+    type_expr(input)
+}
+
 pub(super) fn clause_parser(input: &str) -> PResult<'_, Clause> {
     let (input, clause) = alt((
         use_directive,
@@ -1131,17 +1257,17 @@ pub(super) fn clause_parser(input: &str) -> PResult<'_, Clause> {
         ws(terminated(
             alt((
                 map(
-                    separated_pair(term, ws(tag(":-")), goals),
-                    |(head, body)| Clause::Rule {
+                    (term, opt(return_type_suffix), ws(tag(":-")), goals),
+                    |(head, return_type, _, body)| Clause::Rule {
                         head,
                         body,
-                        return_type: None,
+                        return_type,
                     },
                 ),
-                map(term, |head| Clause::Fact {
-                    head,
-                    return_type: None,
-                }),
+                map(
+                    pair(term, opt(return_type_suffix)),
+                    |(head, return_type)| Clause::Fact { head, return_type },
+                ),
             )),
             cut(ws(char('.'))),
         )),
@@ -1976,5 +2102,145 @@ mod tests {
         let db = database(src).unwrap();
         assert_eq!(db.len(), 2);
         assert!(matches!(&db[0], Clause::Use { path, .. } if path == "bolts"));
+    }
+
+    // ============================================================
+    // 新仕様: 型注釈・戻り値型・#record ブロック構文
+    // ============================================================
+
+    #[test]
+    fn parse_type_expr_atoms() {
+        use crate::types::Type;
+        for (src, expected) in [
+            ("Number", Type::Number),
+            ("Shape3D", Type::Shape3D),
+            ("Shape2D", Type::Shape2D),
+            ("Path2D", Type::Path2D),
+            ("Point3D", Type::Point3D),
+            ("PlacedShape2D", Type::PlacedShape2D),
+            ("Plane", Type::Plane),
+            ("Bool", Type::Bool),
+        ] {
+            let (_, t) = type_expr(src).unwrap();
+            assert_eq!(t, expected, "type_expr({src:?})");
+        }
+    }
+
+    #[test]
+    fn parse_type_expr_list_and_forall() {
+        use crate::types::Type;
+        let (_, t) = type_expr("List(Shape3D)").unwrap();
+        assert_eq!(t, Type::list_of(Type::Shape3D));
+        let (_, t) = type_expr("List(List(Number))").unwrap();
+        assert_eq!(t, Type::list_of(Type::list_of(Type::Number)));
+        // 未知大文字始まり → Forall
+        let (_, t) = type_expr("T").unwrap();
+        assert_eq!(t, Type::Forall("T".to_string()));
+    }
+
+    #[test]
+    fn parse_var_type_annotation_in_arg() {
+        // 引数位置の `X: Shape3D` を annotated_var_term が拾う
+        let (_, clause) = clause_parser("hoge(X: Shape3D).").unwrap();
+        match clause {
+            Clause::Fact { head: Term::Struct { args, .. }, .. } => {
+                match &args[0] {
+                    Term::Var {
+                        name,
+                        type_annotation,
+                        ..
+                    } => {
+                        assert_eq!(name, "X");
+                        assert_eq!(
+                            *type_annotation,
+                            Some(crate::types::Type::Shape3D)
+                        );
+                    }
+                    _ => panic!("Expected Var with annotation"),
+                }
+            }
+            _ => panic!("Expected Fact"),
+        }
+    }
+
+    #[test]
+    fn parse_clause_return_type_on_fact() {
+        let (_, clause) = clause_parser("pi -> Number.").unwrap();
+        match clause {
+            Clause::Fact { return_type, .. } => {
+                assert_eq!(return_type, Some(crate::types::Type::Number));
+            }
+            _ => panic!("Expected Fact"),
+        }
+    }
+
+    #[test]
+    fn parse_clause_return_type_on_rule() {
+        let (_, clause) =
+            clause_parser("my_box(Size: Number) -> Shape3D :- cube(Size, Size, Size).").unwrap();
+        match clause {
+            Clause::Rule {
+                return_type,
+                head: Term::Struct { args, .. },
+                ..
+            } => {
+                assert_eq!(return_type, Some(crate::types::Type::Shape3D));
+                match &args[0] {
+                    Term::Var {
+                        type_annotation: Some(t),
+                        ..
+                    } => assert_eq!(*t, crate::types::Type::Number),
+                    _ => panic!("Expected Var with type annotation"),
+                }
+            }
+            _ => panic!("Expected Rule"),
+        }
+    }
+
+    #[test]
+    fn parse_record_decl_new_syntax() {
+        let src =
+            r#"#record output { models: List(Shape3D) = [], bom: List(BomEntry) = [] }."#;
+        let (_, clause) = clause_parser(src).unwrap();
+        match clause {
+            Clause::RecordDecl { name, fields, .. } => {
+                assert_eq!(name, "output");
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name, "models");
+                assert_eq!(
+                    fields[0].ty,
+                    Some(crate::types::Type::list_of(crate::types::Type::Shape3D))
+                );
+                assert!(fields[0].default.is_some());
+                assert_eq!(fields[1].name, "bom");
+                // BomEntry は未宣言なので Forall として保存される (型推論器が後で resolve)
+                assert_eq!(
+                    fields[1].ty,
+                    Some(crate::types::Type::list_of(crate::types::Type::Forall(
+                        "BomEntry".to_string()
+                    )))
+                );
+            }
+            _ => panic!("Expected RecordDecl, got {:?}", clause),
+        }
+    }
+
+    #[test]
+    fn parse_record_decl_trailing_comma() {
+        let (_, clause) = clause_parser("#record p { x: Number, y: Number, }.").unwrap();
+        assert!(matches!(clause, Clause::RecordDecl { .. }));
+    }
+
+    #[test]
+    fn parse_record_decl_legacy_still_works() {
+        let (_, clause) =
+            clause_parser(":- record output(models=[], bom=[], controls=[]).").unwrap();
+        match clause {
+            Clause::RecordDecl { name, fields, .. } => {
+                assert_eq!(name, "output");
+                assert_eq!(fields.len(), 3);
+            }
+            _ => panic!("Expected RecordDecl"),
+        }
     }
 }
