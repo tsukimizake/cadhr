@@ -200,6 +200,7 @@ fn generate_predicates_for_record(name: &str, fields: &[RecordField]) -> Vec<Cla
                 named_var("R"),
             ],
         )],
+        return_type: None,
     });
 
     let arity = fields.len();
@@ -209,10 +210,13 @@ fn generate_predicates_for_record(name: &str, fields: &[RecordField]) -> Vec<Cla
         let mut record_args = (0..arity).map(|_| anon_var()).collect::<Vec<Term>>();
         record_args[i] = named_var("V");
         let record_pat = struct_term(name, record_args);
-        result.push(Clause::Fact(struct_term(
-            &format!("{}_{}", name, field.name),
-            vec![record_pat, named_var("V")],
-        )));
+        result.push(Clause::Fact {
+            head: struct_term(
+                &format!("{}_{}", name, field.name),
+                vec![record_pat, named_var("V")],
+            ),
+            return_type: None,
+        });
 
         // Setter: set_FIELD_of_NAME(V, NAME(_/Old, Others...), NAME(V, SameOthers...)).
         // i 番目以外は同じ変数 (両 record で共有)、i 番目は新値 V。
@@ -230,10 +234,13 @@ fn generate_predicates_for_record(name: &str, fields: &[RecordField]) -> Vec<Cla
         }
         let r0 = struct_term(name, r0_args);
         let r1 = struct_term(name, r1_args);
-        result.push(Clause::Fact(struct_term(
-            &format!("set_{}_of_{}", field.name, name),
-            vec![named_var("V"), r0, r1],
-        )));
+        result.push(Clause::Fact {
+            head: struct_term(
+                &format!("set_{}_of_{}", field.name, name),
+                vec![named_var("V"), r0, r1],
+            ),
+            return_type: None,
+        });
     }
     result
 }
@@ -246,6 +253,7 @@ fn anon_var() -> Term {
         min: None,
         max: None,
         span: None,
+        type_annotation: None,
     }
 }
 
@@ -257,6 +265,7 @@ fn named_var(name: &str) -> Term {
         min: None,
         max: None,
         span: None,
+        type_annotation: None,
     }
 }
 
@@ -429,7 +438,7 @@ fn is_functor_exposed(
 
 fn clause_head_functor(clause: &Clause) -> Option<String> {
     match clause {
-        Clause::Fact(term) => term_functor(term),
+        Clause::Fact { head, .. } => term_functor(head),
         Clause::Rule { head, .. } => term_functor(head),
         Clause::Use { .. } | Clause::RecordDecl { .. } => None,
     }
@@ -448,13 +457,21 @@ fn prefix_clause(
     record_decls: &HashMap<String, RecordDecl>,
 ) -> Clause {
     match clause {
-        Clause::Fact(term) => Clause::Fact(prefix_term(term, module_name, record_decls)),
-        Clause::Rule { head, body } => Clause::Rule {
+        Clause::Fact { head, return_type } => Clause::Fact {
+            head: prefix_term(head, module_name, record_decls),
+            return_type: return_type.clone(),
+        },
+        Clause::Rule {
+            head,
+            body,
+            return_type,
+        } => Clause::Rule {
             head: prefix_term(head, module_name, record_decls),
             body: body
                 .iter()
                 .map(|t| prefix_term(t, module_name, record_decls))
                 .collect(),
+            return_type: return_type.clone(),
         },
         // RecordDecl はグローバル decl テーブルに乗るので prefix しない。
         // Use directive はクライアントが直接使うことがないのでそのまま。
@@ -522,8 +539,8 @@ fn prefix_term(
 
 fn set_file_id_in_clause(clause: &mut Clause, file_id: u16) {
     match clause {
-        Clause::Fact(term) => set_file_id_in_term(term, file_id),
-        Clause::Rule { head, body } => {
+        Clause::Fact { head, .. } => set_file_id_in_term(head, file_id),
+        Clause::Rule { head, body, .. } => {
             set_file_id_in_term(head, file_id);
             for b in body {
                 set_file_id_in_term(b, file_id);
@@ -621,8 +638,14 @@ mod tests {
         let functors: Vec<String> = result
             .iter()
             .filter_map(|c| match c {
-                Clause::Fact(Term::Struct { functor, .. }) => Some(functor.clone()),
-                Clause::Rule { head: Term::Struct { functor, .. }, .. } => Some(functor.clone()),
+                Clause::Fact {
+                    head: Term::Struct { functor, .. },
+                    ..
+                } => Some(functor.clone()),
+                Clause::Rule {
+                    head: Term::Struct { functor, .. },
+                    ..
+                } => Some(functor.clone()),
                 _ => None,
             })
             .collect();
@@ -890,18 +913,22 @@ mod tests {
 
     #[test]
     fn test_non_use_clauses_preserved() {
-        let clauses = vec![Clause::Fact(Term::Struct {
-            functor: "hello".to_string(),
-            args: vec![],
-            span: None,
-        })];
+        let clauses = vec![Clause::Fact {
+            head: Term::Struct {
+                functor: "hello".to_string(),
+                args: vec![],
+                span: None,
+            },
+            return_type: None,
+        }];
 
         let mut resolver = ModuleResolver::new();
         let result =
             resolve_modules(clauses, &[], &mut resolver, &mut FileRegistry::new()).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(
-            matches!(&result[0], Clause::Fact(Term::Struct { functor, .. }) if functor == "hello")
-        );
+        assert!(matches!(
+            &result[0],
+            Clause::Fact { head: Term::Struct { functor, .. }, .. } if functor == "hello"
+        ));
     }
 }

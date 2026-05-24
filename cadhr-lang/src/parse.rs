@@ -100,6 +100,9 @@ pub enum Term<Scope = ()> {
         min: Option<Bound>,
         max: Option<Bound>,
         span: Option<SrcSpan>,
+        /// 新仕様 §4.3 / §5 の `X: T` 型注釈。シグネチャ位置以外では常に `None`。
+        /// パース時に拾い、型推論器がシグネチャ走査時に参照する。
+        type_annotation: Option<crate::types::Type>,
     },
     Number {
         value: crate::rational::Rational,
@@ -290,6 +293,8 @@ impl<Scope: PartialEq> PartialEq for Term<Scope> {
 pub struct RecordField<Scope = ()> {
     pub name: String,
     pub default: Option<Term<Scope>>,
+    /// 新仕様 §4.4: `field: T = default` の `: T`。省略時は default から推論される。
+    pub ty: Option<crate::types::Type>,
 }
 
 impl<S> fmt::Debug for RecordField<S> {
@@ -303,10 +308,17 @@ impl<S> fmt::Debug for RecordField<S> {
 
 #[derive(Clone, PartialEq)]
 pub enum Clause<Scope = ()> {
-    Fact(Term<Scope>),
+    /// 新仕様 §4.2 における body 空の function_def。`head -> ReturnType.` 形式。
+    /// `return_type` は新仕様パーサーが拾うシグネチャ。旧パーサー経由では常に `None`。
+    Fact {
+        head: Term<Scope>,
+        return_type: Option<crate::types::Type>,
+    },
     Rule {
         head: Term<Scope>,
         body: Vec<Term<Scope>>,
+        /// 新仕様 §4.3: `-> Type` 戻り値型。旧パーサー経由では常に `None`。
+        return_type: Option<crate::types::Type>,
     },
     Use {
         path: String,
@@ -400,8 +412,8 @@ impl<Scope> fmt::Debug for Term<Scope> {
 impl fmt::Debug for Clause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Clause::Fact(term) => write!(f, "{:?}.", term),
-            Clause::Rule { head, body } => {
+            Clause::Fact { head, .. } => write!(f, "{:?}.", head),
+            Clause::Rule { head, body, .. } => {
                 write!(f, "{:?} :- ", head)?;
                 for (idx, term) in body.iter().enumerate() {
                     if idx > 0 {
@@ -444,6 +456,7 @@ pub fn var(name: String) -> Term {
         min: None,
         max: None,
         span: None,
+        type_annotation: None,
     }
 }
 
@@ -455,6 +468,7 @@ pub fn var_with_span(name: String, span: SrcSpan) -> Term {
         min: None,
         max: None,
         span: Some(span),
+        type_annotation: None,
     }
 }
 
@@ -466,6 +480,7 @@ pub fn default_var(name: String, value: crate::rational::Rational) -> Term {
         min: None,
         max: None,
         span: None,
+        type_annotation: None,
     }
 }
 
@@ -477,6 +492,7 @@ pub fn default_var_with_span(name: String, value: crate::rational::Rational, spa
         min: None,
         max: None,
         span: Some(span),
+        type_annotation: None,
     }
 }
 
@@ -494,6 +510,7 @@ pub fn annotated_var(
         min,
         max,
         span,
+        type_annotation: None,
     }
 }
 
@@ -543,6 +560,7 @@ pub fn range_var(name: String, min: Option<Bound>, max: Option<Bound>) -> Term {
         min,
         max,
         span: None,
+        type_annotation: None,
     }
 }
 
@@ -844,6 +862,7 @@ fn annotated_var_term(input: &str) -> PResult<'_, Term> {
                 min,
                 max,
                 span,
+                type_annotation: None,
             },
         ))
     }
@@ -1033,7 +1052,11 @@ fn record_directive(input: &str) -> PResult<'_, Clause> {
         ws(char(',')),
         ws(map(
             pair(atom, opt(preceded(ws(char('=')), term))),
-            |(name, default)| RecordField { name, default },
+            |(name, default)| RecordField {
+                name,
+                default,
+                ty: None,
+            },
         )),
     )
     .parse(input)?;
@@ -1109,9 +1132,16 @@ pub(super) fn clause_parser(input: &str) -> PResult<'_, Clause> {
             alt((
                 map(
                     separated_pair(term, ws(tag(":-")), goals),
-                    |(head, body)| Clause::Rule { head, body },
+                    |(head, body)| Clause::Rule {
+                        head,
+                        body,
+                        return_type: None,
+                    },
                 ),
-                map(term, Clause::Fact),
+                map(term, |head| Clause::Fact {
+                    head,
+                    return_type: None,
+                }),
             )),
             cut(ws(char('.'))),
         )),
@@ -1120,7 +1150,7 @@ pub(super) fn clause_parser(input: &str) -> PResult<'_, Clause> {
 
     let head = match &clause {
         Clause::Rule { head, .. } => Some(head),
-        Clause::Fact(head) => Some(head),
+        Clause::Fact { head, .. } => Some(head),
         Clause::Use { .. } | Clause::RecordDecl { .. } => None,
     };
     if let Some(head) = head {
@@ -1178,8 +1208,8 @@ fn fix_spans_in_term(term: &mut Term, base: usize) {
 
 fn fix_spans_in_clause(clause: &mut Clause, base: usize) {
     match clause {
-        Clause::Fact(term) => fix_spans_in_term(term, base),
-        Clause::Rule { head, body } => {
+        Clause::Fact { head, .. } => fix_spans_in_term(head, base),
+        Clause::Rule { head, body, .. } => {
             fix_spans_in_term(head, base);
             for t in body.iter_mut() {
                 fix_spans_in_term(t, base);
@@ -1366,6 +1396,7 @@ fn substitute_term(term: &Term, values: &std::collections::HashMap<String, f64>)
                     min: min.clone(),
                     max: max.clone(),
                     span: *span,
+                    type_annotation: None,
                 }
             } else {
                 term.clone()
@@ -1406,7 +1437,10 @@ mod tests {
     fn parse_fact() {
         assert_clause(
             "parent(alice, bob).",
-            Clause::Fact(struc("parent".to_string(), vec![a("alice"), a("bob")])),
+            Clause::Fact {
+                head: struc("parent".to_string(), vec![a("alice"), a("bob")]),
+                return_type: None,
+            },
         );
     }
 
@@ -1420,6 +1454,7 @@ mod tests {
                     struc("parent".to_string(), vec![v("X"), v("Z")]),
                     struc("parent".to_string(), vec![v("Z"), v("Y")]),
                 ],
+                return_type: None,
             },
         );
     }
@@ -1463,10 +1498,13 @@ mod tests {
     fn parse_list() {
         assert_clause(
             "member(X, [X|_]).",
-            Clause::Fact(struc(
-                "member".to_string(),
-                vec![v("X"), list(vec![v("X")], Some(v("_")))],
-            )),
+            Clause::Fact {
+                head: struc(
+                    "member".to_string(),
+                    vec![v("X"), list(vec![v("X")], Some(v("_")))],
+                ),
+                return_type: None,
+            },
         );
     }
 
@@ -1506,7 +1544,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
 
         match clause {
-            Clause::Fact(term) => match &term {
+            Clause::Fact { head: term, .. } => match &term {
                 Term::Struct { functor, args, .. } => {
                     assert_eq!(functor, "parent");
                     assert_eq!(args.len(), 2);
@@ -1523,7 +1561,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
 
         match clause {
-            Clause::Fact(term) => match &term {
+            Clause::Fact { head: term, .. } => match &term {
                 Term::Struct { functor, args, .. } => {
                     assert_eq!(functor, "hello");
                     assert_eq!(args.len(), 0);
@@ -1540,7 +1578,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
 
         match clause {
-            Clause::Rule { head, body } => {
+            Clause::Rule { head, body, .. } => {
                 match &head {
                     Term::Struct { functor, args, .. } => {
                         assert_eq!(functor, "hoge");
@@ -1604,7 +1642,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
 
         match clause {
-            Clause::Fact(term) => match &term {
+            Clause::Fact { head: term, .. } => match &term {
                 Term::Struct { args, .. } => match &args[0] {
                     Term::Var {
                         name,
@@ -1627,7 +1665,7 @@ mod tests {
         let src = "f(42).";
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
-            Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
+            Clause::Fact { head: Term::Struct { args, .. }, .. } => match &args[0] {
                 Term::Number { value, .. } => assert_eq!(*value, crate::rational::Rational::from_integer(42)),
                 _ => panic!("Expected Number"),
             },
@@ -1640,7 +1678,7 @@ mod tests {
         let src = "f(100.01).";
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
-            Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
+            Clause::Fact { head: Term::Struct { args, .. }, .. } => match &args[0] {
                 Term::Number { value, .. } => assert_eq!(*value, crate::rational::Rational::from_ratio(10001, 100)),
                 _ => panic!("Expected Number"),
             },
@@ -1653,7 +1691,7 @@ mod tests {
         let src = "f(-3.5).";
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
-            Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
+            Clause::Fact { head: Term::Struct { args, .. }, .. } => match &args[0] {
                 Term::Number { value, .. } => assert_eq!(*value, crate::rational::Rational::from_ratio(-350, 100)),
                 _ => panic!("Expected Number"),
             },
@@ -1674,7 +1712,7 @@ mod tests {
         let src = "hoge(X@2.5).";
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
-            Clause::Fact(Term::Struct { args, .. }) => match &args[0] {
+            Clause::Fact { head: Term::Struct { args, .. }, .. } => match &args[0] {
                 Term::Var {
                     name,
                     default_value,
@@ -1696,7 +1734,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
 
         match clause {
-            Clause::Fact(term) => match &term {
+            Clause::Fact { head: term, .. } => match &term {
                 Term::Struct { functor, args, .. } => {
                     assert_eq!(functor, "translate");
                     assert_eq!(args.len(), 3);
@@ -1730,7 +1768,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
 
         match clause {
-            Clause::Fact(term) => match &term {
+            Clause::Fact { head: term, .. } => match &term {
                 Term::InfixExpr { op, left, right } => {
                     assert_eq!(*op, ArithOp::Add);
                     // left should be translate(cube(10,20,30), p(0,0,0), p(10,0,0))
@@ -1773,7 +1811,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
 
         match clause {
-            Clause::Fact(term) => {
+            Clause::Fact { head: term, .. } => {
                 // This should be apply(ArithExpr, cube)
                 match &term {
                     Term::Struct { functor, .. } => {
@@ -1792,7 +1830,7 @@ mod tests {
         let (_, clause) = clause_parser(src).unwrap();
 
         match clause {
-            Clause::Rule { head, body } => {
+            Clause::Rule { head, body, .. } => {
                 match &head {
                     Term::Struct { args, .. } => match &args[0] {
                         Term::Var {
@@ -1921,7 +1959,7 @@ mod tests {
         let src = "bolts::m5(X).";
         let (_, clause) = clause_parser(src).unwrap();
         match clause {
-            Clause::Fact(Term::Struct { functor, args, .. }) => {
+            Clause::Fact { head: Term::Struct { functor, args, .. }, .. } => {
                 assert_eq!(functor, "bolts::m5");
                 assert_eq!(args.len(), 1);
             }

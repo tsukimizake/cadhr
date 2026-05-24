@@ -154,6 +154,7 @@ fn apply_canonical_annotation(base: ScopedTerm, env: &ScopedEnv) -> ScopedTerm {
         min,
         max,
         span,
+        type_annotation,
     } = base
     {
         let canon = env.get_annotation(scope, &name);
@@ -164,6 +165,7 @@ fn apply_canonical_annotation(base: ScopedTerm, env: &ScopedEnv) -> ScopedTerm {
             span: span.or(canon.span),
             name,
             scope,
+            type_annotation,
         }
     } else {
         base
@@ -185,6 +187,7 @@ fn resolve_inner(term: &ScopedTerm, env: &ScopedEnv, depth: usize) -> ScopedTerm
             min,
             max,
             span,
+            type_annotation,
         } if name != "_" => {
             let has_annotation = default_value.is_some() || min.is_some() || max.is_some();
             let sid = *scope;
@@ -196,6 +199,7 @@ fn resolve_inner(term: &ScopedTerm, env: &ScopedEnv, depth: usize) -> ScopedTerm
                     min: min.clone(),
                     max: max.clone(),
                     span: *span,
+                    type_annotation: type_annotation.clone(),
                 },
                 Some(val) => {
                     let resolved = resolve_inner(val, env, depth + 1);
@@ -224,6 +228,7 @@ fn resolve_inner(term: &ScopedTerm, env: &ScopedEnv, depth: usize) -> ScopedTerm
                             min: min.clone().or(canon_ann.min),
                             max: max.clone().or(canon_ann.max),
                             span: span.or(canon_ann.span),
+                            type_annotation: type_annotation.clone(),
                         }
                     } else {
                         term.clone()
@@ -306,7 +311,10 @@ fn builtin_fact(functor: &str, arity: usize) -> Clause {
     let args = (0..arity)
         .map(|idx| var(format!("__builtin_arg_{}", idx)))
         .collect();
-    Clause::Fact(struc(functor.to_string(), args))
+    Clause::Fact {
+        head: struc(functor.to_string(), args),
+        return_type: None,
+    }
 }
 
 fn builtin_cad_facts() -> Vec<Clause> {
@@ -805,8 +813,8 @@ pub fn infer_query_param_ranges(
         {
             for clause in solved_db {
                 let (head, body) = match clause {
-                    Clause::Rule { head, body } => (head, body.as_slice()),
-                    Clause::Fact(head) => (head, [].as_slice()),
+                    Clause::Rule { head, body, .. } => (head, body.as_slice()),
+                    Clause::Fact { head, .. } => (head, [].as_slice()),
                     _ => continue,
                 };
                 if let Term::Struct {
@@ -1426,13 +1434,21 @@ fn assign_scope_to_clause(
     env: &mut ScopedEnv,
 ) -> Clause<ScopeId> {
     match clause {
-        Clause::Fact(term) => Clause::Fact(assign_scope_to_term(term, scope_id, env)),
-        Clause::Rule { head, body } => Clause::Rule {
+        Clause::Fact { head, return_type } => Clause::Fact {
+            head: assign_scope_to_term(head, scope_id, env),
+            return_type,
+        },
+        Clause::Rule {
+            head,
+            body,
+            return_type,
+        } => Clause::Rule {
             head: assign_scope_to_term(head, scope_id, env),
             body: body
                 .into_iter()
                 .map(|t| assign_scope_to_term(t, scope_id, env))
                 .collect(),
+            return_type,
         },
         Clause::Use { path, expose, span } => Clause::Use { path, expose, span },
         Clause::RecordDecl { name, fields, span } => Clause::RecordDecl {
@@ -1442,6 +1458,7 @@ fn assign_scope_to_clause(
                 .map(|f| crate::parse::RecordField {
                     name: f.name,
                     default: f.default.map(|d| assign_scope_to_term(d, scope_id, env)),
+                    ty: f.ty,
                 })
                 .collect(),
             span,
@@ -1457,6 +1474,7 @@ fn assign_scope_to_term(term: Term, scope_id: ScopeId, env: &mut ScopedEnv) -> S
             min,
             max,
             span,
+            type_annotation,
             ..
         } => {
             // (scope, name) ごとの annotation を env に集約する。複数 instance が
@@ -1480,6 +1498,7 @@ fn assign_scope_to_term(term: Term, scope_id: ScopeId, env: &mut ScopedEnv) -> S
                 min,
                 max,
                 span,
+                type_annotation,
             }
         }
         Term::Number { value, span } => Term::Number { value, span },
@@ -1528,8 +1547,8 @@ fn try_rewrite_single_with_result(
         *clause_counter += 1;
         let scoped = assign_scope_to_clause(clause.clone(), *clause_counter, shared_env);
         let (head, body) = match scoped {
-            Clause::Fact(t) => (t, vec![]),
-            Clause::Rule { head, body } => (head, body),
+            Clause::Fact { head, .. } => (head, vec![]),
+            Clause::Rule { head, body, .. } => (head, body),
             Clause::Use { .. } | Clause::RecordDecl { .. } => continue,
         };
 
@@ -2131,6 +2150,7 @@ pub fn lower_default_annotations(body: &mut Vec<Term>) -> Result<(), RewriteErro
                 min: info.min,
                 max: info.max,
                 span: info.var_span,
+                type_annotation: None,
             }),
             right: Box::new(Term::Number {
                 value: info.value,
@@ -2338,6 +2358,7 @@ mod tests {
             min,
             max,
             span: None,
+            type_annotation: None,
         }
     }
 

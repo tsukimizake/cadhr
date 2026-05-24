@@ -598,6 +598,7 @@ pub fn extract_control_points<S: Clone + PartialEq + fmt::Debug>(
                     min: min.clone(),
                     max: max.clone(),
                     span: None,
+                    type_annotation: None,
                 };
                 // 初期値: override > 継承 default (range のみなら midpoint) > 0
                 let init = overrides
