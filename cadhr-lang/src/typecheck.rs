@@ -196,90 +196,15 @@ pub fn instantiate_signature(
 }
 
 // ============================================================
-// Builtin signature table (Task #5 用の最小スタブ。
-// Task #6 で BuiltinRegistry に統合する)
+// Builtin signature lookup (registry 経由)
 // ============================================================
 
-/// 1 つのアリティに対する 1 シグネチャ。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuiltinSig {
-    pub params: Vec<Type>,
-    pub return_ty: Type,
-}
-
-impl BuiltinSig {
-    pub fn new(params: Vec<Type>, return_ty: Type) -> Self {
-        Self { params, return_ty }
-    }
-}
-
-/// (functor name, arity) → 1 つの (オーバーロード無し) シグネチャ。
-/// 旧パーサーが許していた `cylinder/2 vs cylinder/3` のような arity overload は
-/// 残しつつ、`union2d` / `union3d` のような型 overload は別 functor 名で分離する
-/// (LANG_SPEC §1.1 ・§6.1)。
-pub fn initial_builtin_signatures() -> HashMap<(String, usize), BuiltinSig> {
-    let mut m = HashMap::new();
-    let n = || Type::Number;
-    let s3 = || Type::Shape3D;
-    let s2 = || Type::Shape2D;
-    let placed = || Type::PlacedShape2D;
-    let p2 = || Type::Point2D;
-    let p3 = || Type::Point3D;
-    let path = || Type::Path2D;
-
-    let mut add = |name: &str, arity: usize, sig: BuiltinSig| {
-        m.insert((name.to_string(), arity), sig);
-    };
-
-    // Primitives
-    add("cube", 3, BuiltinSig::new(vec![n(), n(), n()], s3()));
-    add("sphere", 1, BuiltinSig::new(vec![n()], s3()));
-    add("sphere", 2, BuiltinSig::new(vec![n(), n()], s3()));
-    add("cylinder", 2, BuiltinSig::new(vec![n(), n()], s3()));
-    add("tetrahedron", 0, BuiltinSig::new(vec![], s3()));
-    add("circle", 1, BuiltinSig::new(vec![n()], s2()));
-
-    // CSG (dimension-suffixed; §1.1 の overload 撤廃)
-    add("union3d", 2, BuiltinSig::new(vec![s3(), s3()], s3()));
-    add("difference3d", 2, BuiltinSig::new(vec![s3(), s3()], s3()));
-    add("intersection3d", 2, BuiltinSig::new(vec![s3(), s3()], s3()));
-    add("hull3d", 2, BuiltinSig::new(vec![s3(), s3()], s3()));
-    add("union2d", 2, BuiltinSig::new(vec![s2(), s2()], s2()));
-    add("difference2d", 2, BuiltinSig::new(vec![s2(), s2()], s2()));
-    add("intersection2d", 2, BuiltinSig::new(vec![s2(), s2()], s2()));
-
-    // Transforms (point-based: Src/Dst で運ぶ)
-    add(
-        "translate3d",
-        3,
-        BuiltinSig::new(vec![s3(), p3(), p3()], s3()),
-    );
-    add("scale3d", 4, BuiltinSig::new(vec![s3(), n(), n(), n()], s3()));
-    add("rotate3d", 4, BuiltinSig::new(vec![s3(), n(), n(), n()], s3()));
-
-    // Points
-    add("p2d", 2, BuiltinSig::new(vec![n(), n()], p2()));
-    add("p3d", 3, BuiltinSig::new(vec![n(), n(), n()], p3()));
-
-    // Plane placement
-    add("rotateToXY", 1, BuiltinSig::new(vec![s2()], placed()));
-    add("rotateToYZ", 1, BuiltinSig::new(vec![s2()], placed()));
-    add("rotateToXZ", 1, BuiltinSig::new(vec![s2()], placed()));
-
-    // Extrusion
-    add(
-        "linear_extrude",
-        2,
-        BuiltinSig::new(vec![placed(), n()], s3()),
-    );
-    add("revolve", 2, BuiltinSig::new(vec![placed(), n()], s3()));
-    add(
-        "sweep_extrude",
-        2,
-        BuiltinSig::new(vec![placed(), path()], s3()),
-    );
-
-    m
+/// `BuiltinRegistry` から推論器が期待する形式へ展開する。
+/// (Task #6 完了後はこの関数を経由せず Registry を直接渡してもよい。)
+pub fn signatures_from_registry(
+    registry: &crate::builtins::BuiltinRegistry,
+) -> HashMap<(String, usize), (Vec<Type>, Type)> {
+    registry.signatures()
 }
 
 // ============================================================
@@ -316,7 +241,7 @@ pub struct InferCtx<'a> {
     pub env: TypeEnv,
     pub subst: &'a mut Substitution,
     pub var_gen: &'a mut VarGen,
-    pub builtins: &'a HashMap<(String, usize), BuiltinSig>,
+    pub builtins: &'a crate::builtins::BuiltinRegistry,
 }
 
 /// Term を推論し、その型を返す。Substitution は副作用で更新される。
@@ -364,18 +289,14 @@ pub fn infer_term<S>(
             }
         }
         Term::Struct { functor, args, .. } => {
-            let key = (functor.clone(), args.len());
-            let sig = ctx.builtins.get(&key).ok_or_else(|| TypeError::MissingSignature {
-                context: format!("{}/{}", functor, args.len()),
-            })?;
+            let sig = ctx
+                .builtins
+                .lookup(functor, args.len())
+                .ok_or_else(|| TypeError::MissingSignature {
+                    context: format!("{}/{}", functor, args.len()),
+                })?;
             let (params, ret_ty) =
                 instantiate_signature(&sig.params, &sig.return_ty, ctx.var_gen);
-            if args.len() != params.len() {
-                return Err(TypeError::Mismatch {
-                    expected: Type::Forall(format!("arity {}", params.len())),
-                    actual: Type::Forall(format!("arity {}", args.len())),
-                });
-            }
             for (arg, expected) in args.iter().zip(params.iter()) {
                 let actual = infer_term(arg, ctx)?;
                 unify(expected, &actual, ctx.subst)?;
@@ -410,7 +331,7 @@ pub fn infer_term<S>(
 /// return_type と unify する方向で詰める予定。
 pub fn infer_clause<S: Clone>(
     clause: &crate::parse::Clause<S>,
-    builtins: &HashMap<(String, usize), BuiltinSig>,
+    builtins: &crate::builtins::BuiltinRegistry,
 ) -> Result<(), TypeError> {
     use crate::parse::{Clause, Term};
     let (head, body) = match clause {
@@ -598,7 +519,7 @@ mod tests {
     fn fresh_ctx<'a>(
         subst: &'a mut Substitution,
         var_gen: &'a mut VarGen,
-        builtins: &'a HashMap<(String, usize), BuiltinSig>,
+        builtins: &'a crate::builtins::BuiltinRegistry,
     ) -> InferCtx<'a> {
         InferCtx {
             env: TypeEnv::new(),
@@ -612,7 +533,7 @@ mod tests {
     fn infer_number_literal() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b);
         let t = infer_term::<()>(&number(Rational::from_integer(42)), &mut ctx).unwrap();
         assert_eq!(t, Type::Number);
@@ -622,7 +543,7 @@ mod tests {
     fn infer_cube_returns_shape3d() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b);
         let t = struc::<()>(
             "cube".to_string(),
@@ -640,7 +561,7 @@ mod tests {
     fn infer_union3d_two_cubes() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b);
         let cube = |sz: i64| {
             struc::<()>(
@@ -661,7 +582,7 @@ mod tests {
     fn infer_var_unannotated_is_fresh_alpha() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b);
         let ty = infer_term::<()>(&var("X".to_string()), &mut ctx).unwrap();
         assert!(matches!(ty, Type::Var(_)));
@@ -671,7 +592,7 @@ mod tests {
     fn infer_var_annotation_pins_type() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b);
         let v = Term::<()>::Var {
             name: "X".to_string(),
@@ -692,7 +613,7 @@ mod tests {
     fn infer_list_with_homogeneous_numbers() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b);
         let lst = Term::<()>::List {
             items: vec![
@@ -710,7 +631,7 @@ mod tests {
     fn infer_list_mismatch_errors() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b);
         let lst = Term::<()>::List {
             items: vec![
@@ -727,7 +648,7 @@ mod tests {
     fn infer_eq_unifies_two_sides() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b);
         // X = cube(10, 10, 10): X should be Shape3D
         let eq = Term::<()>::Eq {
@@ -750,7 +671,7 @@ mod tests {
     fn infer_arith_requires_numbers() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b);
         let expr = Term::<()>::InfixExpr {
             op: ArithOp::Add,
@@ -764,7 +685,7 @@ mod tests {
     #[test]
     fn infer_clause_typed_rule_ok() {
         use crate::parse::{Clause, struc};
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         // my_box(Size: Number) :- B = cube(Size, Size, Size).
         let head = struc::<()>(
             "my_box".to_string(),
@@ -800,7 +721,7 @@ mod tests {
     #[test]
     fn infer_clause_type_mismatch_in_body() {
         use crate::parse::{Clause, struc};
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         // bad(X: Number) :- B = cube(X, X, circle(1)).  ← circle returns Shape2D, cube wants Number
         let head = struc::<()>(
             "bad".to_string(),
@@ -841,7 +762,7 @@ mod tests {
     fn infer_unknown_functor_errors_with_missing_sig() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
-        let b = initial_builtin_signatures();
+        let b = crate::builtins::registry();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b);
         let t = struc::<()>("unknown_op".to_string(), vec![]);
         let r = infer_term(&t, &mut ctx);

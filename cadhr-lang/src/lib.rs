@@ -5,6 +5,7 @@ mod test_helpers;
 pub mod assertions;
 pub mod bezier;
 pub mod bom;
+pub mod builtins;
 pub mod collision;
 pub mod constraint;
 pub mod manifold_bridge;
