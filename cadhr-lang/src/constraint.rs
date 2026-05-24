@@ -379,6 +379,12 @@ impl ArithExpr {
                     field
                 ),
             }),
+            Term::Record { name, .. } => Err(ConversionError {
+                message: format!(
+                    "cannot convert record literal '{}' to arithmetic expression",
+                    name
+                ),
+            }),
         }
     }
 

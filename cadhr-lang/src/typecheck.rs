@@ -311,12 +311,24 @@ pub fn infer_term<S>(
             Ok(Type::Bool)
         }
         Term::FieldAccess { record: _, field, .. } => {
-            // TODO(Task #7): record decl テーブルを ctx に渡し、
+            // TODO(Task #7 残): record decl テーブルを ctx に渡し、
             // record の型 → 該当 field の型 を返す実装にする。
             // 現状は record native 評価が未着手のため AmbiguousType を返して
             // 推論器が止まることを優先する (silent fallback 禁止)。
             Err(TypeError::AmbiguousType {
                 context: format!("field access .{}: record decl table not yet available", field),
+            })
+        }
+        Term::Record { name, fields, .. } => {
+            // TODO(Task #7 残): record decl テーブルから宣言を引き、
+            // 各 field 値型と宣言の field 型を unify、Type::Record(name) を返す。
+            // 現状は record decl table が ctx に存在しないため AmbiguousType。
+            // ただし field 値の推論自体は走らせて未定義 functor 等は検出する。
+            for (_, v) in fields {
+                let _ = infer_term(v, ctx)?;
+            }
+            Err(TypeError::AmbiguousType {
+                context: format!("record literal '{}': record decl table not yet available", name),
             })
         }
     }

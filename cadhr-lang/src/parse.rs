@@ -144,6 +144,15 @@ pub enum Term<Scope = ()> {
         field: String,
         span: Option<SrcSpan>,
     },
+    /// `name { field: value, ... }` 形式の named record リテラル (LANG_SPEC §4.4)。
+    /// positional 形式 `name(v1, v2, ...)` は従来通り `Term::Struct` で表現される。
+    /// `fields` は宣言順 (positional 順) には並べ替えられておらず、ソースコードに
+    /// 現れた順を保持する。型推論・評価層が record decl と突き合わせて整合させる。
+    Record {
+        name: String,
+        fields: Vec<(String, Term<Scope>)>,
+        span: Option<SrcSpan>,
+    },
 }
 
 pub type ScopeId = usize;
@@ -222,6 +231,14 @@ pub fn first_span<S>(term: &Term<S>) -> Option<SrcSpan> {
             tail.as_ref().and_then(|t| first_span(t))
         }
         Term::FieldAccess { record, span, .. } => span.or_else(|| first_span(record)),
+        Term::Record { span, fields, .. } => span.or_else(|| {
+            for (_, v) in fields {
+                if let Some(s) = first_span(v) {
+                    return Some(s);
+                }
+            }
+            None
+        }),
         _ => None,
     }
 }
@@ -295,6 +312,18 @@ impl<Scope: PartialEq> PartialEq for Term<Scope> {
                     ..
                 },
             ) => r1 == r2 && f1 == f2,
+            (
+                Term::Record {
+                    name: n1,
+                    fields: fs1,
+                    ..
+                },
+                Term::Record {
+                    name: n2,
+                    fields: fs2,
+                    ..
+                },
+            ) => n1 == n2 && fs1 == fs2,
             (
                 Term::Eq {
                     left: l1,
@@ -425,6 +454,16 @@ impl<Scope> fmt::Debug for Term<Scope> {
             Term::StringLit { value } => write!(f, "\"{}\"", value),
             Term::FieldAccess { record, field, .. } => {
                 write!(f, "{:?}.{}", record, field)
+            }
+            Term::Record { name, fields, .. } => {
+                write!(f, "{} {{ ", name)?;
+                for (i, (n, v)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {:?}", n, v)?;
+                }
+                write!(f, " }}")
             }
             Term::Eq { left, right } => {
                 write!(f, "constraint({:?} = {:?})", left, right)
@@ -990,6 +1029,13 @@ fn string_literal(input: &str) -> PResult<'_, Term> {
     .parse(input)
 }
 
+fn record_field_value(input: &str) -> PResult<'_, (String, Term)> {
+    let (input, name) = ws(unquoted_atom).parse(input)?;
+    let (input, _) = ws(char(':')).parse(input)?;
+    let (input, value) = term(input)?;
+    Ok((input, (name, value)))
+}
+
 fn atom_term(input: &str) -> PResult<'_, Term> {
     let (input, _) = space_or_comment0(input)?;
     let start = input.as_ptr() as usize;
@@ -1004,12 +1050,43 @@ fn atom_term(input: &str) -> PResult<'_, Term> {
         } else {
             (input, name)
         };
+    // `name(...)` positional args OR `name { fields }` named record literal の二択。
+    // 順に試行する。
     let (input, maybe_args) = opt(ws(delimited(
         char('('),
         separated_list0(ws(char(',')), term),
         cut(ws(char(')'))),
     )))
     .parse(input)?;
+    if maybe_args.is_none() {
+        // `{ field: value, ... }` record literal を試す
+        if let Ok((after, fields)) = ws(delimited(
+            char('{'),
+            terminated(
+                separated_list0(ws(char(',')), record_field_value),
+                opt(ws(char(','))),
+            ),
+            cut(ws(char('}'))),
+        ))
+        .parse(input)
+        {
+            let end = after.as_ptr() as usize;
+            let (after, _) = space_or_comment0(after)?;
+            let span = SrcSpan {
+                start,
+                end,
+                file_id: 0,
+            };
+            return Ok((
+                after,
+                Term::Record {
+                    name,
+                    fields,
+                    span: Some(span),
+                },
+            ));
+        }
+    }
     let end = input.as_ptr() as usize;
     let (input, _) = space_or_comment0(input)?;
     let span = SrcSpan { start, end, file_id: 0 };
@@ -1371,6 +1448,15 @@ fn fix_spans_in_term(term: &mut Term, base: usize) {
                 s.end = s.end.wrapping_sub(base);
             }
             fix_spans_in_term(record, base);
+        }
+        Term::Record { fields, span, .. } => {
+            if let Some(s) = span {
+                s.start = s.start.wrapping_sub(base);
+                s.end = s.end.wrapping_sub(base);
+            }
+            for (_, v) in fields.iter_mut() {
+                fix_spans_in_term(v, base);
+            }
         }
         _ => {}
     }
@@ -2323,6 +2409,77 @@ mod tests {
                         }
                     }
                     _ => panic!("Expected FieldAccess"),
+                },
+                _ => panic!("Expected Eq"),
+            },
+            _ => panic!("Expected Rule"),
+        }
+    }
+
+    #[test]
+    fn parse_named_record_literal_basic() {
+        // R = output { models: [], bom: [] }.
+        let (_, clause) = clause_parser("hoge :- R = output { models: [], bom: [] }.").unwrap();
+        match clause {
+            Clause::Rule { body, .. } => match &body[0] {
+                Term::Eq { right, .. } => match right.as_ref() {
+                    Term::Record { name, fields, .. } => {
+                        assert_eq!(name, "output");
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0].0, "models");
+                        assert_eq!(fields[1].0, "bom");
+                    }
+                    other => panic!("Expected Record, got {:?}", other),
+                },
+                _ => panic!("Expected Eq"),
+            },
+            _ => panic!("Expected Rule"),
+        }
+    }
+
+    #[test]
+    fn parse_record_literal_with_trailing_comma() {
+        let (_, clause) = clause_parser("hoge :- R = p { x: 1, y: 2, }.").unwrap();
+        assert!(matches!(clause, Clause::Rule { .. }));
+    }
+
+    #[test]
+    fn parse_record_literal_nested() {
+        // record の中に record
+        let (_, clause) =
+            clause_parser("hoge :- R = wrap { inner: inner { v: 1 } }.").unwrap();
+        match clause {
+            Clause::Rule { body, .. } => match &body[0] {
+                Term::Eq { right, .. } => match right.as_ref() {
+                    Term::Record { name, fields, .. } => {
+                        assert_eq!(name, "wrap");
+                        match &fields[0].1 {
+                            Term::Record { name: inner_name, .. } => {
+                                assert_eq!(inner_name, "inner");
+                            }
+                            _ => panic!("Expected nested Record"),
+                        }
+                    }
+                    _ => panic!("Expected Record"),
+                },
+                _ => panic!("Expected Eq"),
+            },
+            _ => panic!("Expected Rule"),
+        }
+    }
+
+    #[test]
+    fn parse_positional_record_struct_still_works() {
+        // positional 形式 (Term::Struct) はそのまま使えること
+        let (_, clause) = clause_parser("hoge :- R = output([], [], []).").unwrap();
+        match clause {
+            Clause::Rule { body, .. } => match &body[0] {
+                Term::Eq { right, .. } => match right.as_ref() {
+                    Term::Struct { functor, args, .. } => {
+                        assert_eq!(functor, "output");
+                        assert_eq!(args.len(), 3);
+                    }
+                    _ => panic!("Expected Struct"),
                 },
                 _ => panic!("Expected Eq"),
             },

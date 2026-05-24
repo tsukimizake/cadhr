@@ -423,6 +423,11 @@ fn collect_default_var_bindings(
         Term::FieldAccess { record, .. } => {
             collect_default_var_bindings(record, bindings);
         }
+        Term::Record { fields, .. } => {
+            for (_, v) in fields {
+                collect_default_var_bindings(v, bindings);
+            }
+        }
     }
 }
 
@@ -502,7 +507,8 @@ fn try_fold_number_literals<S>(term: &Term<S>) -> Option<crate::rational::Ration
         | Term::List { .. }
         | Term::StringLit { .. }
         | Term::Eq { .. }
-        | Term::FieldAccess { .. } => None,
+        | Term::FieldAccess { .. }
+        | Term::Record { .. } => None,
     }
 }
 
@@ -536,7 +542,8 @@ pub fn try_eval_to_number<S>(term: &Term<S>) -> Option<crate::rational::Rational
         | Term::List { .. }
         | Term::StringLit { .. }
         | Term::Eq { .. }
-        | Term::FieldAccess { .. } => None,
+        | Term::FieldAccess { .. }
+        | Term::Record { .. } => None,
     }
 }
 
@@ -570,6 +577,11 @@ pub fn fold_number_literals_in_place<S>(term: &mut Term<S>) {
             Term::FieldAccess { record, .. } => {
                 fold_number_literals_in_place(record.as_mut());
             }
+            Term::Record { fields, .. } => {
+                for (_, v) in fields.iter_mut() {
+                    fold_number_literals_in_place(v);
+                }
+            }
             Term::Number { .. } | Term::Var { .. } | Term::StringLit { .. } => {}
         }
     }
@@ -601,6 +613,9 @@ fn occurs_check_scoped(var_name: &str, var_scope: ScopeId, term: &ScopedTerm) ->
         Term::FieldAccess { record, .. } => {
             occurs_check_scoped(var_name, var_scope, record)
         }
+        Term::Record { fields, .. } => fields
+            .iter()
+            .any(|(_, v)| occurs_check_scoped(var_name, var_scope, v)),
         Term::Number { .. } | Term::StringLit { .. } => false,
     }
 }
@@ -1547,6 +1562,14 @@ fn assign_scope_to_term(term: Term, scope_id: ScopeId, env: &mut ScopedEnv) -> S
             field,
             span,
         },
+        Term::Record { name, fields, span } => Term::Record {
+            name,
+            fields: fields
+                .into_iter()
+                .map(|(n, v)| (n, assign_scope_to_term(v, scope_id, env)))
+                .collect(),
+            span,
+        },
     }
 }
 
@@ -2264,6 +2287,11 @@ fn collect_default_annotations_in_term(
         Term::FieldAccess { record, .. } => {
             collect_default_annotations_in_term(record, collected)?;
         }
+        Term::Record { fields, .. } => {
+            for (_, v) in fields {
+                collect_default_annotations_in_term(v, collected)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2301,6 +2329,11 @@ fn strip_default_annotations(term: &mut Term) {
         }
         Term::FieldAccess { record, .. } => {
             strip_default_annotations(record);
+        }
+        Term::Record { fields, .. } => {
+            for (_, v) in fields.iter_mut() {
+                strip_default_annotations(v);
+            }
         }
     }
 }

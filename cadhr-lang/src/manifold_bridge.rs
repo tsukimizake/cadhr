@@ -842,7 +842,8 @@ impl<'a, S> Args<'a, S> {
             | Term::List { .. }
             | Term::StringLit { .. }
             | Term::Eq { .. }
-            | Term::FieldAccess { .. } => Err(ConversionError::TypeMismatch {
+            | Term::FieldAccess { .. }
+            | Term::Record { .. } => Err(ConversionError::TypeMismatch {
                 functor: self.functor.to_string(),
                 arg_index: i,
                 expected: "number",
