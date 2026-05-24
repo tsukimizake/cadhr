@@ -168,6 +168,230 @@ pub fn instantiate(ty: &Type, var_gen: &mut VarGen) -> Type {
     go(ty, var_gen, &mut HashMap::new())
 }
 
+/// 同じシグネチャ内の複数の型 (params + return) を共有 mapping で instantiate する。
+/// `length(Xs: List(T)) -> Number` のような signature で、両側の T が同一 Var に
+/// 束縛される必要があるため必要。
+pub fn instantiate_signature(
+    params: &[Type],
+    return_ty: &Type,
+    var_gen: &mut VarGen,
+) -> (Vec<Type>, Type) {
+    let mut mapping = HashMap::new();
+    fn go(ty: &Type, var_gen: &mut VarGen, mapping: &mut HashMap<String, Type>) -> Type {
+        match ty {
+            Type::Forall(name) => mapping
+                .entry(name.clone())
+                .or_insert_with(|| var_gen.fresh())
+                .clone(),
+            Type::List(inner) => Type::list_of(go(inner, var_gen, mapping)),
+            _ => ty.clone(),
+        }
+    }
+    let inst_params = params
+        .iter()
+        .map(|p| go(p, var_gen, &mut mapping))
+        .collect();
+    let inst_return = go(return_ty, var_gen, &mut mapping);
+    (inst_params, inst_return)
+}
+
+// ============================================================
+// Builtin signature table (Task #5 用の最小スタブ。
+// Task #6 で BuiltinRegistry に統合する)
+// ============================================================
+
+/// 1 つのアリティに対する 1 シグネチャ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinSig {
+    pub params: Vec<Type>,
+    pub return_ty: Type,
+}
+
+impl BuiltinSig {
+    pub fn new(params: Vec<Type>, return_ty: Type) -> Self {
+        Self { params, return_ty }
+    }
+}
+
+/// (functor name, arity) → 1 つの (オーバーロード無し) シグネチャ。
+/// 旧パーサーが許していた `cylinder/2 vs cylinder/3` のような arity overload は
+/// 残しつつ、`union2d` / `union3d` のような型 overload は別 functor 名で分離する
+/// (LANG_SPEC §1.1 ・§6.1)。
+pub fn initial_builtin_signatures() -> HashMap<(String, usize), BuiltinSig> {
+    let mut m = HashMap::new();
+    let n = || Type::Number;
+    let s3 = || Type::Shape3D;
+    let s2 = || Type::Shape2D;
+    let placed = || Type::PlacedShape2D;
+    let p2 = || Type::Point2D;
+    let p3 = || Type::Point3D;
+    let path = || Type::Path2D;
+
+    let mut add = |name: &str, arity: usize, sig: BuiltinSig| {
+        m.insert((name.to_string(), arity), sig);
+    };
+
+    // Primitives
+    add("cube", 3, BuiltinSig::new(vec![n(), n(), n()], s3()));
+    add("sphere", 1, BuiltinSig::new(vec![n()], s3()));
+    add("sphere", 2, BuiltinSig::new(vec![n(), n()], s3()));
+    add("cylinder", 2, BuiltinSig::new(vec![n(), n()], s3()));
+    add("tetrahedron", 0, BuiltinSig::new(vec![], s3()));
+    add("circle", 1, BuiltinSig::new(vec![n()], s2()));
+
+    // CSG (dimension-suffixed; §1.1 の overload 撤廃)
+    add("union3d", 2, BuiltinSig::new(vec![s3(), s3()], s3()));
+    add("difference3d", 2, BuiltinSig::new(vec![s3(), s3()], s3()));
+    add("intersection3d", 2, BuiltinSig::new(vec![s3(), s3()], s3()));
+    add("hull3d", 2, BuiltinSig::new(vec![s3(), s3()], s3()));
+    add("union2d", 2, BuiltinSig::new(vec![s2(), s2()], s2()));
+    add("difference2d", 2, BuiltinSig::new(vec![s2(), s2()], s2()));
+    add("intersection2d", 2, BuiltinSig::new(vec![s2(), s2()], s2()));
+
+    // Transforms (point-based: Src/Dst で運ぶ)
+    add(
+        "translate3d",
+        3,
+        BuiltinSig::new(vec![s3(), p3(), p3()], s3()),
+    );
+    add("scale3d", 4, BuiltinSig::new(vec![s3(), n(), n(), n()], s3()));
+    add("rotate3d", 4, BuiltinSig::new(vec![s3(), n(), n(), n()], s3()));
+
+    // Points
+    add("p2d", 2, BuiltinSig::new(vec![n(), n()], p2()));
+    add("p3d", 3, BuiltinSig::new(vec![n(), n(), n()], p3()));
+
+    // Plane placement
+    add("rotateToXY", 1, BuiltinSig::new(vec![s2()], placed()));
+    add("rotateToYZ", 1, BuiltinSig::new(vec![s2()], placed()));
+    add("rotateToXZ", 1, BuiltinSig::new(vec![s2()], placed()));
+
+    // Extrusion
+    add(
+        "linear_extrude",
+        2,
+        BuiltinSig::new(vec![placed(), n()], s3()),
+    );
+    add("revolve", 2, BuiltinSig::new(vec![placed(), n()], s3()));
+    add(
+        "sweep_extrude",
+        2,
+        BuiltinSig::new(vec![placed(), path()], s3()),
+    );
+
+    m
+}
+
+// ============================================================
+// 式レベル推論 (TypeEnv + infer_term)
+// ============================================================
+
+/// 関数本体内のローカル変数 → 型 (まだ未確定なら Var(α))。
+/// 関数の入口で signature の引数型を入れ、本体評価中に新規 Var が登場したら fresh α を追加する。
+#[derive(Debug, Clone, Default)]
+pub struct TypeEnv {
+    bindings: HashMap<String, Type>,
+}
+
+impl TypeEnv {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, name: impl Into<String>, ty: Type) {
+        self.bindings.insert(name.into(), ty);
+    }
+
+    pub fn get_or_fresh(&mut self, name: &str, var_gen: &mut VarGen) -> Type {
+        if let Some(t) = self.bindings.get(name) {
+            return t.clone();
+        }
+        let fresh = var_gen.fresh();
+        self.bindings.insert(name.to_string(), fresh.clone());
+        fresh
+    }
+}
+
+pub struct InferCtx<'a> {
+    pub env: TypeEnv,
+    pub subst: &'a mut Substitution,
+    pub var_gen: &'a mut VarGen,
+    pub builtins: &'a HashMap<(String, usize), BuiltinSig>,
+}
+
+/// Term を推論し、その型を返す。Substitution は副作用で更新される。
+pub fn infer_term<S>(
+    term: &crate::parse::Term<S>,
+    ctx: &mut InferCtx<'_>,
+) -> Result<Type, TypeError> {
+    use crate::parse::{ArithOp, Term};
+    match term {
+        Term::Number { .. } => Ok(Type::Number),
+        Term::StringLit { .. } => Ok(Type::String),
+        Term::Var { name, type_annotation, .. } => {
+            let t = ctx.env.get_or_fresh(name, ctx.var_gen);
+            if let Some(annot) = type_annotation {
+                // X: T 注釈があれば unify でローカル型と整合させる。
+                unify(&t, annot, ctx.subst)?;
+            }
+            Ok(t)
+        }
+        Term::List { items, tail } => {
+            // 全要素同じ T、結果は List(T)
+            let elem_ty = ctx.var_gen.fresh();
+            for item in items {
+                let item_ty = infer_term(item, ctx)?;
+                unify(&elem_ty, &item_ty, ctx.subst)?;
+            }
+            if let Some(t) = tail {
+                let tail_ty = infer_term(t, ctx)?;
+                unify(&Type::list_of(elem_ty.clone()), &tail_ty, ctx.subst)?;
+            }
+            Ok(Type::list_of(elem_ty))
+        }
+        Term::InfixExpr { op, left, right } => {
+            // 算術: Number * Number = Number
+            // CSG: Shape * Shape = Shape (op-specific) は dimension-suffixed builtin
+            // (union3d 等) に置き換わる前提なので、ここでは算術のみ。
+            let _ = op;
+            let l = infer_term(left, ctx)?;
+            let r = infer_term(right, ctx)?;
+            unify(&l, &Type::Number, ctx.subst)?;
+            unify(&r, &Type::Number, ctx.subst)?;
+            // ArithOp::Add etc — 全部 Number 返す
+            match op {
+                ArithOp::Add | ArithOp::Sub | ArithOp::Mul | ArithOp::Div => Ok(Type::Number),
+            }
+        }
+        Term::Struct { functor, args, .. } => {
+            let key = (functor.clone(), args.len());
+            let sig = ctx.builtins.get(&key).ok_or_else(|| TypeError::MissingSignature {
+                context: format!("{}/{}", functor, args.len()),
+            })?;
+            let (params, ret_ty) =
+                instantiate_signature(&sig.params, &sig.return_ty, ctx.var_gen);
+            if args.len() != params.len() {
+                return Err(TypeError::Mismatch {
+                    expected: Type::Forall(format!("arity {}", params.len())),
+                    actual: Type::Forall(format!("arity {}", args.len())),
+                });
+            }
+            for (arg, expected) in args.iter().zip(params.iter()) {
+                let actual = infer_term(arg, ctx)?;
+                unify(expected, &actual, ctx.subst)?;
+            }
+            Ok(ret_ty)
+        }
+        Term::Eq { left, right } => {
+            let l = infer_term(left, ctx)?;
+            let r = infer_term(right, ctx)?;
+            unify(&l, &r, ctx.subst)?;
+            // Eq は goal なので戻り値型は意味的に不要。型システムでは Bool を返す。
+            Ok(Type::Bool)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +520,189 @@ mod tests {
             &mut s,
         );
         assert!(matches!(r, Err(TypeError::Mismatch { .. })));
+    }
+
+    // ============================================================
+    // infer_term テスト
+    // ============================================================
+
+    use crate::parse::{ArithOp, Term, number, struc, var};
+    use crate::rational::Rational;
+
+    fn fresh_ctx<'a>(
+        subst: &'a mut Substitution,
+        var_gen: &'a mut VarGen,
+        builtins: &'a HashMap<(String, usize), BuiltinSig>,
+    ) -> InferCtx<'a> {
+        InferCtx {
+            env: TypeEnv::new(),
+            subst,
+            var_gen,
+            builtins,
+        }
+    }
+
+    #[test]
+    fn infer_number_literal() {
+        let mut s = Substitution::new();
+        let mut g = VarGen::new();
+        let b = initial_builtin_signatures();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let t = infer_term::<()>(&number(Rational::from_integer(42)), &mut ctx).unwrap();
+        assert_eq!(t, Type::Number);
+    }
+
+    #[test]
+    fn infer_cube_returns_shape3d() {
+        let mut s = Substitution::new();
+        let mut g = VarGen::new();
+        let b = initial_builtin_signatures();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let t = struc::<()>(
+            "cube".to_string(),
+            vec![
+                number(Rational::from_integer(10)),
+                number(Rational::from_integer(20)),
+                number(Rational::from_integer(30)),
+            ],
+        );
+        let ty = infer_term(&t, &mut ctx).unwrap();
+        assert_eq!(ty, Type::Shape3D);
+    }
+
+    #[test]
+    fn infer_union3d_two_cubes() {
+        let mut s = Substitution::new();
+        let mut g = VarGen::new();
+        let b = initial_builtin_signatures();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let cube = |sz: i64| {
+            struc::<()>(
+                "cube".to_string(),
+                vec![
+                    number(Rational::from_integer(sz)),
+                    number(Rational::from_integer(sz)),
+                    number(Rational::from_integer(sz)),
+                ],
+            )
+        };
+        let t = struc::<()>("union3d".to_string(), vec![cube(1), cube(2)]);
+        let ty = infer_term(&t, &mut ctx).unwrap();
+        assert_eq!(ty, Type::Shape3D);
+    }
+
+    #[test]
+    fn infer_var_unannotated_is_fresh_alpha() {
+        let mut s = Substitution::new();
+        let mut g = VarGen::new();
+        let b = initial_builtin_signatures();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let ty = infer_term::<()>(&var("X".to_string()), &mut ctx).unwrap();
+        assert!(matches!(ty, Type::Var(_)));
+    }
+
+    #[test]
+    fn infer_var_annotation_pins_type() {
+        let mut s = Substitution::new();
+        let mut g = VarGen::new();
+        let b = initial_builtin_signatures();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let v = Term::<()>::Var {
+            name: "X".to_string(),
+            scope: (),
+            default_value: None,
+            min: None,
+            max: None,
+            span: None,
+            type_annotation: Some(Type::Shape3D),
+        };
+        let ty = infer_term(&v, &mut ctx).unwrap();
+        // ty は env のα、ただし unify でα = Shape3D に bind されている
+        let resolved = ctx.subst.apply(&ty);
+        assert_eq!(resolved, Type::Shape3D);
+    }
+
+    #[test]
+    fn infer_list_with_homogeneous_numbers() {
+        let mut s = Substitution::new();
+        let mut g = VarGen::new();
+        let b = initial_builtin_signatures();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let lst = Term::<()>::List {
+            items: vec![
+                number(Rational::from_integer(1)),
+                number(Rational::from_integer(2)),
+            ],
+            tail: None,
+        };
+        let ty = infer_term(&lst, &mut ctx).unwrap();
+        let resolved = ctx.subst.apply(&ty);
+        assert_eq!(resolved, Type::list_of(Type::Number));
+    }
+
+    #[test]
+    fn infer_list_mismatch_errors() {
+        let mut s = Substitution::new();
+        let mut g = VarGen::new();
+        let b = initial_builtin_signatures();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let lst = Term::<()>::List {
+            items: vec![
+                number(Rational::from_integer(1)),
+                struc::<()>("circle".to_string(), vec![number(Rational::from_integer(2))]),
+            ],
+            tail: None,
+        };
+        let r = infer_term(&lst, &mut ctx);
+        assert!(matches!(r, Err(TypeError::Mismatch { .. })));
+    }
+
+    #[test]
+    fn infer_eq_unifies_two_sides() {
+        let mut s = Substitution::new();
+        let mut g = VarGen::new();
+        let b = initial_builtin_signatures();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        // X = cube(10, 10, 10): X should be Shape3D
+        let eq = Term::<()>::Eq {
+            left: Box::new(var("X".to_string())),
+            right: Box::new(struc::<()>(
+                "cube".to_string(),
+                vec![
+                    number(Rational::from_integer(10)),
+                    number(Rational::from_integer(10)),
+                    number(Rational::from_integer(10)),
+                ],
+            )),
+        };
+        let _ = infer_term(&eq, &mut ctx).unwrap();
+        let x_ty = ctx.env.get_or_fresh("X", ctx.var_gen);
+        assert_eq!(ctx.subst.apply(&x_ty), Type::Shape3D);
+    }
+
+    #[test]
+    fn infer_arith_requires_numbers() {
+        let mut s = Substitution::new();
+        let mut g = VarGen::new();
+        let b = initial_builtin_signatures();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let expr = Term::<()>::InfixExpr {
+            op: ArithOp::Add,
+            left: Box::new(number(Rational::from_integer(1))),
+            right: Box::new(number(Rational::from_integer(2))),
+        };
+        let ty = infer_term(&expr, &mut ctx).unwrap();
+        assert_eq!(ty, Type::Number);
+    }
+
+    #[test]
+    fn infer_unknown_functor_errors_with_missing_sig() {
+        let mut s = Substitution::new();
+        let mut g = VarGen::new();
+        let b = initial_builtin_signatures();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let t = struc::<()>("unknown_op".to_string(), vec![]);
+        let r = infer_term(&t, &mut ctx);
+        assert!(matches!(r, Err(TypeError::MissingSignature { .. })));
     }
 }
