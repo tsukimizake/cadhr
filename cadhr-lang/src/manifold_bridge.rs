@@ -34,6 +34,9 @@ impl TrackedF64 {
 
 #[derive(Debug, Clone)]
 pub enum Model3D {
+    /// 3D の単位元。CSG (`Union`/`Difference`/`Intersection`) の identity element として動作する。
+    /// `empty_3d` builtin から構築される他、デフォルト値や条件分岐の不在表現に使われる。
+    Empty,
     Cube {
         x: f64,
         y: f64,
@@ -106,6 +109,9 @@ pub enum Model3D {
 /// で `Model2D` が使われる。
 #[derive(Debug, Clone)]
 pub enum Model2D {
+    /// 2D の単位元。CSG (`Union`/`Difference`/`Intersection`) の identity element として動作する。
+    /// `empty_2d` builtin から構築される。
+    Empty,
     Sketch {
         points: Vec<(f64, f64)>,
     },
@@ -124,11 +130,14 @@ pub enum Model2D {
 
 /// 開いた進行方向付き polyline。sweep_extrude の path 引数専用。
 /// extrude / boolean / rotateTo* には渡せない (型システムで弾く)。
-/// `points` は曲線セグメント (bezier_to) を tessellate した後の頂点列。
+/// `Polyline.points` は曲線セグメント (bezier_to) を tessellate した後の頂点列。
 /// 閉路化・CCW化・自己交差チェックは行わない (開いた path を許容するため)。
+/// `Empty` は単位元相当の不在表現で、sweep_extrude に渡された場合は実装が
+/// 決まっていないため panic する (TODO: 仕様確定)。
 #[derive(Debug, Clone)]
-pub struct Path {
-    pub points: Vec<(f64, f64)>,
+pub enum Path {
+    Empty,
+    Polyline { points: Vec<(f64, f64)> },
 }
 
 /// 3D空間内のいずれかの平面に配置された2Dプロファイル。
@@ -1299,6 +1308,9 @@ impl Model2D {
 
     fn to_polygon_rings(&self) -> Option<Vec<Vec<f64>>> {
         match self {
+            // 単位元は ring を持たない。CSG は identity element として扱う必要があるため、
+            // Union/Difference/Intersection 側でも明示的に短絡する。
+            Model2D::Empty => Some(Vec::new()),
             Model2D::Sketch { points } => {
                 // points は構築時に CCW 化済なので clone のみ。
                 Some(vec![pairs_to_flat(points)])
@@ -1313,9 +1325,20 @@ impl Model2D {
                     .collect();
                 Some(vec![points])
             }
-            Model2D::Union(a, b) => polygon_boolean_2d(a, b, |ma, mb| ma.union(mb)),
-            Model2D::Difference(a, b) => polygon_boolean_2d(a, b, |ma, mb| ma.difference(mb)),
-            Model2D::Intersection(a, b) => polygon_boolean_2d(a, b, |ma, mb| ma.intersection(mb)),
+            Model2D::Union(a, b) => match (a.as_ref(), b.as_ref()) {
+                (Model2D::Empty, _) => b.to_polygon_rings(),
+                (_, Model2D::Empty) => a.to_polygon_rings(),
+                _ => polygon_boolean_2d(a, b, |ma, mb| ma.union(mb)),
+            },
+            Model2D::Difference(a, b) => match (a.as_ref(), b.as_ref()) {
+                (Model2D::Empty, _) => Some(Vec::new()),
+                (_, Model2D::Empty) => a.to_polygon_rings(),
+                _ => polygon_boolean_2d(a, b, |ma, mb| ma.difference(mb)),
+            },
+            Model2D::Intersection(a, b) => match (a.as_ref(), b.as_ref()) {
+                (Model2D::Empty, _) | (_, Model2D::Empty) => Some(Vec::new()),
+                _ => polygon_boolean_2d(a, b, |ma, mb| ma.intersection(mb)),
+            },
             Model2D::Center2D { profile, x, y } => {
                 let rings = profile.to_polygon_rings()?;
                 let mut min_x = f64::INFINITY;
@@ -1391,7 +1414,7 @@ impl Path {
                 expected: "path with at least one segment (2+ points)",
             });
         }
-        Ok(Path { points })
+        Ok(Path::Polyline { points })
     }
 }
 
@@ -1747,6 +1770,7 @@ impl Model3D {
     /// Model3D を manifold-rs の Manifold に評価
     pub fn evaluate(&self, include_paths: &[PathBuf]) -> Result<Manifold, ConversionError> {
         match self {
+            Model3D::Empty => Ok(Manifold::empty()),
             Model3D::Cube { x, y, z } => Ok(Manifold::cube(*x, *y, *z)),
             Model3D::Sphere { radius } => Ok(Manifold::sphere(*radius, DEFAULT_SEGMENTS)),
             Model3D::Cylinder { radius, height } => Ok(Manifold::cylinder(
@@ -1808,10 +1832,19 @@ impl Model3D {
             }
 
             Model3D::SweepExtrude { profile, path } => {
+                let path_points = match path {
+                    Path::Polyline { points } => points,
+                    Path::Empty => {
+                        todo!(
+                            "sweep_extrude with empty path: semantics undecided. \
+                             Should this produce Model3D::Empty, or be a type error?"
+                        )
+                    }
+                };
                 let rings = polygon_rings_or_err(profile, "sweep_extrude")?;
                 let profile_data = flat_to_pairs(&rings[0]);
                 let (verts, indices) =
-                    crate::sweep::sweep_extrude_mesh(&profile_data, &path.points)?;
+                    crate::sweep::sweep_extrude_mesh(&profile_data, path_points)?;
                 let mesh = Mesh::new(&verts, &indices);
                 let m = Manifold::from_mesh(mesh);
                 Ok(apply_plane_rotation(m, profile))
@@ -3229,14 +3262,17 @@ mod tests {
         let term = struc("sweep_extrude".into(), vec![profile, path]);
         let expr = Model3D::from_term(&term).unwrap();
         match &expr {
-            Model3D::SweepExtrude { path, .. } => {
-                assert_eq!(path.points.len(), 4);
+            Model3D::SweepExtrude {
+                path: Path::Polyline { points },
+                ..
+            } => {
+                assert_eq!(points.len(), 4);
                 assert_eq!(
-                    path.points,
+                    *points,
                     vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
                 );
             }
-            _ => panic!("Expected SweepExtrude"),
+            _ => panic!("Expected SweepExtrude with polyline path"),
         }
     }
 
@@ -3247,14 +3283,17 @@ mod tests {
         let term = struc("sweep_extrude".into(), vec![profile, path]);
         let expr = Model3D::from_term(&term).unwrap();
         match &expr {
-            Model3D::SweepExtrude { path, .. } => {
+            Model3D::SweepExtrude {
+                path: Path::Polyline { points },
+                ..
+            } => {
                 // start(1) + 16 bezier steps = 17 points
-                assert_eq!(path.points.len(), 17);
-                assert_eq!(path.points[0], (0.0, 0.0));
-                assert_close!(path.points[16].0, 10.0);
-                assert_close!(path.points[16].1, 0.0);
+                assert_eq!(points.len(), 17);
+                assert_eq!(points[0], (0.0, 0.0));
+                assert_close!(points[16].0, 10.0);
+                assert_close!(points[16].1, 0.0);
             }
-            _ => panic!("Expected SweepExtrude"),
+            _ => panic!("Expected SweepExtrude with polyline path"),
         }
     }
 
@@ -3268,12 +3307,15 @@ mod tests {
         let term = struc("sweep_extrude".into(), vec![profile, path]);
         let expr = Model3D::from_term(&term).unwrap();
         match &expr {
-            Model3D::SweepExtrude { path, .. } => {
-                assert_eq!(path.points.len(), 17);
-                assert_close!(path.points[16].0, 10.0);
-                assert_close!(path.points[16].1, 0.0);
+            Model3D::SweepExtrude {
+                path: Path::Polyline { points },
+                ..
+            } => {
+                assert_eq!(points.len(), 17);
+                assert_close!(points[16].0, 10.0);
+                assert_close!(points[16].1, 0.0);
             }
-            _ => panic!("Expected SweepExtrude"),
+            _ => panic!("Expected SweepExtrude with polyline path"),
         }
     }
 
@@ -3291,12 +3333,79 @@ mod tests {
         let term = struc("sweep_extrude".into(), vec![profile, path]);
         let expr = Model3D::from_term(&term).unwrap();
         match &expr {
-            Model3D::SweepExtrude { path, .. } => {
+            Model3D::SweepExtrude {
+                path: Path::Polyline { points },
+                ..
+            } => {
                 // start(1) + line(1) + quad(16) + cubic(16) = 34 points
-                assert_eq!(path.points.len(), 34);
+                assert_eq!(points.len(), 34);
             }
-            _ => panic!("Expected SweepExtrude"),
+            _ => panic!("Expected SweepExtrude with polyline path"),
         }
+    }
+
+    #[test]
+    fn test_empty_3d_is_identity_for_union() {
+        let cube = Model3D::Cube {
+            x: 10.0,
+            y: 10.0,
+            z: 10.0,
+        };
+        let lhs_empty = Model3D::Union(Box::new(Model3D::Empty), Box::new(cube.clone()));
+        let rhs_empty = Model3D::Union(Box::new(cube.clone()), Box::new(Model3D::Empty));
+        let cube_mesh = cube.evaluate(&[]).unwrap().to_mesh();
+        let lhs_mesh = lhs_empty.evaluate(&[]).unwrap().to_mesh();
+        let rhs_mesh = rhs_empty.evaluate(&[]).unwrap().to_mesh();
+        assert_eq!(lhs_mesh.vertices().len(), cube_mesh.vertices().len());
+        assert_eq!(rhs_mesh.vertices().len(), cube_mesh.vertices().len());
+    }
+
+    #[test]
+    fn test_empty_3d_absorbs_intersection() {
+        let cube = Model3D::Cube {
+            x: 10.0,
+            y: 10.0,
+            z: 10.0,
+        };
+        let lhs_empty = Model3D::Intersection(Box::new(Model3D::Empty), Box::new(cube.clone()));
+        let rhs_empty = Model3D::Intersection(Box::new(cube), Box::new(Model3D::Empty));
+        assert!(lhs_empty.evaluate(&[]).unwrap().is_empty());
+        assert!(rhs_empty.evaluate(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_empty_3d_difference_semantics() {
+        let cube = Model3D::Cube {
+            x: 10.0,
+            y: 10.0,
+            z: 10.0,
+        };
+        // X - Empty = X
+        let minus_empty = Model3D::Difference(Box::new(cube.clone()), Box::new(Model3D::Empty));
+        let cube_verts = cube.evaluate(&[]).unwrap().to_mesh().vertices().len();
+        let minus_empty_verts = minus_empty.evaluate(&[]).unwrap().to_mesh().vertices().len();
+        assert_eq!(minus_empty_verts, cube_verts);
+        // Empty - X = Empty
+        let empty_minus = Model3D::Difference(Box::new(Model3D::Empty), Box::new(cube));
+        assert!(empty_minus.evaluate(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_empty_2d_union_returns_other() {
+        let circle = Model2D::Circle { radius: 5.0 };
+        let lhs_empty = Model2D::Union(Box::new(Model2D::Empty), Box::new(circle.clone()));
+        let rings = lhs_empty.to_polygon_rings().unwrap();
+        // 単純に circle のリングと同一であること (polygon_boolean_2d を経由しない)
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].len(), (DEFAULT_SEGMENTS as usize) * 2);
+    }
+
+    #[test]
+    fn test_empty_2d_intersection_is_empty() {
+        let circle = Model2D::Circle { radius: 5.0 };
+        let inter = Model2D::Intersection(Box::new(Model2D::Empty), Box::new(circle));
+        let rings = inter.to_polygon_rings().unwrap();
+        assert!(rings.is_empty());
     }
 
     #[test]
