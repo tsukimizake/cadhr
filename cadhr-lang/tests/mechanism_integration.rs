@@ -58,7 +58,7 @@ main(OUT) :- do_mech([
     let renders = run(src, "main(OUT).").expect("should succeed");
     let render_count = renders
         .iter()
-        .filter(|s| s.starts_with("translate("))
+        .filter(|s| s.starts_with("translate3d("))
         .count();
     assert_eq!(
         render_count, 3,
@@ -187,7 +187,7 @@ main(T1, OUT) :- do_mech([
     let renders = run(src, "main(0, OUT).").expect("should succeed");
     let render_count = renders
         .iter()
-        .filter(|s| s.starts_with("translate("))
+        .filter(|s| s.starts_with("translate3d("))
         .count();
     assert_eq!(render_count, 2, "expected 2 gears rendered");
 }
