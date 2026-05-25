@@ -143,38 +143,41 @@ pub fn registry() -> BuiltinRegistry {
             doc: "Regular tetrahedron primitive.",
             snippet: "tetrahedron",
         })
-        // ----- 3D CSG (dimension-suffixed; LANG_SPEC §1.1) -----
+        // ----- CSG (polymorphic over Shape2D / Shape3D) -----
+        // dispatch は `union/difference/intersection/hull` をそのまま受け、
+        // Model2D / Model3D どちらの context で呼ばれたかで分岐する。型推論側は
+        // `forall T. T -> T -> T` で 2 引数の型が一致することを保証する。
         .add(Builtin {
-            name: "union3d",
-            params: vec![s3(), s3()],
-            return_ty: s3(),
-            usage: "union3d(A: Shape3D, B: Shape3D) -> Shape3D",
-            doc: "Boolean union of two 3D shapes.",
-            snippet: "union3d($1, $2)",
+            name: "union",
+            params: vec![Type::Forall("T".to_string()), Type::Forall("T".to_string())],
+            return_ty: Type::Forall("T".to_string()),
+            usage: "union(A: T, B: T) -> T  where T = Shape2D | Shape3D",
+            doc: "Boolean union of two shapes (polymorphic over dimension).",
+            snippet: "union($1, $2)",
         })
         .add(Builtin {
-            name: "difference3d",
-            params: vec![s3(), s3()],
-            return_ty: s3(),
-            usage: "difference3d(A: Shape3D, B: Shape3D) -> Shape3D",
-            doc: "Boolean difference (A minus B) of two 3D shapes.",
-            snippet: "difference3d($1, $2)",
+            name: "difference",
+            params: vec![Type::Forall("T".to_string()), Type::Forall("T".to_string())],
+            return_ty: Type::Forall("T".to_string()),
+            usage: "difference(A: T, B: T) -> T  where T = Shape2D | Shape3D",
+            doc: "Boolean difference (A minus B), polymorphic over dimension.",
+            snippet: "difference($1, $2)",
         })
         .add(Builtin {
-            name: "intersection3d",
-            params: vec![s3(), s3()],
-            return_ty: s3(),
-            usage: "intersection3d(A: Shape3D, B: Shape3D) -> Shape3D",
-            doc: "Boolean intersection of two 3D shapes.",
-            snippet: "intersection3d($1, $2)",
+            name: "intersection",
+            params: vec![Type::Forall("T".to_string()), Type::Forall("T".to_string())],
+            return_ty: Type::Forall("T".to_string()),
+            usage: "intersection(A: T, B: T) -> T  where T = Shape2D | Shape3D",
+            doc: "Boolean intersection, polymorphic over dimension.",
+            snippet: "intersection($1, $2)",
         })
         .add(Builtin {
-            name: "hull3d",
+            name: "hull",
             params: vec![s3(), s3()],
             return_ty: s3(),
-            usage: "hull3d(A: Shape3D, B: Shape3D) -> Shape3D",
+            usage: "hull(A: Shape3D, B: Shape3D) -> Shape3D",
             doc: "Convex hull of two 3D shapes.",
-            snippet: "hull3d($1, $2)",
+            snippet: "hull($1, $2)",
         })
         // ----- 3D transforms (point-based translate per §1.1) -----
         // 3D-only なので dim suffix は不要 (overload 衝突なし)。
@@ -219,31 +222,8 @@ pub fn registry() -> BuiltinRegistry {
             doc: "2D circle primitive.",
             snippet: "circle($1)",
         })
-        // ----- 2D CSG -----
-        .add(Builtin {
-            name: "union2d",
-            params: vec![s2(), s2()],
-            return_ty: s2(),
-            usage: "union2d(A: Shape2D, B: Shape2D) -> Shape2D",
-            doc: "Boolean union of two 2D shapes.",
-            snippet: "union2d($1, $2)",
-        })
-        .add(Builtin {
-            name: "difference2d",
-            params: vec![s2(), s2()],
-            return_ty: s2(),
-            usage: "difference2d(A: Shape2D, B: Shape2D) -> Shape2D",
-            doc: "Boolean difference of two 2D shapes.",
-            snippet: "difference2d($1, $2)",
-        })
-        .add(Builtin {
-            name: "intersection2d",
-            params: vec![s2(), s2()],
-            return_ty: s2(),
-            usage: "intersection2d(A: Shape2D, B: Shape2D) -> Shape2D",
-            doc: "Boolean intersection of two 2D shapes.",
-            snippet: "intersection2d($1, $2)",
-        })
+        // 2D-specific CSG はもう polymorphic union/intersection/difference に統合済み。
+        // center2d だけ Point2D を取る点で 3D の center3d と区別が必要。
         .add(Builtin {
             name: "center2d",
             params: vec![s2(), p2()],

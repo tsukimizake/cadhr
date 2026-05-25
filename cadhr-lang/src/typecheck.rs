@@ -783,7 +783,9 @@ mod tests {
     }
 
     #[test]
-    fn infer_union3d_two_cubes() {
+    fn infer_union_two_cubes_polymorphic() {
+        // union は forall T. T -> T -> T。両引数が Shape3D の cube なので
+        // 推論結果は Shape3D に確定する。
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
@@ -800,9 +802,9 @@ mod tests {
                 ],
             )
         };
-        let t = struc::<()>("union3d".to_string(), vec![cube(1), cube(2)]);
+        let t = struc::<()>("union".to_string(), vec![cube(1), cube(2)]);
         let ty = infer_term(&t, &mut ctx).unwrap();
-        assert_eq!(ty, Type::Shape3D);
+        assert_eq!(ctx.subst.apply(&ty), Type::Shape3D);
     }
 
     #[test]
