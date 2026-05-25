@@ -8,9 +8,11 @@ use cadhr_lang::parse::{
     FileRegistry, QueryParam, ScopedTerm, SrcSpan, Term, collect_query_params, database,
     parse_error_span, query as parse_query, substitute_query_params,
 };
+use cadhr_lang::builtins;
 use cadhr_lang::term_processor::TermProcessor;
 use cadhr_lang::term_rewrite::CadhrError;
 use cadhr_lang::term_rewrite::{execute, infer_query_param_ranges};
+use cadhr_lang::typecheck;
 
 use crate::debug_log;
 use crate::preview::pipeline::Vertex;
@@ -220,6 +222,34 @@ pub fn run_mesh_job(params: MeshJobParams) -> MeshJobResult {
             &mut file_registry,
         )
         .map_err(|e| (format!("Module error: {}", e), None))?;
+
+        // 型検査 (best-effort): 新仕様のシグネチャ (`-> Type` / `X: Type`) を持つ
+        // clause に対して `infer_database` を走らせ、見つかった型エラーは debug_log
+        // に流す。マイグレーション完了までは実行をブロックしない。
+        // CADHR_TYPECHECK=strict が設定されている場合のみ MeshJobResult::Error にする。
+        let typecheck_diags = typecheck::infer_database(&db, &builtins::registry());
+        if !typecheck_diags.is_empty() {
+            let strict = std::env::var("CADHR_TYPECHECK").as_deref() == Ok("strict");
+            for d in &typecheck_diags {
+                debug_log!(
+                    "TypeError in clause #{} ({}): {}",
+                    d.clause_index,
+                    d.functor.as_deref().unwrap_or("<anon>"),
+                    d.error
+                );
+            }
+            if strict {
+                let first = &typecheck_diags[0];
+                return Err((
+                    format!(
+                        "Type error in {}: {}",
+                        first.functor.as_deref().unwrap_or("<anon>"),
+                        first.error
+                    ),
+                    None,
+                ));
+            }
+        }
 
         let mut query_params = collect_query_params(&query_terms);
         infer_query_param_ranges(&query_terms, &db, &mut query_params)

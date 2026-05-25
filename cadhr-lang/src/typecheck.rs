@@ -237,11 +237,71 @@ impl TypeEnv {
     }
 }
 
+/// ユーザ定義述語のシグネチャテーブル。`(functor name, arity) → (params, return_ty)`。
+/// 旧 cadhr-lang はシグネチャを書く構文がなかったため、新仕様で `head -> Type` が
+/// 付いた Clause だけがここに登録される。signature 未指定の predicate は本テーブルに
+/// 入らず、その呼び出しは `infer_term` で `MissingSignature` エラーになる。
+#[derive(Debug, Clone, Default)]
+pub struct UserSignatures {
+    sigs: HashMap<(String, usize), (Vec<Type>, Type)>,
+}
+
+impl UserSignatures {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, name: String, params: Vec<Type>, return_ty: Type) {
+        self.sigs.insert((name, params.len()), (params, return_ty));
+    }
+
+    pub fn lookup(&self, name: &str, arity: usize) -> Option<&(Vec<Type>, Type)> {
+        self.sigs.get(&(name.to_string(), arity))
+    }
+}
+
+/// database から `head -> Type` の付いた Clause のシグネチャを抽出する。
+/// head 引数の `type_annotation` (型) または min/max (range = Number) から params を組み、
+/// return_type フィールドを return_ty に使う。type_annotation も range も無い引数があれば
+/// その Clause は登録をスキップ (シグネチャ不完全と判断)。
+pub fn collect_user_signatures<S>(clauses: &[crate::parse::Clause<S>]) -> UserSignatures {
+    use crate::parse::{Clause, Term};
+    let mut us = UserSignatures::new();
+    for clause in clauses {
+        let (head, return_type) = match clause {
+            Clause::Fact { head, return_type } => (head, return_type),
+            Clause::Rule { head, return_type, .. } => (head, return_type),
+            _ => continue,
+        };
+        let Some(return_ty) = return_type else { continue };
+        let Term::Struct { functor, args, .. } = head else { continue };
+        let mut params = Vec::with_capacity(args.len());
+        let mut complete = true;
+        for arg in args {
+            match arg {
+                Term::Var { type_annotation: Some(t), .. } => params.push(t.clone()),
+                Term::Var { min, max, .. } if min.is_some() || max.is_some() => {
+                    params.push(Type::Number);
+                }
+                _ => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            us.insert(functor.clone(), params, return_ty.clone());
+        }
+    }
+    us
+}
+
 pub struct InferCtx<'a> {
     pub env: TypeEnv,
     pub subst: &'a mut Substitution,
     pub var_gen: &'a mut VarGen,
     pub builtins: &'a crate::builtins::BuiltinRegistry,
+    pub user_sigs: &'a UserSignatures,
 }
 
 /// Term を推論し、その型を返す。Substitution は副作用で更新される。
@@ -289,14 +349,19 @@ pub fn infer_term<S>(
             }
         }
         Term::Struct { functor, args, .. } => {
-            let sig = ctx
-                .builtins
-                .lookup(functor, args.len())
-                .ok_or_else(|| TypeError::MissingSignature {
-                    context: format!("{}/{}", functor, args.len()),
-                })?;
+            // builtin → user sig の順で探す。両方に無ければ MissingSignature。
+            let (params_template, ret_template) =
+                if let Some(b) = ctx.builtins.lookup(functor, args.len()) {
+                    (b.params.clone(), b.return_ty.clone())
+                } else if let Some((p, r)) = ctx.user_sigs.lookup(functor, args.len()) {
+                    (p.clone(), r.clone())
+                } else {
+                    return Err(TypeError::MissingSignature {
+                        context: format!("{}/{}", functor, args.len()),
+                    });
+                };
             let (params, ret_ty) =
-                instantiate_signature(&sig.params, &sig.return_ty, ctx.var_gen);
+                instantiate_signature(&params_template, &ret_template, ctx.var_gen);
             for (arg, expected) in args.iter().zip(params.iter()) {
                 let actual = infer_term(arg, ctx)?;
                 unify(expected, &actual, ctx.subst)?;
@@ -353,6 +418,7 @@ pub fn infer_term<S>(
 pub fn infer_clause<S: Clone>(
     clause: &crate::parse::Clause<S>,
     builtins: &crate::builtins::BuiltinRegistry,
+    user_sigs: &UserSignatures,
 ) -> Result<(), TypeError> {
     use crate::parse::{Clause, Term};
     let (head, body) = match clause {
@@ -391,6 +457,7 @@ pub fn infer_clause<S: Clone>(
         subst: &mut subst,
         var_gen: &mut var_gen,
         builtins,
+        user_sigs,
     };
 
     for goal in body {
@@ -398,6 +465,43 @@ pub fn infer_clause<S: Clone>(
         let _ = infer_term(goal, &mut ctx)?;
     }
     Ok(())
+}
+
+/// 診断結果のまとめ。1 つの clause での型エラーを集めて返す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClauseDiagnostic {
+    pub clause_index: usize,
+    pub functor: Option<String>,
+    pub error: TypeError,
+}
+
+/// database 全体に対して型推論を走らせる。
+/// clauses を 2 パス処理: まず user signatures を抽出、次に各 clause を `infer_clause`。
+/// 失敗した clause だけ `ClauseDiagnostic` として返す (途中で止まらない)。
+pub fn infer_database<S: Clone>(
+    clauses: &[crate::parse::Clause<S>],
+    builtins: &crate::builtins::BuiltinRegistry,
+) -> Vec<ClauseDiagnostic> {
+    use crate::parse::{Clause, Term};
+    let user_sigs = collect_user_signatures(clauses);
+    let mut diags = Vec::new();
+    for (idx, clause) in clauses.iter().enumerate() {
+        if let Err(err) = infer_clause(clause, builtins, &user_sigs) {
+            let functor = match clause {
+                Clause::Fact { head: Term::Struct { functor, .. }, .. }
+                | Clause::Rule { head: Term::Struct { functor, .. }, .. } => {
+                    Some(functor.clone())
+                }
+                _ => None,
+            };
+            diags.push(ClauseDiagnostic {
+                clause_index: idx,
+                functor,
+                error: err,
+            });
+        }
+    }
+    diags
 }
 
 #[cfg(test)]
@@ -541,12 +645,14 @@ mod tests {
         subst: &'a mut Substitution,
         var_gen: &'a mut VarGen,
         builtins: &'a crate::builtins::BuiltinRegistry,
+        user_sigs: &'a UserSignatures,
     ) -> InferCtx<'a> {
         InferCtx {
             env: TypeEnv::new(),
             subst,
             var_gen,
             builtins,
+            user_sigs,
         }
     }
 
@@ -555,7 +661,8 @@ mod tests {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let us = UserSignatures::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
         let t = infer_term::<()>(&number(Rational::from_integer(42)), &mut ctx).unwrap();
         assert_eq!(t, Type::Number);
     }
@@ -565,7 +672,8 @@ mod tests {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let us = UserSignatures::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
         let t = struc::<()>(
             "cube".to_string(),
             vec![
@@ -583,7 +691,8 @@ mod tests {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let us = UserSignatures::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
         let cube = |sz: i64| {
             struc::<()>(
                 "cube".to_string(),
@@ -604,7 +713,8 @@ mod tests {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let us = UserSignatures::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
         let ty = infer_term::<()>(&var("X".to_string()), &mut ctx).unwrap();
         assert!(matches!(ty, Type::Var(_)));
     }
@@ -614,7 +724,8 @@ mod tests {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let us = UserSignatures::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
         let v = Term::<()>::Var {
             name: "X".to_string(),
             scope: (),
@@ -635,7 +746,8 @@ mod tests {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let us = UserSignatures::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
         let lst = Term::<()>::List {
             items: vec![
                 number(Rational::from_integer(1)),
@@ -653,7 +765,8 @@ mod tests {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let us = UserSignatures::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
         let lst = Term::<()>::List {
             items: vec![
                 number(Rational::from_integer(1)),
@@ -670,7 +783,8 @@ mod tests {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let us = UserSignatures::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
         // X = cube(10, 10, 10): X should be Shape3D
         let eq = Term::<()>::Eq {
             left: Box::new(var("X".to_string())),
@@ -693,7 +807,8 @@ mod tests {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let us = UserSignatures::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
         let expr = Term::<()>::InfixExpr {
             op: ArithOp::Add,
             left: Box::new(number(Rational::from_integer(1))),
@@ -736,7 +851,7 @@ mod tests {
             body,
             return_type: Some(Type::Shape3D),
         };
-        infer_clause(&clause, &b).unwrap();
+        infer_clause(&clause, &b, &UserSignatures::new()).unwrap();
     }
 
     #[test]
@@ -775,8 +890,130 @@ mod tests {
             body,
             return_type: None,
         };
-        let r = infer_clause(&clause, &b);
+        let r = infer_clause(&clause, &b, &UserSignatures::new());
         assert!(matches!(r, Err(TypeError::Mismatch { .. })));
+    }
+
+    #[test]
+    fn collect_user_signatures_picks_typed_clauses() {
+        use crate::parse::{Clause, struc};
+        // foo(X: Number) -> Shape3D :- ... と bar(Y) :- ... の二つ
+        let typed_head = struc::<()>(
+            "foo".to_string(),
+            vec![Term::Var {
+                name: "X".to_string(),
+                scope: (),
+                default_value: None,
+                min: None,
+                max: None,
+                span: None,
+                type_annotation: Some(Type::Number),
+            }],
+        );
+        let bare_head = struc::<()>("bar".to_string(), vec![var("Y".to_string())]);
+        let clauses = vec![
+            Clause::<()>::Rule {
+                head: typed_head,
+                body: vec![],
+                return_type: Some(Type::Shape3D),
+            },
+            Clause::<()>::Rule {
+                head: bare_head,
+                body: vec![],
+                return_type: None,
+            },
+        ];
+        let us = collect_user_signatures(&clauses);
+        assert!(us.lookup("foo", 1).is_some());
+        assert!(us.lookup("bar", 1).is_none(), "untyped clause should be skipped");
+    }
+
+    #[test]
+    fn infer_calls_user_predicate_after_sig_collection() {
+        use crate::parse::{Clause, struc};
+        // foo(X: Number) -> Shape3D :- B = cube(X, X, X).
+        // main(M) -> Shape3D :- M = foo(10).
+        let foo = Clause::<()>::Rule {
+            head: struc::<()>(
+                "foo".to_string(),
+                vec![Term::Var {
+                    name: "X".to_string(),
+                    scope: (),
+                    default_value: None,
+                    min: None,
+                    max: None,
+                    span: None,
+                    type_annotation: Some(Type::Number),
+                }],
+            ),
+            body: vec![Term::Eq {
+                left: Box::new(var("B".to_string())),
+                right: Box::new(struc::<()>(
+                    "cube".to_string(),
+                    vec![
+                        var("X".to_string()),
+                        var("X".to_string()),
+                        var("X".to_string()),
+                    ],
+                )),
+            }],
+            return_type: Some(Type::Shape3D),
+        };
+        let main = Clause::<()>::Rule {
+            head: struc::<()>("main".to_string(), vec![var("M".to_string())]),
+            body: vec![Term::Eq {
+                left: Box::new(var("M".to_string())),
+                right: Box::new(struc::<()>(
+                    "foo".to_string(),
+                    vec![number(Rational::from_integer(10))],
+                )),
+            }],
+            return_type: None,
+        };
+        let clauses = vec![foo, main];
+        let b = crate::builtins::registry();
+        let diags = infer_database(&clauses, &b);
+        assert!(diags.is_empty(), "expected no diagnostics, got {:?}", diags);
+    }
+
+    #[test]
+    fn infer_database_reports_mismatch() {
+        use crate::parse::{Clause, struc};
+        // bad(X: Number) -> Shape3D :- B = cube(X, X, circle(1)).
+        let clauses = vec![Clause::<()>::Rule {
+            head: struc::<()>(
+                "bad".to_string(),
+                vec![Term::Var {
+                    name: "X".to_string(),
+                    scope: (),
+                    default_value: None,
+                    min: None,
+                    max: None,
+                    span: None,
+                    type_annotation: Some(Type::Number),
+                }],
+            ),
+            body: vec![Term::Eq {
+                left: Box::new(var("B".to_string())),
+                right: Box::new(struc::<()>(
+                    "cube".to_string(),
+                    vec![
+                        var("X".to_string()),
+                        var("X".to_string()),
+                        struc::<()>(
+                            "circle".to_string(),
+                            vec![number(Rational::from_integer(1))],
+                        ),
+                    ],
+                )),
+            }],
+            return_type: Some(Type::Shape3D),
+        }];
+        let b = crate::builtins::registry();
+        let diags = infer_database(&clauses, &b);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].functor.as_deref(), Some("bad"));
+        assert!(matches!(diags[0].error, TypeError::Mismatch { .. }));
     }
 
     #[test]
@@ -784,7 +1021,8 @@ mod tests {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b);
+        let us = UserSignatures::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
         let t = struc::<()>("unknown_op".to_string(), vec![]);
         let r = infer_term(&t, &mut ctx);
         assert!(matches!(r, Err(TypeError::MissingSignature { .. })));
