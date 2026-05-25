@@ -159,43 +159,20 @@ pub enum Plane3D {
 
 const DEFAULT_SEGMENTS: u32 = 32;
 
-/// Runtime dispatch が認識する functor 名 (LSP の `is_builtin_functor` も参照)。
-/// 旧名 (`union`, `translate` 等) と新仕様の dimension-suffixed 名 (`union3d`,
-/// `translate3d` 等) を両方並べる。dispatch は `FunctorTag` に集約されるため、
-/// 同名異 arity の overload は同じ tag を共有する。
-///
-/// 移行期間中は両方が認識されるが、推奨は新名。タスク完了後 (全 user コードが
-/// 新名を使うようになったら) 旧名はこのテーブルから削除し FunctorTag からも除く。
 pub const BUILTIN_FUNCTORS: &[(&str, &[usize])] = &[
     ("cube", &[3]),
     ("sphere", &[1, 2]),
     ("cylinder", &[2, 3]),
     ("tetrahedron", &[0]),
-    // CSG (legacy non-suffixed)
     ("union", &[2]),
     ("difference", &[2]),
     ("intersection", &[2]),
     ("hull", &[2]),
-    // CSG (LANG_SPEC §1.1: dimension-suffixed)
-    ("union3d", &[2]),
-    ("difference3d", &[2]),
-    ("intersection3d", &[2]),
-    ("hull3d", &[2]),
-    ("union2d", &[2]),
-    ("difference2d", &[2]),
-    ("intersection2d", &[2]),
-    // Transforms (legacy non-suffixed)
     ("translate", &[3]),
     ("scale", &[4]),
     ("rotate", &[4]),
-    // Transforms (new spec)
-    ("translate3d", &[3]),
-    ("scale3d", &[4]),
-    ("rotate3d", &[4]),
-    // Points
-    ("p", &[2, 3]),
-    ("p2d", &[2]),
-    ("p3d", &[3]),
+    ("p2", &[2]),
+    ("p3", &[3]),
     ("sketch", &[2]),
     ("rotateToXY", &[1]),
     ("rotateToYZ", &[1]),
@@ -235,7 +212,8 @@ enum FunctorTag {
     Translate,
     Scale,
     Rotate,
-    Point,
+    Point2D,
+    Point3D,
     Sketch,
     RotateToXY,
     RotateToYZ,
@@ -263,17 +241,15 @@ impl FromStr for FunctorTag {
             "sphere" => Ok(FunctorTag::Sphere),
             "cylinder" => Ok(FunctorTag::Cylinder),
             "tetrahedron" => Ok(FunctorTag::Tetrahedron),
-            // CSG: legacy + dimension-suffixed alias (同じ tag に解決)
-            "union" | "union3d" | "union2d" => Ok(FunctorTag::Union),
-            "difference" | "difference3d" | "difference2d" => Ok(FunctorTag::Difference),
-            "intersection" | "intersection3d" | "intersection2d" => Ok(FunctorTag::Intersection),
-            "hull" | "hull3d" => Ok(FunctorTag::Hull),
-            // Transforms
-            "translate" | "translate3d" => Ok(FunctorTag::Translate),
-            "scale" | "scale3d" => Ok(FunctorTag::Scale),
-            "rotate" | "rotate3d" => Ok(FunctorTag::Rotate),
-            // Points: arity が型を兼ねるので legacy `p/2,3` も新 `p2d/p3d` も同じ tag
-            "p" | "p2d" | "p3d" => Ok(FunctorTag::Point),
+            "union" => Ok(FunctorTag::Union),
+            "difference" => Ok(FunctorTag::Difference),
+            "intersection" => Ok(FunctorTag::Intersection),
+            "hull" => Ok(FunctorTag::Hull),
+            "translate" => Ok(FunctorTag::Translate),
+            "scale" => Ok(FunctorTag::Scale),
+            "rotate" => Ok(FunctorTag::Rotate),
+            "p2" => Ok(FunctorTag::Point2D),
+            "p3" => Ok(FunctorTag::Point3D),
             "sketch" => Ok(FunctorTag::Sketch),
             "rotateToXY" => Ok(FunctorTag::RotateToXY),
             "rotateToYZ" => Ok(FunctorTag::RotateToYZ),
@@ -310,7 +286,8 @@ impl fmt::Display for FunctorTag {
             FunctorTag::Translate => "translate",
             FunctorTag::Scale => "scale",
             FunctorTag::Rotate => "rotate",
-            FunctorTag::Point => "p",
+            FunctorTag::Point2D => "p2",
+            FunctorTag::Point3D => "p3",
             FunctorTag::Sketch => "sketch",
             FunctorTag::RotateToXY => "rotateToXY",
             FunctorTag::RotateToYZ => "rotateToYZ",
@@ -523,21 +500,20 @@ fn midpoint(lo: &Bound, hi: &Bound) -> Rational {
     Rational::from_f64((lo.value.to_f64() + hi.value.to_f64()) / 2.0)
 }
 
-/// `p(A, B)` 形式の Term から内部 2 引数を借用で取り出す(control2d 用)。
+/// `p2(A, B)` 形式の Term から内部 2 引数を借用で取り出す(control2d 用)。
 fn point_2d_args<S>(term: &Term<S>) -> Option<&[Term<S>; 2]> {
     if let Term::Struct {
         functor: f, args, ..
     } = term
     {
-        // legacy `p/2` と新名 `p2d/2` の両方を受け入れる。
-        if (f == "p" || f == "p2d") && args.len() == 2 {
+        if f == "p2" && args.len() == 2 {
             return args.as_slice().try_into().ok();
         }
     }
     None
 }
 
-/// control2d(p(X,Y)[, Name]) / control3d(p(X,Y,Z)[, Name]) の Term を抽出し、
+/// control2d(p2(X,Y)[, Name]) / control3d(p3(X,Y,Z)[, Name]) の Term を抽出し、
 /// 残りの Term を返す。各軸の Var に対する override を適用し、同名 Var の他の参照箇所も
 /// 数値に置換する。control2d は z=0 固定、var_names[2]=None。
 pub fn extract_control_points<S: Clone + PartialEq + fmt::Debug>(
@@ -574,7 +550,7 @@ pub fn extract_control_points<S: Clone + PartialEq + fmt::Debug>(
         let axis_labels = ["x", "y", "z"];
 
         // 第 1 引数が bare Var (注釈付きも含む) の場合: per-axis Var に unify する。
-        // `control2d(CENTER)` → CENTER = p(CENTER.x, CENTER.y) (fresh Var)
+        // `control2d(CENTER)` → CENTER = p2(CENTER.x, CENTER.y) (fresh Var)
         // `control2d(-100<CENTER<100)` → 各 axis Var が range -100..100 を継承
         // 各 fresh Var には bare Var の annotation (default/min/max) を伝搬し、range のみ
         // 指定された場合は midpoint を default に補う(center2d 等の strict 評価先で値が
@@ -644,7 +620,7 @@ pub fn extract_control_points<S: Clone + PartialEq + fmt::Debug>(
             }
 
             let p_term: Term<S> = Term::Struct {
-                functor: "p".to_string(),
+                functor: if is_2d { "p2".to_string() } else { "p3".to_string() },
                 args: p_args,
                 span: None,
             };
@@ -666,7 +642,7 @@ pub fn extract_control_points<S: Clone + PartialEq + fmt::Debug>(
             return false;
         }
 
-        // 通常パス: 引数は `p(X, Y[, Z])` リテラル。
+        // 通常パス: 引数は `p3(X, Y[, Z])` リテラル。
         let axes: Option<Vec<&Term<S>>> = if is_3d {
             point_3d_args(&args[0]).map(|a| a.iter().collect())
         } else {
@@ -1063,7 +1039,7 @@ fn on_segment(p: (f64, f64), q: (f64, f64), r: (f64, f64), eps: f64) -> bool {
     in_x || in_y
 }
 
-/// `term` を 2D 点として抽出する。`p(number, number)` リテラルのみを受け入れる。
+/// `term` を 2D 点として抽出する。`p2(number, number)` リテラルのみを受け入れる。
 /// 各座標は `term_as_number` (Number / Var with default) で値化できる必要がある。
 fn extract_point_2d_at<S>(
     term: &Term<S>,
@@ -1073,14 +1049,14 @@ fn extract_point_2d_at<S>(
     if let Term::Struct {
         functor: f, args, ..
     } = term
-        && f == "p"
+        && f == "p2"
         && args.len() == 2
     {
         let x = term_as_number(&args[0])
             .ok_or_else(|| ConversionError::TypeMismatch {
                 functor: functor.to_string(),
                 arg_index,
-                expected: "p(number, number)",
+                expected: "p2(number, number)",
             })?
             .0
             .to_f64();
@@ -1088,7 +1064,7 @@ fn extract_point_2d_at<S>(
             .ok_or_else(|| ConversionError::TypeMismatch {
                 functor: functor.to_string(),
                 arg_index,
-                expected: "p(number, number)",
+                expected: "p2(number, number)",
             })?
             .0
             .to_f64();
@@ -1097,7 +1073,7 @@ fn extract_point_2d_at<S>(
     Err(ConversionError::TypeMismatch {
         functor: functor.to_string(),
         arg_index,
-        expected: "p(x, y)",
+        expected: "p2(x, y)",
     })
 }
 
@@ -1109,7 +1085,7 @@ fn extract_point_2d<S>(
     extract_point_2d_at(term, &tag.to_string(), arg_index)
 }
 
-/// `p(A, B, C)` 形式の Term から内部 3 引数を借用で取り出す。
+/// `p3(A, B, C)` 形式の Term から内部 3 引数を借用で取り出す。
 /// 構造マッチに集中させ、各 sub-term をどう値化するかは呼び出し側に委ねる。
 /// (control は TrackedF64 + Var 追跡が必要、center3d/translate は単純な f64 が必要、と
 ///  要求が異なるため。)
@@ -1118,8 +1094,7 @@ fn point_3d_args<S>(term: &Term<S>) -> Option<&[Term<S>; 3]> {
         functor: f, args, ..
     } = term
     {
-        // legacy `p/3` と新名 `p3d/3` の両方を受け入れる。
-        if (f == "p" || f == "p3d") && args.len() == 3 {
+        if f == "p3" && args.len() == 3 {
             return args.as_slice().try_into().ok();
         }
     }
@@ -1134,14 +1109,14 @@ fn extract_point_3d<S>(
     let args = point_3d_args(term).ok_or_else(|| ConversionError::TypeMismatch {
         functor: tag.to_string(),
         arg_index,
-        expected: "p(x, y, z)",
+        expected: "p3(x, y, z)",
     })?;
     let mut out = [0.0; 3];
     for (i, a) in args.iter().enumerate() {
         let (r, _) = term_as_number(a).ok_or_else(|| ConversionError::TypeMismatch {
             functor: tag.to_string(),
             arg_index,
-            expected: "p(number, number, number)",
+            expected: "p3(number, number, number)",
         })?;
         out[i] = r.to_f64();
     }
@@ -1739,8 +1714,8 @@ impl Model3D {
             }
             FunctorTag::SweepExtrude => Err(a.arity_error("2")),
 
-            FunctorTag::Point => Err(ConversionError::UnknownPrimitive(
-                "p is a data constructor, not a shape primitive".to_string(),
+            FunctorTag::Point2D | FunctorTag::Point3D => Err(ConversionError::UnknownPrimitive(
+                "p2/p3 are data constructors, not shape primitives".to_string(),
             )),
             FunctorTag::LineTo | FunctorTag::BezierTo => {
                 Err(ConversionError::UnknownPrimitive(format!(
@@ -2144,11 +2119,11 @@ mod tests {
             vec![number_int(1), number_int(1), number_int(1)],
         );
         let src = struc(
-            "p".into(),
+            "p3".into(),
             vec![number_int(0), number_int(0), number_int(0)],
         );
         let dst = struc(
-            "p".into(),
+            "p3".into(),
             vec![number_int(5), number_int(10), number_int(15)],
         );
         let translated = struc("translate".into(), vec![cube, src, dst]);
@@ -2171,11 +2146,11 @@ mod tests {
             vec![number_int(2), number_int(2), number_int(2)],
         );
         let src = struc(
-            "p".into(),
+            "p3".into(),
             vec![number_int(1), number_int(2), number_int(3)],
         );
         let dst = struc(
-            "p".into(),
+            "p3".into(),
             vec![number_int(10), number_int(20), number_int(30)],
         );
         let translated = struc("translate".into(), vec![cube, src, dst]);
@@ -2365,13 +2340,13 @@ mod tests {
             pts.len()
         );
         let (sx, sy) = pts[0];
-        let start = struc("p".into(), vec![number_int(sx), number_int(sy)]);
+        let start = struc("p2".into(), vec![number_int(sx), number_int(sy)]);
         let segments: Vec<Term> = pts[1..]
             .iter()
             .map(|&(x, y)| {
                 struc(
                     "line_to".into(),
-                    vec![struc("p".into(), vec![number_int(x), number_int(y)])],
+                    vec![struc("p2".into(), vec![number_int(x), number_int(y)])],
                 )
             })
             .collect();
@@ -2413,7 +2388,7 @@ mod tests {
     #[test]
     fn test_sketch_explicit_close_dedupes_last_vertex() {
         // 明示的に始点に戻す: 4 line_to + 末尾は始点と一致 → 重複排除されて 4 頂点。
-        let start: Term = struc("p".into(), vec![number_int(0), number_int(0)]);
+        let start: Term = struc("p2".into(), vec![number_int(0), number_int(0)]);
         let segments: Vec<Term> = vec![
             line_to_term(1, 0),
             line_to_term(1, 1),
@@ -2804,7 +2779,7 @@ mod tests {
         let cp1 = struc(
             "control3d".into(),
             vec![struc(
-                "p".into(),
+                "p3".into(),
                 vec![number_int(1), number_int(2), number_int(3)],
             )],
         );
@@ -2812,7 +2787,7 @@ mod tests {
             "control3d".into(),
             vec![
                 struc(
-                    "p".into(),
+                    "p3".into(),
                     vec![number_int(4), number_int(5), number_int(6)],
                 ),
                 string_lit("origin".into()),
@@ -2839,7 +2814,7 @@ mod tests {
         let cp = struc(
             "control3d".into(),
             vec![struc(
-                "p".into(),
+                "p3".into(),
                 vec![var("X".into()), number_int(0), number_int(0)],
             )],
         );
@@ -2856,7 +2831,7 @@ mod tests {
     #[test]
     fn test_control_shared_var_with_geometry() {
         let mut resolved = execute_main_args(
-            "main(L) :- L = [linear_extrude(rotateToXY(sketch(p(0, 0), [line_to(p(0, 40)), line_to(p(30, 0))])), X@10), control3d(p(X, 0, 0), \"width\")].",
+            "main(L) :- L = [linear_extrude(rotateToXY(sketch(p2(0, 0), [line_to(p2(0, 40)), line_to(p2(30, 0))])), X@10), control3d(p3(X, 0, 0), \"width\")].",
         );
         let cps = extract_control_points(&mut resolved, &Default::default());
 
@@ -2874,7 +2849,7 @@ mod tests {
     fn test_control_shared_var_without_default() {
         // X=なし: controlのVar座標が0にフォールバックし、extrude側にも0が代入される
         let mut resolved = execute_main_args(
-            "main(L) :- L = [linear_extrude(rotateToXY(sketch(p(0, 0), [line_to(p(0, 40)), line_to(p(30, 0))])), X), control3d(p(X, -10, -10))].",
+            "main(L) :- L = [linear_extrude(rotateToXY(sketch(p2(0, 0), [line_to(p2(0, 40)), line_to(p2(30, 0))])), X), control3d(p3(X, -10, -10))].",
         );
         let cps = extract_control_points(&mut resolved, &Default::default());
 
@@ -2890,7 +2865,7 @@ mod tests {
     #[test]
     fn test_control_shared_var_in_arith_expr() {
         let mut resolved = execute_main_args(
-            "main(L) :- L = [sketch(p(0,0), [line_to(p(0,40)), line_to(p(30,0))]) |> rotateToXY |> linear_extrude(X+1), control3d(p(X, -10, -10))].",
+            "main(L) :- L = [sketch(p2(0,0), [line_to(p2(0,40)), line_to(p2(30,0))]) |> rotateToXY |> linear_extrude(X+1), control3d(p3(X, -10, -10))].",
         );
         let cps = extract_control_points(&mut resolved, &Default::default());
 
@@ -2904,7 +2879,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let src = "main(L) :- L = [sketch(p(0,0), [line_to(p(0,40)), line_to(p(30,0))]) |> rotateToXY |> linear_extrude(X+1), control3d(p(X, -10, -10))].";
+        let src = "main(L) :- L = [sketch(p2(0,0), [line_to(p2(0,40)), line_to(p2(30,0))]) |> rotateToXY |> linear_extrude(X+1), control3d(p3(X, -10, -10))].";
 
         // 初回: overridesなし
         let mut resolved = execute_main_args(src);
@@ -2933,106 +2908,8 @@ mod tests {
     }
 
     #[test]
-    fn test_dim_suffixed_names_recognized_as_builtin() {
-        // 新仕様 §1.1 の dimension-suffixed 名がパース後の dispatch で認識されること。
-        for name in &[
-            "union3d",
-            "difference3d",
-            "intersection3d",
-            "hull3d",
-            "union2d",
-            "difference2d",
-            "intersection2d",
-            "translate3d",
-            "scale3d",
-            "rotate3d",
-            "p2d",
-            "p3d",
-        ] {
-            assert!(
-                crate::term_processor::is_builtin_functor(name),
-                "expected '{}' to be a recognized builtin",
-                name
-            );
-        }
-    }
-
-    #[test]
-    fn test_dim_suffixed_aliases_dispatch_same_as_legacy() {
-        // `union3d(cube(1,1,1), cube(2,2,2))` が `union(...)` と同じ Model3D に解釈される。
-        let cube1 = struc(
-            "cube".to_string(),
-            vec![
-                number_int::<()>(1),
-                number_int::<()>(1),
-                number_int::<()>(1),
-            ],
-        );
-        let cube2 = struc(
-            "cube".to_string(),
-            vec![
-                number_int::<()>(2),
-                number_int::<()>(2),
-                number_int::<()>(2),
-            ],
-        );
-        let legacy = Model3D::from_term(&struc(
-            "union".to_string(),
-            vec![cube1.clone(), cube2.clone()],
-        ))
-        .unwrap();
-        let new = Model3D::from_term(&struc(
-            "union3d".to_string(),
-            vec![cube1, cube2],
-        ))
-        .unwrap();
-        // どちらも Union variant に解決されることを確認 (形が同じ Box<Model3D> 2 つ)
-        assert!(matches!(legacy, Model3D::Union(_, _)));
-        assert!(matches!(new, Model3D::Union(_, _)));
-    }
-
-    #[test]
-    fn test_p3d_alias_for_legacy_p3() {
-        // p3d(1,2,3) が p(1,2,3) と同じ点として解釈される (translate の引数として使える)。
-        let cube = struc(
-            "cube".to_string(),
-            vec![
-                number_int::<()>(10),
-                number_int::<()>(10),
-                number_int::<()>(10),
-            ],
-        );
-        let src = struc(
-            "p".to_string(),
-            vec![
-                number_int::<()>(0),
-                number_int::<()>(0),
-                number_int::<()>(0),
-            ],
-        );
-        let dst_new = struc(
-            "p3d".to_string(),
-            vec![
-                number_int::<()>(5),
-                number_int::<()>(6),
-                number_int::<()>(7),
-            ],
-        );
-        let t = struc("translate3d".to_string(), vec![cube, src, dst_new]);
-        let expr = Model3D::from_term(&t).unwrap();
-        match expr {
-            Model3D::Translate { x, y, z, .. } => {
-                assert_eq!(x, 5.0);
-                assert_eq!(y, 6.0);
-                assert_eq!(z, 7.0);
-            }
-            _ => panic!("expected Translate"),
-        }
-    }
-
-    #[test]
     fn test_extract_control_2d() {
-        // control2d(p(X, Y)) は z=0、var_names[2]=None の ControlPoint を生成。
+        // control2d(p2(X, Y)) は z=0、var_names[2]=None の ControlPoint を生成。
         let cube: Term = struc(
             "cube".into(),
             vec![number_int(10), number_int(20), number_int(30)],
@@ -3040,7 +2917,7 @@ mod tests {
         let cp = struc(
             "control2d".into(),
             vec![struc(
-                "p".into(),
+                "p2".into(),
                 vec![number_int(7), number_int(11)],
             )],
         );
@@ -3058,12 +2935,12 @@ mod tests {
 
     #[test]
     fn test_extract_control_2d_with_var_and_name() {
-        // control2d(p(X, Y), "anchor") で X 軸の Var 名が追跡されること
+        // control2d(p2(X, Y), "anchor") で X 軸の Var 名が追跡されること
         let cp = struc(
             "control2d".into(),
             vec![
                 struc(
-                    "p".into(),
+                    "p2".into(),
                     vec![var("X".into()), number_int(5)],
                 ),
                 string_lit("anchor".into()),
@@ -3088,7 +2965,7 @@ mod tests {
         let cp = struc(
             "control2d".into(),
             vec![struc(
-                "p".into(),
+                "p2".into(),
                 vec![var("X".into()), var("Y".into())],
             )],
         );
@@ -3128,15 +3005,15 @@ mod tests {
     #[test]
     fn test_control_2d_unify_multi_reference_with_range() {
         let mut resolved = execute_main_args(
-            "inner(CENTER, M) :- M = sketch(p(0,0), [line_to(p(XIN@14.6,0)), line_to(p(XIN,INNERLEN@49.8)), line_to(p(0,INNERLEN))])
+            "inner(CENTER, M) :- M = sketch(p2(0,0), [line_to(p2(XIN@14.6,0)), line_to(p2(XIN,INNERLEN@49.8)), line_to(p2(0,INNERLEN))])
                 |> center2d(CENTER).
              battery_box(M, C) :-
                inner(CENTER, INNER),
-               M = (((sketch(p(0,0), [line_to(p(X@20,0)), line_to(p(X,Y@58)), line_to(p(0,Y))]) |> center2d(CENTER))
+               M = (((sketch(p2(0,0), [line_to(p2(X@20,0)), line_to(p2(X,Y@58)), line_to(p2(0,Y))]) |> center2d(CENTER))
                      - INNER) |> rotateToYZ |> linear_extrude(20))
                     + (INNER |> rotateToYZ |> linear_extrude(2)),
                C = control2d(-100<CENTER<100).
-             main(L) :- battery_box(B, C), L = [B |> center3d(p(0,0,0)), C].",
+             main(L) :- battery_box(B, C), L = [B |> center3d(p3(0,0,0)), C].",
         );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
@@ -3155,15 +3032,15 @@ mod tests {
     #[test]
     fn test_control_2d_unify_multi_reference_mesh_generation() {
         let mut resolved = execute_main_args(
-            "inner(CENTER, M) :- M = sketch(p(0,0), [line_to(p(XIN@14.6,0)), line_to(p(XIN,INNERLEN@49.8)), line_to(p(0,INNERLEN))])
+            "inner(CENTER, M) :- M = sketch(p2(0,0), [line_to(p2(XIN@14.6,0)), line_to(p2(XIN,INNERLEN@49.8)), line_to(p2(0,INNERLEN))])
                 |> center2d(CENTER).
              battery_box(M, C) :-
                inner(CENTER, INNER),
-               M = (((sketch(p(0,0), [line_to(p(X@20,0)), line_to(p(X,Y@58)), line_to(p(0,Y))]) |> center2d(CENTER))
+               M = (((sketch(p2(0,0), [line_to(p2(X@20,0)), line_to(p2(X,Y@58)), line_to(p2(0,Y))]) |> center2d(CENTER))
                      - INNER) |> rotateToYZ |> linear_extrude(20))
                     + (INNER |> rotateToYZ |> linear_extrude(2)),
                C = control2d(-100<CENTER<100).
-             main(L) :- battery_box(B, C), L = [B |> center3d(p(0,0,0)), C].",
+             main(L) :- battery_box(B, C), L = [B |> center3d(p3(0,0,0)), C].",
         );
         let _cps = extract_control_points(&mut resolved, &Default::default());
         let exprs: Vec<Model3D> = resolved
@@ -3188,14 +3065,14 @@ mod tests {
     fn test_control_3d_bare_unify_does_not_cross_scopes() {
         let mut resolved = execute_main_args(
             "foo(M, C) :- M = cube(1, 1, 1), C = control3d(POS).
-             bar(M) :- M = cube(2, 2, 2) |> translate(p(0,0,0), POS), POS = p(5, 0, 0).
+             bar(M) :- M = cube(2, 2, 2) |> translate(p3(0,0,0), POS), POS = p3(5, 0, 0).
              main(L) :- foo(M1, C), bar(M2), L = [M1 + M2, C].",
         );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
-        // foo の control3d は POS を p(POS.x#<scope>, POS.y#<scope>, POS.z#<scope>) に unify
+        // foo の control3d は POS を p3(POS.x#<scope>, POS.y#<scope>, POS.z#<scope>) に unify
         assert!(cps[0].var_names[0].as_deref().unwrap().starts_with("POS.x#"));
-        // bar 側の POS は CENTER = p(5, 0, 0) で別の値に bind されている。
+        // bar 側の POS は CENTER = p3(5, 0, 0) で別の値に bind されている。
         // 変換が通れば(エラーなく Model3D になれば) cross-scope 干渉していない。
         let _exprs: Vec<Model3D> = resolved
             .iter()
@@ -3242,11 +3119,11 @@ mod tests {
         );
     }
 
-    /// 明示形 `p(0<X<100, 50<Y<150)` で軸ごとに異なる range が axis_ranges に入る。
+    /// 明示形 `p2(0<X<100, 50<Y<150)` で軸ごとに異なる range が axis_ranges に入る。
     #[test]
     fn test_control_2d_named_per_axis_ranges() {
         let mut resolved = execute_main_args(
-            "main(L) :- L = [cube(1,1,1), control2d(p(0<X<100, 50<Y<150))].",
+            "main(L) :- L = [cube(1,1,1), control2d(p2(0<X<100, 50<Y<150))].",
         );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
@@ -3263,7 +3140,7 @@ mod tests {
     #[test]
     fn test_control_3d_named_per_axis_negative_range() {
         let mut resolved = execute_main_args(
-            "main(L) :- L = [cube(1,1,1), control3d(p(-100<X<-50, -10<Y<10, 0<Z<200))].",
+            "main(L) :- L = [cube(1,1,1), control3d(p3(-100<X<-50, -10<Y<10, 0<Z<200))].",
         );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
@@ -3277,19 +3154,19 @@ mod tests {
         // クエリの変数名を確認 (デバッグ出力するだけの diagnostic テスト)
         let resolved = execute_main_args(
             "box(N, M) :- M = cube(N, N, N).\n\
-             main(L) :- box(10, S1), box(20, S2), L = [S1, S2, control3d(p(X, 0, 0))].",
+             main(L) :- box(10, S1), box(20, S2), L = [S1, S2, control3d(p3(X, 0, 0))].",
         );
         eprintln!("case1: {:?}", resolved);
 
         // 2つのcontrolが同じ変数名Xを使うケース
         let resolved2 = execute_main_args(
-            "main(L) :- L = [cube(X+Y, 20, 30), control3d(p(X, 0, 0)), control3d(p(Y, 0, 0))].",
+            "main(L) :- L = [cube(X+Y, 20, 30), control3d(p3(X, 0, 0)), control3d(p3(Y, 0, 0))].",
         );
         eprintln!("case2: {:?}", resolved2);
 
         // ルール経由で同名変数が複数スコープに存在するケース
         let resolved3 = execute_main_args(
-            "helper(N, M, C) :- M = cube(N, N, N), C = control3d(p(X, 0, 0)).\n\
+            "helper(N, M, C) :- M = cube(N, N, N), C = control3d(p3(X, 0, 0)).\n\
              main(L) :- helper(10, M1, C1), helper(20, M2, C2), L = [M1, M2, C1, C2].",
         );
         eprintln!("case3: {:?}", resolved3);
@@ -3301,7 +3178,7 @@ mod tests {
 
         // shape と control を 1 つのリストとして main(M) 経由で受け取る。
         let mut resolved = execute_main_args(
-            "main(M) :- M = [cube(X+10, 20, 30), control3d(p(X, 0, 0))].",
+            "main(M) :- M = [cube(X+10, 20, 30), control3d(p3(X, 0, 0))].",
         );
 
         let mut overrides = HashMap::new();
@@ -3325,7 +3202,7 @@ mod tests {
         // box(10) → cube(10,10,10) / box(20) → cube(20,20,20) は変わらないこと。
         let mut resolved = execute_main_args(
             "box(N, M) :- M = cube(N, N, N).\n\
-             main(L) :- box(10, S1), box(20, S2), L = [S1 + S2, control3d(p(X, 0, 0))].",
+             main(L) :- box(10, S1), box(20, S2), L = [S1 + S2, control3d(p3(X, 0, 0))].",
         );
 
         let mut overrides = HashMap::new();
@@ -3340,7 +3217,7 @@ mod tests {
     }
 
     fn make_path_term(start: (i64, i64), segments: Vec<Term>) -> Term {
-        let start_point = struc("p".into(), vec![number_int(start.0), number_int(start.1)]);
+        let start_point = struc("p2".into(), vec![number_int(start.0), number_int(start.1)]);
         struc(
             "path".into(),
             vec![start_point, crate::parse::list(segments, None)],
@@ -3350,7 +3227,7 @@ mod tests {
     fn line_to_term(x: i64, y: i64) -> Term {
         struc(
             "line_to".into(),
-            vec![struc("p".into(), vec![number_int(x), number_int(y)])],
+            vec![struc("p2".into(), vec![number_int(x), number_int(y)])],
         )
     }
 
@@ -3358,8 +3235,8 @@ mod tests {
         struc(
             "bezier_to".into(),
             vec![
-                struc("p".into(), vec![number_int(cp.0), number_int(cp.1)]),
-                struc("p".into(), vec![number_int(end.0), number_int(end.1)]),
+                struc("p2".into(), vec![number_int(cp.0), number_int(cp.1)]),
+                struc("p2".into(), vec![number_int(end.0), number_int(end.1)]),
             ],
         )
     }
@@ -3368,9 +3245,9 @@ mod tests {
         struc(
             "bezier_to".into(),
             vec![
-                struc("p".into(), vec![number_int(cp1.0), number_int(cp1.1)]),
-                struc("p".into(), vec![number_int(cp2.0), number_int(cp2.1)]),
-                struc("p".into(), vec![number_int(end.0), number_int(end.1)]),
+                struc("p2".into(), vec![number_int(cp1.0), number_int(cp1.1)]),
+                struc("p2".into(), vec![number_int(cp2.0), number_int(cp2.1)]),
+                struc("p2".into(), vec![number_int(end.0), number_int(end.1)]),
             ],
         )
     }
@@ -3567,7 +3444,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let resolved = execute_main_args("main(M) :- M = cube(10,10,10) |> translate(p(0,0,0), p(5,0,0)) |> center3d(p(0,0,0)).");
+        let resolved = execute_main_args("main(M) :- M = cube(10,10,10) |> translate(p3(0,0,0), p3(5,0,0)) |> center3d(p3(0,0,0)).");
         let exprs: Vec<Model3D> = resolved
             .iter()
             .filter_map(|t| Model3D::from_term(t).ok())
@@ -3585,7 +3462,7 @@ mod tests {
     #[test]
     fn test_center3d_with_control() {
         let mut resolved = execute_main_args(
-            "main(L) :- L = [control3d(p(X@0, Y@0, Z@0)), cube(10,10,10) |> center3d(p(X, Y, Z))].",
+            "main(L) :- L = [control3d(p3(X@0, Y@0, Z@0)), cube(10,10,10) |> center3d(p3(X, Y, Z))].",
         );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);
@@ -3611,7 +3488,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let resolved = execute_main_args("main(M) :- M = circle(5) |> center2d(p(10, 20)) |> rotateToXY |> linear_extrude(2).");
+        let resolved = execute_main_args("main(M) :- M = circle(5) |> center2d(p2(10, 20)) |> rotateToXY |> linear_extrude(2).");
         let exprs: Vec<Model3D> = resolved
             .iter()
             .filter_map(|t| Model3D::from_term(t).ok())
@@ -3631,7 +3508,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let resolved = execute_main_args("main(M) :- M = sketch(p(10,20), [line_to(p(20,20)), line_to(p(20,30)), line_to(p(10,30))]) |> center2d(p(0, 0)) |> rotateToYZ |> linear_extrude(2).");
+        let resolved = execute_main_args("main(M) :- M = sketch(p2(10,20), [line_to(p2(20,20)), line_to(p2(20,30)), line_to(p2(10,30))]) |> center2d(p2(0, 0)) |> rotateToYZ |> linear_extrude(2).");
         let exprs: Vec<Model3D> = resolved
             .iter()
             .filter_map(|t| Model3D::from_term(t).ok())
@@ -3656,7 +3533,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let resolved = execute_main_args("main(M) :- M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))]) |> center2d(p(0, 0)) |> rotateToXY |> linear_extrude(1).");
+        let resolved = execute_main_args("main(M) :- M = sketch(p2(0,0), [line_to(p2(10,0)), line_to(p2(10,4)), line_to(p2(0,4))]) |> center2d(p2(0, 0)) |> rotateToXY |> linear_extrude(1).");
         let exprs: Vec<Model3D> = resolved
             .iter()
             .filter_map(|t| Model3D::from_term(t).ok())
@@ -3674,7 +3551,7 @@ mod tests {
     #[test]
     fn test_bare_var_as_point_errors_center2d() {
         let resolved = execute_main_args(
-            "inner_part(CENTER, M) :- M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))]) |> center2d(CENTER).
+            "inner_part(CENTER, M) :- M = sketch(p2(0,0), [line_to(p2(10,0)), line_to(p2(10,4)), line_to(p2(0,4))]) |> center2d(CENTER).
              main(M) :- inner_part(CENTER, INNER), M = INNER |> rotateToXY |> linear_extrude(1).",
         );
         let err = resolved
@@ -3690,7 +3567,7 @@ mod tests {
         use crate::parse::{database, query as parse_query};
         use crate::term_rewrite::execute;
 
-        let resolved = execute_main_args("main(M) :- M = cube(10,10,10) |> translate(p(0,0,0), p(5,0,0)) |> center3d(P).");
+        let resolved = execute_main_args("main(M) :- M = cube(10,10,10) |> translate(p3(0,0,0), p3(5,0,0)) |> center3d(P).");
         let err = resolved
             .iter()
             .map(|t| Model3D::from_term(t))
@@ -3706,7 +3583,7 @@ mod tests {
             vec![number_int(1), number_int(1), number_int(1)],
         );
         let dst = struc(
-            "p".into(),
+            "p3".into(),
             vec![number_int(7), number_int(0), number_int(0)],
         );
         let t = struc("translate".into(), vec![cube_t, var("SRC".into()), dst]);
@@ -3719,8 +3596,8 @@ mod tests {
     #[test]
     fn test_var_bound_to_point_works() {
         let resolved = execute_main_args(
-            "main(M) :- CENTER = p(10, 20),
-                        M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,4)), line_to(p(0,4))])
+            "main(M) :- CENTER = p2(10, 20),
+                        M = sketch(p2(0,0), [line_to(p2(10,0)), line_to(p2(10,4)), line_to(p2(0,4))])
                             |> center2d(CENTER) |> rotateToXY |> linear_extrude(1).",
         );
         let exprs: Vec<Model3D> = resolved
@@ -3730,7 +3607,7 @@ mod tests {
             .unwrap();
         assert_eq!(exprs.len(), 1);
         let node = build_evaluated_node(&exprs[0], &[]).unwrap();
-        // center2d(p(10, 20)) で中心が (10, 20) に移動 → 5 × 2 の矩形が中心 (10, 20)
+        // center2d(p2(10, 20)) で中心が (10, 20) に移動 → 5 × 2 の矩形が中心 (10, 20)
         assert_close!(node.aabb_min[0], 5.0);
         assert_close!(node.aabb_max[0], 15.0);
         assert_close!(node.aabb_min[1], 18.0);
@@ -3739,17 +3616,17 @@ mod tests {
 
     #[test]
     fn test_bare_var_inside_p_errors() {
-        // p(X, 0, 0) の X が bare Var: 値が決まらないのでエラー。
+        // p3(X, 0, 0) の X が bare Var: 値が決まらないのでエラー。
         let cube_t = struc(
             "cube".into(),
             vec![number_int(1), number_int(1), number_int(1)],
         );
         let src = struc(
-            "p".into(),
+            "p3".into(),
             vec![number_int(0), number_int(0), number_int(0)],
         );
         let dst = struc(
-            "p".into(),
+            "p3".into(),
             vec![var("X".into()), number_int(5), number_int(0)],
         );
         let t = struc("translate".into(), vec![cube_t, src, dst]);
@@ -3813,7 +3690,7 @@ mod tests {
     fn test_rotate_to_yz_basic() {
         // 10x10の正方形をrotateToYZしてZ方向(=push後の+X)に2押し出し
         let exprs = run_main(
-            "main(M) :- M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToYZ |> linear_extrude(2).",
+            "main(M) :- M = sketch(p2(0,0), [line_to(p2(10,0)), line_to(p2(10,10)), line_to(p2(0,10))]) |> rotateToYZ |> linear_extrude(2).",
         )
         .unwrap();
         assert_eq!(exprs.len(), 1);
@@ -3830,7 +3707,7 @@ mod tests {
     fn test_rotate_to_xz_basic() {
         // 10x10の正方形をrotateToXZ → 押し出しは+Y方向に2
         let exprs = run_main(
-            "main(M) :- M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToXZ |> linear_extrude(2).",
+            "main(M) :- M = sketch(p2(0,0), [line_to(p2(10,0)), line_to(p2(10,10)), line_to(p2(0,10))]) |> rotateToXZ |> linear_extrude(2).",
         )
         .unwrap();
         assert_eq!(exprs.len(), 1);
@@ -3888,7 +3765,7 @@ mod tests {
     fn test_rotate_to_xz_sketch_orientation() {
         // sketch 版でも同様に法線が外向きであること (回帰防止)。
         let exprs = run_main(
-            "main(M) :- M = sketch(p(0,0), [line_to(p(10,0)), line_to(p(10,10)), line_to(p(0,10))]) |> rotateToXZ |> linear_extrude(2).",
+            "main(M) :- M = sketch(p2(0,0), [line_to(p2(10,0)), line_to(p2(10,10)), line_to(p2(0,10))]) |> rotateToXZ |> linear_extrude(2).",
         )
         .unwrap();
         let node = build_evaluated_node(&exprs[0], &[]).unwrap();
@@ -3900,7 +3777,7 @@ mod tests {
     fn test_rotate_to_xy_places_on_xy() {
         // rotateToXY を明示すると XY 平面の押し出し (押し出し方向は +Z)
         let exprs = run_main(
-            "main(M) :- M = sketch(p(0,0), [line_to(p(4,0)), line_to(p(4,3)), line_to(p(0,3))]) |> rotateToXY |> linear_extrude(2).",
+            "main(M) :- M = sketch(p2(0,0), [line_to(p2(4,0)), line_to(p2(4,3)), line_to(p2(0,3))]) |> rotateToXY |> linear_extrude(2).",
         )
         .unwrap();
         let node = build_evaluated_node(&exprs[0], &[]).unwrap();
@@ -3915,7 +3792,7 @@ mod tests {
     #[test]
     fn test_linear_extrude_requires_plane() {
         let resolved = execute_main_args(
-            "main(M) :- M = sketch(p(0,0), [line_to(p(4,0)), line_to(p(4,3)), line_to(p(0,3))]) |> linear_extrude(2).",
+            "main(M) :- M = sketch(p2(0,0), [line_to(p2(4,0)), line_to(p2(4,3)), line_to(p2(0,3))]) |> linear_extrude(2).",
         );
         let err = resolved
             .iter()
@@ -3933,7 +3810,7 @@ mod tests {
         // (a - b) |> rotateToYZ |> linear_extrude
         // 今回の battery_case のバグ再現ケースが正しく動くこと
         let exprs = run_main(
-            "main(M) :- M = (sketch(p(0,0), [line_to(p(20,0)), line_to(p(20,58)), line_to(p(0,58))]) - sketch(p(2.7,4.1), [line_to(p(17.3,4.1)), line_to(p(17.3,53.9)), line_to(p(2.7,53.9))])) |> rotateToYZ |> linear_extrude(20).",
+            "main(M) :- M = (sketch(p2(0,0), [line_to(p2(20,0)), line_to(p2(20,58)), line_to(p2(0,58))]) - sketch(p2(2.7,4.1), [line_to(p2(17.3,4.1)), line_to(p2(17.3,53.9)), line_to(p2(2.7,53.9))])) |> rotateToYZ |> linear_extrude(20).",
         )
         .unwrap();
         assert_eq!(exprs.len(), 1);
@@ -3982,19 +3859,19 @@ mod tests {
     #[test]
     fn test_boolean_after_rotate_errors() {
         expect_sealed(
-            "main(M) :- M = (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> linear_extrude(1).",
+            "main(M) :- M = (sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> rotateToYZ) + sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> linear_extrude(1).",
             "+",
         );
         expect_sealed(
-            "main(M) :- M = sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) |> linear_extrude(1).",
+            "main(M) :- M = sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) + (sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> rotateToYZ) |> linear_extrude(1).",
             "+",
         );
         expect_sealed(
-            "main(M) :- M = (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) |> linear_extrude(1).",
+            "main(M) :- M = (sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> rotateToYZ) + (sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> rotateToYZ) |> linear_extrude(1).",
             "+",
         );
         expect_sealed(
-            "main(M) :- M = (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) + (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToXZ) |> linear_extrude(1).",
+            "main(M) :- M = (sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> rotateToYZ) + (sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> rotateToXZ) |> linear_extrude(1).",
             "+",
         );
     }
@@ -4002,7 +3879,7 @@ mod tests {
     #[test]
     fn test_difference_after_rotate_errors() {
         expect_sealed(
-            "main(M) :- M = (sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ) - sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> linear_extrude(1).",
+            "main(M) :- M = (sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> rotateToYZ) - sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> linear_extrude(1).",
             "-",
         );
     }
@@ -4010,7 +3887,7 @@ mod tests {
     #[test]
     fn test_center2d_after_rotate_errors() {
         expect_sealed(
-            "main(M) :- M = sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> center2d(p(0, 0)) |> linear_extrude(1).",
+            "main(M) :- M = sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> rotateToYZ |> center2d(p2(0, 0)) |> linear_extrude(1).",
             "center2d",
         );
     }
@@ -4023,9 +3900,9 @@ mod tests {
         // rotateTo* が is_builtin_functor として正しく登録され、term_rewrite で
         // 既定ファンクタとして扱われることをこの統合テストで確認する。
         let src = "\
-honi(M) :- M = sketch(p(0,0), [line_to(p(14.6,0)), line_to(p(14.6,49.8)), line_to(p(0,49.8))]) |> center2d(p(0,0)).
+honi(M) :- M = sketch(p2(0,0), [line_to(p2(14.6,0)), line_to(p2(14.6,49.8)), line_to(p2(0,49.8))]) |> center2d(p2(0,0)).
 battery_box(M) :- honi(H),
-  M = (sketch(p(0,0), [line_to(p(20,0)), line_to(p(20,58)), line_to(p(0,58))]) |> center2d(p(0,0)))
+  M = (sketch(p2(0,0), [line_to(p2(20,0)), line_to(p2(20,58)), line_to(p2(0,58))]) |> center2d(p2(0,0)))
       - H |> rotateToYZ |> linear_extrude(20).
 main(M) :- battery_box(M).
 ";
@@ -4049,15 +3926,15 @@ main(M) :- battery_box(M).
     #[test]
     fn test_double_rotate_errors() {
         expect_sealed(
-            "main(M) :- M = sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToXZ |> linear_extrude(1).",
+            "main(M) :- M = sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> rotateToYZ |> rotateToXZ |> linear_extrude(1).",
             "rotateToXZ",
         );
         expect_sealed(
-            "main(M) :- M = sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToYZ |> linear_extrude(1).",
+            "main(M) :- M = sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> rotateToYZ |> rotateToYZ |> linear_extrude(1).",
             "rotateToYZ",
         );
         expect_sealed(
-            "main(M) :- M = sketch(p(0,0), [line_to(p(1,0)), line_to(p(1,1)), line_to(p(0,1))]) |> rotateToYZ |> rotateToXY |> linear_extrude(1).",
+            "main(M) :- M = sketch(p2(0,0), [line_to(p2(1,0)), line_to(p2(1,1)), line_to(p2(0,1))]) |> rotateToYZ |> rotateToXY |> linear_extrude(1).",
             "rotateToXY",
         );
     }

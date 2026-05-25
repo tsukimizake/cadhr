@@ -31,13 +31,13 @@
 % 歯車本体はピッチ円半径の円柱で代用する (歯形は今のところ非表示)。
 % 隣接歯車同士は規格通りに配置されればちょうど接触する。
 %
-% translate3d(Shape, SrcPoint, DstPoint): 歯車中心 (ローカル原点 = p3d(0,0,0)) を
+% translate(Shape, SrcPoint, DstPoint): 歯車中心 (ローカル原点 = p3(0,0,0)) を
 % ワールド上の (X, Y, 0) に運ぶ。
 render_part(gp(_, M, Z, X, Y, T, Th), MODEL) :-
     R = M*Z/2,
     MODEL = cylinder(R, Th)
-        |> rotate3d(0, 0, T)
-        |> translate3d(p3d(0, 0, 0), p3d(X, Y, 0)).
+        |> rotate(0, 0, T)
+        |> translate(p3(0, 0, 0), p3(X, Y, 0)).
 
 % ─────── 噛み合い制約 ───────
 % 隣接する 2 つの平歯車の噛み合いを表現する。

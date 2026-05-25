@@ -2593,15 +2593,14 @@ mod tests {
 
     #[test]
     fn test_record_literal_desugars_to_positional_struct() {
-        // p { x: 1, y: 2 } should desugar to p(1, 2)
+        // pt { x: 1, y: 2 } should desugar to pt(1, 2)
         let results = run_with_records(
-            "#record p { x, y }. main(R) :- R = p { x: 1, y: 2 }.",
+            "#record pt { x, y }. main(R) :- R = pt { x: 1, y: 2 }.",
             "main(R).",
         );
-        // main(p(1, 2)) のような形になっていれば成功
         assert!(
-            results.iter().any(|s| s.contains("p(1, 2)")),
-            "expected p(1, 2) in results, got: {:?}",
+            results.iter().any(|s| s.contains("pt(1, 2)")),
+            "expected pt(1, 2) in results, got: {:?}",
             results
         );
     }
@@ -2609,12 +2608,12 @@ mod tests {
     #[test]
     fn test_record_literal_uses_default_for_missing_field() {
         let results = run_with_records(
-            "#record p { x = 0, y }. main(R) :- R = p { y: 5 }.",
+            "#record pt { x = 0, y }. main(R) :- R = pt { y: 5 }.",
             "main(R).",
         );
         assert!(
-            results.iter().any(|s| s.contains("p(0, 5)")),
-            "expected p(0, 5) in results, got: {:?}",
+            results.iter().any(|s| s.contains("pt(0, 5)")),
+            "expected pt(0, 5) in results, got: {:?}",
             results
         );
     }
@@ -2623,12 +2622,12 @@ mod tests {
     fn test_record_literal_field_order_independent() {
         // field を逆順に書いても decl 順 (x, y) に並ぶ
         let results = run_with_records(
-            "#record p { x, y }. main(R) :- R = p { y: 2, x: 1 }.",
+            "#record pt { x, y }. main(R) :- R = pt { y: 2, x: 1 }.",
             "main(R).",
         );
         assert!(
-            results.iter().any(|s| s.contains("p(1, 2)")),
-            "expected p(1, 2) in results, got: {:?}",
+            results.iter().any(|s| s.contains("pt(1, 2)")),
+            "expected pt(1, 2) in results, got: {:?}",
             results
         );
     }
@@ -2768,13 +2767,13 @@ mod tests {
     fn default_var_propagates_within_rule_body() {
         // W@5 / X@25 はそれぞれ W = 5 / X = 25 として lowering され、出力上は数値に置換される。
         let resolved = run_success(
-            "cut(W, MODEL) :- MODEL = cube(W, 50, 260). main(MODEL) :- cut(W@5, CUT), MODEL = cube(X@25, 50, 300) - (CUT |> translate(p(0, 0, 0), p(X / 2 - W, 0, 0))).",
+            "cut(W, MODEL) :- MODEL = cube(W, 50, 260). main(MODEL) :- cut(W@5, CUT), MODEL = cube(X@25, 50, 300) - (CUT |> translate(p3(0, 0, 0), p3(X / 2 - W, 0, 0))).",
             "main(M).",
         );
         assert_eq!(
             resolved,
             vec![
-                "main((cube(25, 50, 300) - translate(cube(5, 50, 260), p(0, 0, 0), p(7.5, 0, 0))))"
+                "main((cube(25, 50, 300) - translate(cube(5, 50, 260), p3(0, 0, 0), p3(7.5, 0, 0))))"
             ]
         );
     }
@@ -3086,12 +3085,12 @@ mod tests {
     #[test]
     fn arith_with_pipe_and_rule() {
         let resolved = run_success(
-            "ob(M) :- M = cube(1,1,1) |> translate(p(0,0,0), p(10,0,0)). main(M) :- ob(O), M = O + cube(2,2,2).",
+            "ob(M) :- M = cube(1,1,1) |> translate(p3(0,0,0), p3(10,0,0)). main(M) :- ob(O), M = O + cube(2,2,2).",
             "main(M).",
         );
         assert_eq!(
             resolved,
-            vec!["main((translate(cube(1, 1, 1), p(0, 0, 0), p(10, 0, 0)) + cube(2, 2, 2)))"]
+            vec!["main((translate(cube(1, 1, 1), p3(0, 0, 0), p3(10, 0, 0)) + cube(2, 2, 2)))"]
         );
     }
 
@@ -3138,13 +3137,13 @@ mod tests {
     #[test]
     fn body_eq_constraint_with_rule() {
         let resolved = run_success(
-            "cut(SLIT, W, H, MODEL) :- X=(W-SLIT)/2, MODEL = sketch(p(X, 0), [line_to(p(SLIT+W, 0)), line_to(p(SLIT+W, H-20)), line_to(p(X, H-20))]).",
+            "cut(SLIT, W, H, MODEL) :- X=(W-SLIT)/2, MODEL = sketch(p2(X, 0), [line_to(p2(SLIT+W, 0)), line_to(p2(SLIT+W, H-20)), line_to(p2(X, H-20))]).",
             "cut(18, 40, 120, M).",
         );
         assert_eq!(
             resolved,
             vec![
-                "cut(18, 40, 120, sketch(p(11, 0), [line_to(p(58, 0)), line_to(p(58, 100)), line_to(p(11, 100))]))"
+                "cut(18, 40, 120, sketch(p2(11, 0), [line_to(p2(58, 0)), line_to(p2(58, 100)), line_to(p2(11, 100))]))"
             ]
         );
     }
@@ -3300,9 +3299,9 @@ main :- battery_box.\n\
 battery_box :- ((cube(X@20, Y@18, OUTLEN@58)\n\
                 - wire_hole(X/2, WH_Y1, 0)\n\
                 - wire_hole(X/2, WH_Y2, 0)\n\
-                ) |> translate(p(0, 0, 0), p(0-X/2, 0-Y/2, 0))),\n\
+                ) |> translate(p3(0, 0, 0), p3(0-X/2, 0-Y/2, 0))),\n\
                 WH_Y1 = Y/4, WH_Y2 = Y*3/4.\n\
-wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(p(0, 0, 0), p(X, Y, H)).\n\
+wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(p3(0, 0, 0), p3(X, Y, H)).\n\
 ";
         let mut db = database(db_src).expect("failed to parse db");
         let (_, query_terms) = query("main.").expect("failed to parse query");
@@ -3508,7 +3507,7 @@ test(B, C) :- constrain([item(a, 3), item(b, B), item(c, C)]).\n";
 
     /// `@N` 付き Var が InfixExpr の内部に埋まっているケースでも、`X = N` の
     /// シンタックスシュガーとして展開されて算術式が評価できる。
-    /// (`line_to(p(HOOK_L - HOOK_LEN@4, ...))` のような実用パターン)
+    /// (`line_to(p2(HOOK_L - HOOK_LEN@4, ...))` のような実用パターン)
     #[test]
     fn annotation_inside_infix_expr_resolves() {
         let resolved = run_success(
@@ -3522,12 +3521,12 @@ test(B, C) :- constrain([item(a, 3), item(b, B), item(c, C)]).\n";
     #[test]
     fn annotation_inside_deeply_nested_struct() {
         let resolved = run_success(
-            "test(MODEL) :- MODEL = sketch(p(0, 0), [line_to(p(X@10, Y@20)), line_to(p(X - W@3, Y))]).",
+            "test(MODEL) :- MODEL = sketch(p2(0, 0), [line_to(p2(X@10, Y@20)), line_to(p2(X - W@3, Y))]).",
             "test(M).",
         );
         assert_eq!(
             resolved,
-            vec!["test(sketch(p(0, 0), [line_to(p(10, 20)), line_to(p(7, 20))]))"]
+            vec!["test(sketch(p2(0, 0), [line_to(p2(10, 20)), line_to(p2(7, 20))]))"]
         );
     }
 
@@ -3581,18 +3580,18 @@ test(B, C) :- constrain([item(a, 3), item(b, B), item(c, C)]).\n";
         let resolved = run_success(
             "xz(X_OUTER, Z_OUTER, MODEL) :- \
                HOOK_L = 13, HOOK_W = 7, HOOK_R = HOOK_L + HOOK_W, \
-               MODEL = sketch(p(2, 0), [\
-                 line_to(p(X_OUTER, 0)), \
-                 line_to(p(X_OUTER, TOP_Z@7)), \
-                 line_to(p(HOOK_R, TOP_Z)), \
-                 line_to(p(HOOK_R, Z_OUTER)), \
-                 line_to(p(HOOK_L, Z_OUTER)), \
-                 line_to(p(HOOK_L - HOOK_LEN@4, Z_OUTER)), \
-                 line_to(p(HOOK_L - HOOK_LEN, Z_OUTER - HOOK_WIDTH@3)), \
-                 line_to(p(HOOK_L, Z_OUTER - HOOK_WIDTH)), \
-                 line_to(p(HOOK_L, TOP_Z)), \
-                 line_to(p(LOW_W@12, LOW_H@2)), \
-                 line_to(p(2, LOW_H))\
+               MODEL = sketch(p2(2, 0), [\
+                 line_to(p2(X_OUTER, 0)), \
+                 line_to(p2(X_OUTER, TOP_Z@7)), \
+                 line_to(p2(HOOK_R, TOP_Z)), \
+                 line_to(p2(HOOK_R, Z_OUTER)), \
+                 line_to(p2(HOOK_L, Z_OUTER)), \
+                 line_to(p2(HOOK_L - HOOK_LEN@4, Z_OUTER)), \
+                 line_to(p2(HOOK_L - HOOK_LEN, Z_OUTER - HOOK_WIDTH@3)), \
+                 line_to(p2(HOOK_L, Z_OUTER - HOOK_WIDTH)), \
+                 line_to(p2(HOOK_L, TOP_Z)), \
+                 line_to(p2(LOW_W@12, LOW_H@2)), \
+                 line_to(p2(2, LOW_H))\
                ]).",
             "xz(80, 15, M).",
         );
@@ -3600,18 +3599,18 @@ test(B, C) :- constrain([item(a, 3), item(b, B), item(c, C)]).\n";
         assert_eq!(
             resolved,
             vec![
-                "xz(80, 15, sketch(p(2, 0), [\
-                    line_to(p(80, 0)), \
-                    line_to(p(80, 7)), \
-                    line_to(p(20, 7)), \
-                    line_to(p(20, 15)), \
-                    line_to(p(13, 15)), \
-                    line_to(p(9, 15)), \
-                    line_to(p(9, 12)), \
-                    line_to(p(13, 12)), \
-                    line_to(p(13, 7)), \
-                    line_to(p(12, 2)), \
-                    line_to(p(2, 2))\
+                "xz(80, 15, sketch(p2(2, 0), [\
+                    line_to(p2(80, 0)), \
+                    line_to(p2(80, 7)), \
+                    line_to(p2(20, 7)), \
+                    line_to(p2(20, 15)), \
+                    line_to(p2(13, 15)), \
+                    line_to(p2(9, 15)), \
+                    line_to(p2(9, 12)), \
+                    line_to(p2(13, 12)), \
+                    line_to(p2(13, 7)), \
+                    line_to(p2(12, 2)), \
+                    line_to(p2(2, 2))\
                   ]))"
             ]
         );

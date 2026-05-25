@@ -183,7 +183,7 @@ pub fn registry() -> BuiltinRegistry {
             return_ty: s3(),
             usage: "translate3d(Shape: Shape3D, Src: Point3D, Dst: Point3D) -> Shape3D",
             doc: "Move Shape so Src coincides with Dst.",
-            snippet: "translate3d($1, p3d($2), p3d($3))",
+            snippet: "translate3d($1, p3($2), p3($3))",
         })
         .add(Builtin {
             name: "scale3d",
@@ -207,7 +207,7 @@ pub fn registry() -> BuiltinRegistry {
             return_ty: s3(),
             usage: "center3d(Shape: Shape3D, Target: Point3D) -> Shape3D",
             doc: "Translate Shape so its bounding-box center sits at Target.",
-            snippet: "center3d($1, p3d($2))",
+            snippet: "center3d($1, p3($2))",
         })
         // ----- 2D primitives -----
         .add(Builtin {
@@ -249,24 +249,24 @@ pub fn registry() -> BuiltinRegistry {
             return_ty: s2(),
             usage: "center2d(Profile: Shape2D, Target: Point2D) -> Shape2D",
             doc: "Translate Profile so its bounding-box center sits at Target.",
-            snippet: "center2d($1, p2d($2))",
+            snippet: "center2d($1, p2($2))",
         })
         // ----- Points -----
         .add(Builtin {
-            name: "p2d",
+            name: "p2",
             params: vec![n(), n()],
             return_ty: p2(),
-            usage: "p2d(X, Y) -> Point2D",
+            usage: "p2(X, Y) -> Point2D",
             doc: "2D point literal.",
-            snippet: "p2d($1, $2)",
+            snippet: "p2($1, $2)",
         })
         .add(Builtin {
-            name: "p3d",
+            name: "p3",
             params: vec![n(), n(), n()],
             return_ty: p3(),
-            usage: "p3d(X, Y, Z) -> Point3D",
+            usage: "p3(X, Y, Z) -> Point3D",
             doc: "3D point literal.",
-            snippet: "p3d($1, $2, $3)",
+            snippet: "p3($1, $2, $3)",
         })
         // ----- Plane placement -----
         .add(Builtin {
