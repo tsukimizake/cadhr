@@ -177,29 +177,30 @@ pub fn registry() -> BuiltinRegistry {
             snippet: "hull3d($1, $2)",
         })
         // ----- 3D transforms (point-based translate per §1.1) -----
+        // 3D-only なので dim suffix は不要 (overload 衝突なし)。
         .add(Builtin {
-            name: "translate3d",
+            name: "translate",
             params: vec![s3(), p3(), p3()],
             return_ty: s3(),
-            usage: "translate3d(Shape: Shape3D, Src: Point3D, Dst: Point3D) -> Shape3D",
+            usage: "translate(Shape: Shape3D, Src: Point3D, Dst: Point3D) -> Shape3D",
             doc: "Move Shape so Src coincides with Dst.",
-            snippet: "translate3d($1, p3($2), p3($3))",
+            snippet: "translate($1, p3($2), p3($3))",
         })
         .add(Builtin {
-            name: "scale3d",
+            name: "scale",
             params: vec![s3(), n(), n(), n()],
             return_ty: s3(),
-            usage: "scale3d(Shape: Shape3D, X: Number, Y: Number, Z: Number) -> Shape3D",
+            usage: "scale(Shape: Shape3D, X: Number, Y: Number, Z: Number) -> Shape3D",
             doc: "Scale Shape per axis.",
-            snippet: "scale3d($1, $2, $3, $4)",
+            snippet: "scale($1, $2, $3, $4)",
         })
         .add(Builtin {
-            name: "rotate3d",
+            name: "rotate",
             params: vec![s3(), n(), n(), n()],
             return_ty: s3(),
-            usage: "rotate3d(Shape: Shape3D, RX: Number, RY: Number, RZ: Number) -> Shape3D",
+            usage: "rotate(Shape: Shape3D, RX: Number, RY: Number, RZ: Number) -> Shape3D",
             doc: "Rotate Shape by Euler angles (degrees).",
-            snippet: "rotate3d($1, $2, $3, $4)",
+            snippet: "rotate($1, $2, $3, $4)",
         })
         .add(Builtin {
             name: "center3d",
