@@ -2338,6 +2338,121 @@ fn strip_default_annotations(term: &mut Term) {
     }
 }
 
+/// 用途: desugar 中の構造的エラー。呼出元で `RewriteError` にラップする。
+#[derive(Debug, Clone)]
+struct DesugarError {
+    message: String,
+}
+
+impl DesugarError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// `Term::Record { name, fields }` をその record decl の宣言順に並べ替え、
+/// `Term::Struct { functor: name, args: positional_values, span }` に変換する。
+/// Term<()> 専用 (default 値も使える)。scope 付与後の用途は将来必要になれば追加する。
+fn desugar_record_literal_unscoped(
+    name: &str,
+    fields: &[(String, Term)],
+    span: Option<crate::parse::SrcSpan>,
+    record_decls: &HashMap<String, Vec<RecordField>>,
+) -> Result<Term, DesugarError> {
+    let decl = record_decls.get(name).ok_or_else(|| {
+        DesugarError::new(format!("record literal '{}' but no #record decl found", name))
+    })?;
+    for (fname, _) in fields {
+        if !decl.iter().any(|f| f.name == *fname) {
+            return Err(DesugarError::new(format!(
+                "field '{}' is not declared on record '{}'",
+                fname, name
+            )));
+        }
+    }
+    let mut args = Vec::with_capacity(decl.len());
+    for declf in decl {
+        if let Some((_, v)) = fields.iter().find(|(n, _)| n == &declf.name) {
+            args.push(v.clone());
+        } else if let Some(default) = &declf.default {
+            args.push(default.clone());
+        } else {
+            return Err(DesugarError::new(format!(
+                "record '{}' is missing required field '{}' (no default)",
+                name, declf.name
+            )));
+        }
+    }
+    Ok(Term::Struct {
+        functor: name.to_string(),
+        args,
+        span,
+    })
+}
+
+/// AST 上を再帰的に歩いて `Term::Record` を `Term::Struct` (positional) に desugar する。
+/// `Term::FieldAccess` は現状 runtime 表現を持たないので、検出したらエラー報告する
+/// (パーサーは受け付けるが、native 評価未実装の旨を明示)。
+fn desugar_record_terms_in(
+    term: &mut Term,
+    record_decls: &HashMap<String, Vec<RecordField>>,
+) -> Result<(), DesugarError> {
+    match term {
+        Term::Record { name, fields, span } => {
+            for (_, v) in fields.iter_mut() {
+                desugar_record_terms_in(v, record_decls)?;
+            }
+            *term = desugar_record_literal_unscoped(name, fields, *span, record_decls)?;
+        }
+        Term::FieldAccess { record, field, .. } => {
+            desugar_record_terms_in(record, record_decls)?;
+            return Err(DesugarError::new(format!(
+                "field access .{}: runtime evaluation not yet implemented \
+                 (Task #7 残: native FieldAccess の意味を未確定)",
+                field
+            )));
+        }
+        Term::Struct { args, .. } => {
+            for a in args.iter_mut() {
+                desugar_record_terms_in(a, record_decls)?;
+            }
+        }
+        Term::List { items, tail } => {
+            for i in items.iter_mut() {
+                desugar_record_terms_in(i, record_decls)?;
+            }
+            if let Some(t) = tail.as_mut() {
+                desugar_record_terms_in(t, record_decls)?;
+            }
+        }
+        Term::InfixExpr { left, right, .. } => {
+            desugar_record_terms_in(left, record_decls)?;
+            desugar_record_terms_in(right, record_decls)?;
+        }
+        Term::Eq { left, right } => {
+            desugar_record_terms_in(left, record_decls)?;
+            desugar_record_terms_in(right, record_decls)?;
+        }
+        Term::Var { .. } | Term::Number { .. } | Term::StringLit { .. } => {}
+    }
+    Ok(())
+}
+
+/// `desugar_record_terms_in` の DesugarError を実行時 RewriteError にラップする。
+/// goal にはダミーの `Term::Struct { functor: "desugar_error", args: [], span: None }` を入れる。
+fn wrap_desugar_err(e: DesugarError) -> RewriteError {
+    RewriteError {
+        message: e.message,
+        goal: ScopedTerm::Struct {
+            functor: "desugar_error".to_string(),
+            args: vec![],
+            span: None,
+        },
+    }
+}
+
 pub fn execute(
     db: &mut [Clause],
     mut query: Vec<Term>,
@@ -2360,6 +2475,26 @@ pub fn execute(
 
     // record decl テーブルを db から抽出。make_NAME builtin の引数解決に使う。
     let record_decls = extract_record_decls(&db_with_builtins);
+
+    // 新仕様 `Term::Record { ... }` を decl 順の `Term::Struct` に desugar。
+    // これにより既存の unify / Struct ベースの dispatch が変わらず動く。
+    for clause in db_with_builtins.iter_mut() {
+        match clause {
+            Clause::Rule { head, body, .. } => {
+                desugar_record_terms_in(head, &record_decls).map_err(wrap_desugar_err)?;
+                for t in body.iter_mut() {
+                    desugar_record_terms_in(t, &record_decls).map_err(wrap_desugar_err)?;
+                }
+            }
+            Clause::Fact { head, .. } => {
+                desugar_record_terms_in(head, &record_decls).map_err(wrap_desugar_err)?;
+            }
+            Clause::Use { .. } | Clause::RecordDecl { .. } => {}
+        }
+    }
+    for t in query.iter_mut() {
+        desugar_record_terms_in(t, &record_decls).map_err(wrap_desugar_err)?;
+    }
 
     let scoped_query: Vec<ScopedTerm> = query
         .into_iter()
@@ -2452,6 +2587,50 @@ mod tests {
         let q = query(query_src).expect("failed to parse query").1;
         let (resolved, _env) = execute(&mut db, q).expect("Expected success");
         resolved.iter().map(|t| format!("{:?}", t)).collect()
+    }
+
+    // ===== record literal desugar =====
+
+    #[test]
+    fn test_record_literal_desugars_to_positional_struct() {
+        // p { x: 1, y: 2 } should desugar to p(1, 2)
+        let results = run_with_records(
+            "#record p { x, y }. main(R) :- R = p { x: 1, y: 2 }.",
+            "main(R).",
+        );
+        // main(p(1, 2)) のような形になっていれば成功
+        assert!(
+            results.iter().any(|s| s.contains("p(1, 2)")),
+            "expected p(1, 2) in results, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn test_record_literal_uses_default_for_missing_field() {
+        let results = run_with_records(
+            "#record p { x = 0, y }. main(R) :- R = p { y: 5 }.",
+            "main(R).",
+        );
+        assert!(
+            results.iter().any(|s| s.contains("p(0, 5)")),
+            "expected p(0, 5) in results, got: {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn test_record_literal_field_order_independent() {
+        // field を逆順に書いても decl 順 (x, y) に並ぶ
+        let results = run_with_records(
+            "#record p { x, y }. main(R) :- R = p { y: 2, x: 1 }.",
+            "main(R).",
+        );
+        assert!(
+            results.iter().any(|s| s.contains("p(1, 2)")),
+            "expected p(1, 2) in results, got: {:?}",
+            results
+        );
     }
 
     // ===== unify tests =====
