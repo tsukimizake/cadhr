@@ -388,6 +388,31 @@ pub fn run_collision_job(params: CollisionJobParams) -> CollisionJobResult {
             )
             .map_err(|e| (format!("Module error: {}", e), None))?;
 
+            // run_mesh_job と同じ best-effort 型検査 (CADHR_TYPECHECK=strict で fatal)。
+            let typecheck_diags = typecheck::infer_database(&db, &builtins::registry());
+            if !typecheck_diags.is_empty() {
+                let strict = std::env::var("CADHR_TYPECHECK").as_deref() == Ok("strict");
+                for d in &typecheck_diags {
+                    debug_log!(
+                        "CollisionJob TypeError in clause #{} ({}): {}",
+                        d.clause_index,
+                        d.functor.as_deref().unwrap_or("<anon>"),
+                        d.error
+                    );
+                }
+                if strict {
+                    let first = &typecheck_diags[0];
+                    return Err((
+                        format!(
+                            "Type error in {}: {}",
+                            first.functor.as_deref().unwrap_or("<anon>"),
+                            first.error
+                        ),
+                        None,
+                    ));
+                }
+            }
+
             let (resolved_raw, _env) = execute(&mut db, query_terms).map_err(|e| {
                 format_error("Rewrite error", &e.to_string(), e.span(), &file_registry)
             })?;
