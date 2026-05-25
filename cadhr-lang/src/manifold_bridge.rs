@@ -159,19 +159,43 @@ pub enum Plane3D {
 
 const DEFAULT_SEGMENTS: u32 = 32;
 
+/// Runtime dispatch が認識する functor 名 (LSP の `is_builtin_functor` も参照)。
+/// 旧名 (`union`, `translate` 等) と新仕様の dimension-suffixed 名 (`union3d`,
+/// `translate3d` 等) を両方並べる。dispatch は `FunctorTag` に集約されるため、
+/// 同名異 arity の overload は同じ tag を共有する。
+///
+/// 移行期間中は両方が認識されるが、推奨は新名。タスク完了後 (全 user コードが
+/// 新名を使うようになったら) 旧名はこのテーブルから削除し FunctorTag からも除く。
 pub const BUILTIN_FUNCTORS: &[(&str, &[usize])] = &[
     ("cube", &[3]),
     ("sphere", &[1, 2]),
     ("cylinder", &[2, 3]),
     ("tetrahedron", &[0]),
+    // CSG (legacy non-suffixed)
     ("union", &[2]),
     ("difference", &[2]),
     ("intersection", &[2]),
     ("hull", &[2]),
+    // CSG (LANG_SPEC §1.1: dimension-suffixed)
+    ("union3d", &[2]),
+    ("difference3d", &[2]),
+    ("intersection3d", &[2]),
+    ("hull3d", &[2]),
+    ("union2d", &[2]),
+    ("difference2d", &[2]),
+    ("intersection2d", &[2]),
+    // Transforms (legacy non-suffixed)
     ("translate", &[3]),
     ("scale", &[4]),
     ("rotate", &[4]),
+    // Transforms (new spec)
+    ("translate3d", &[3]),
+    ("scale3d", &[4]),
+    ("rotate3d", &[4]),
+    // Points
     ("p", &[2, 3]),
+    ("p2d", &[2]),
+    ("p3d", &[3]),
     ("sketch", &[2]),
     ("rotateToXY", &[1]),
     ("rotateToYZ", &[1]),
@@ -239,14 +263,17 @@ impl FromStr for FunctorTag {
             "sphere" => Ok(FunctorTag::Sphere),
             "cylinder" => Ok(FunctorTag::Cylinder),
             "tetrahedron" => Ok(FunctorTag::Tetrahedron),
-            "union" => Ok(FunctorTag::Union),
-            "difference" => Ok(FunctorTag::Difference),
-            "intersection" => Ok(FunctorTag::Intersection),
-            "hull" => Ok(FunctorTag::Hull),
-            "translate" => Ok(FunctorTag::Translate),
-            "scale" => Ok(FunctorTag::Scale),
-            "rotate" => Ok(FunctorTag::Rotate),
-            "p" => Ok(FunctorTag::Point),
+            // CSG: legacy + dimension-suffixed alias (同じ tag に解決)
+            "union" | "union3d" | "union2d" => Ok(FunctorTag::Union),
+            "difference" | "difference3d" | "difference2d" => Ok(FunctorTag::Difference),
+            "intersection" | "intersection3d" | "intersection2d" => Ok(FunctorTag::Intersection),
+            "hull" | "hull3d" => Ok(FunctorTag::Hull),
+            // Transforms
+            "translate" | "translate3d" => Ok(FunctorTag::Translate),
+            "scale" | "scale3d" => Ok(FunctorTag::Scale),
+            "rotate" | "rotate3d" => Ok(FunctorTag::Rotate),
+            // Points: arity が型を兼ねるので legacy `p/2,3` も新 `p2d/p3d` も同じ tag
+            "p" | "p2d" | "p3d" => Ok(FunctorTag::Point),
             "sketch" => Ok(FunctorTag::Sketch),
             "rotateToXY" => Ok(FunctorTag::RotateToXY),
             "rotateToYZ" => Ok(FunctorTag::RotateToYZ),
@@ -502,7 +529,8 @@ fn point_2d_args<S>(term: &Term<S>) -> Option<&[Term<S>; 2]> {
         functor: f, args, ..
     } = term
     {
-        if f == "p" && args.len() == 2 {
+        // legacy `p/2` と新名 `p2d/2` の両方を受け入れる。
+        if (f == "p" || f == "p2d") && args.len() == 2 {
             return args.as_slice().try_into().ok();
         }
     }
@@ -1090,7 +1118,8 @@ fn point_3d_args<S>(term: &Term<S>) -> Option<&[Term<S>; 3]> {
         functor: f, args, ..
     } = term
     {
-        if f == "p" && args.len() == 3 {
+        // legacy `p/3` と新名 `p3d/3` の両方を受け入れる。
+        if (f == "p" || f == "p3d") && args.len() == 3 {
             return args.as_slice().try_into().ok();
         }
     }
@@ -2901,6 +2930,104 @@ mod tests {
     fn test_control_is_builtin_functor() {
         assert!(crate::term_processor::is_builtin_functor("control2d"));
         assert!(crate::term_processor::is_builtin_functor("control3d"));
+    }
+
+    #[test]
+    fn test_dim_suffixed_names_recognized_as_builtin() {
+        // 新仕様 §1.1 の dimension-suffixed 名がパース後の dispatch で認識されること。
+        for name in &[
+            "union3d",
+            "difference3d",
+            "intersection3d",
+            "hull3d",
+            "union2d",
+            "difference2d",
+            "intersection2d",
+            "translate3d",
+            "scale3d",
+            "rotate3d",
+            "p2d",
+            "p3d",
+        ] {
+            assert!(
+                crate::term_processor::is_builtin_functor(name),
+                "expected '{}' to be a recognized builtin",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_dim_suffixed_aliases_dispatch_same_as_legacy() {
+        // `union3d(cube(1,1,1), cube(2,2,2))` が `union(...)` と同じ Model3D に解釈される。
+        let cube1 = struc(
+            "cube".to_string(),
+            vec![
+                number_int::<()>(1),
+                number_int::<()>(1),
+                number_int::<()>(1),
+            ],
+        );
+        let cube2 = struc(
+            "cube".to_string(),
+            vec![
+                number_int::<()>(2),
+                number_int::<()>(2),
+                number_int::<()>(2),
+            ],
+        );
+        let legacy = Model3D::from_term(&struc(
+            "union".to_string(),
+            vec![cube1.clone(), cube2.clone()],
+        ))
+        .unwrap();
+        let new = Model3D::from_term(&struc(
+            "union3d".to_string(),
+            vec![cube1, cube2],
+        ))
+        .unwrap();
+        // どちらも Union variant に解決されることを確認 (形が同じ Box<Model3D> 2 つ)
+        assert!(matches!(legacy, Model3D::Union(_, _)));
+        assert!(matches!(new, Model3D::Union(_, _)));
+    }
+
+    #[test]
+    fn test_p3d_alias_for_legacy_p3() {
+        // p3d(1,2,3) が p(1,2,3) と同じ点として解釈される (translate の引数として使える)。
+        let cube = struc(
+            "cube".to_string(),
+            vec![
+                number_int::<()>(10),
+                number_int::<()>(10),
+                number_int::<()>(10),
+            ],
+        );
+        let src = struc(
+            "p".to_string(),
+            vec![
+                number_int::<()>(0),
+                number_int::<()>(0),
+                number_int::<()>(0),
+            ],
+        );
+        let dst_new = struc(
+            "p3d".to_string(),
+            vec![
+                number_int::<()>(5),
+                number_int::<()>(6),
+                number_int::<()>(7),
+            ],
+        );
+        let t = struc("translate3d".to_string(), vec![cube, src, dst_new]);
+        let expr = Model3D::from_term(&t).unwrap();
+        match expr {
+            Model3D::Translate { x, y, z, .. } => {
+                assert_eq!(x, 5.0);
+                assert_eq!(y, 6.0);
+                assert_eq!(z, 7.0);
+            }
+            _ => panic!("expected Translate"),
+        }
     }
 
     #[test]
