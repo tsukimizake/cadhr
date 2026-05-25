@@ -296,12 +296,60 @@ pub fn collect_user_signatures<S>(clauses: &[crate::parse::Clause<S>]) -> UserSi
     us
 }
 
+/// record 宣言の typecheck 用 view。`#record name { f: T = default }` の `(field, T)` だけを
+/// 抽出して保持する。実体は `crate::parse::Clause::RecordDecl` から `RecordDeclTable::from_clauses`
+/// で構築する。
+#[derive(Debug, Clone, Default)]
+pub struct RecordDeclTable {
+    decls: HashMap<String, Vec<(String, Type)>>,
+}
+
+impl RecordDeclTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, name: String, fields: Vec<(String, Type)>) {
+        self.decls.insert(name, fields);
+    }
+
+    pub fn lookup(&self, name: &str) -> Option<&[(String, Type)]> {
+        self.decls.get(name).map(|v| v.as_slice())
+    }
+
+    /// `RecordField.ty` が `None` の field はそのフィールドの型注釈が省略されていた
+    /// (default 値から推論される予定の) ケース。新仕様 §4.4 では推論は型推論器の役割。
+    /// 現状の typecheck は型注釈付き field のみ扱うため、注釈なしフィールドは fresh α
+    /// として登録する。型を pin したい場合はソース側で `field: T = default` と書く。
+    pub fn from_clauses<S>(
+        clauses: &[crate::parse::Clause<S>],
+        var_gen: &mut VarGen,
+    ) -> Self {
+        use crate::parse::Clause;
+        let mut t = Self::new();
+        for c in clauses {
+            if let Clause::RecordDecl { name, fields, .. } = c {
+                let fs = fields
+                    .iter()
+                    .map(|f| {
+                        let ty = f.ty.clone().unwrap_or_else(|| var_gen.fresh());
+                        (f.name.clone(), ty)
+                    })
+                    .collect();
+                t.insert(name.clone(), fs);
+            }
+        }
+        t
+    }
+}
+
 pub struct InferCtx<'a> {
     pub env: TypeEnv,
     pub subst: &'a mut Substitution,
     pub var_gen: &'a mut VarGen,
     pub builtins: &'a crate::builtins::BuiltinRegistry,
     pub user_sigs: &'a UserSignatures,
+    pub records: &'a RecordDeclTable,
 }
 
 /// Term を推論し、その型を返す。Substitution は副作用で更新される。
@@ -375,26 +423,63 @@ pub fn infer_term<S>(
             // Eq は goal なので戻り値型は意味的に不要。型システムでは Bool を返す。
             Ok(Type::Bool)
         }
-        Term::FieldAccess { record: _, field, .. } => {
-            // TODO(Task #7 残): record decl テーブルを ctx に渡し、
-            // record の型 → 該当 field の型 を返す実装にする。
-            // 現状は record native 評価が未着手のため AmbiguousType を返して
-            // 推論器が止まることを優先する (silent fallback 禁止)。
-            Err(TypeError::AmbiguousType {
-                context: format!("field access .{}: record decl table not yet available", field),
-            })
+        Term::FieldAccess { record, field, .. } => {
+            // record の型を推論 → substitute で具体化 → Type::Record(name) を期待。
+            // Var (未束縛 α) なら型が不明なため AmbiguousType。
+            let rec_ty = infer_term(record, ctx)?;
+            let resolved = ctx.subst.apply(&rec_ty);
+            let record_name = match &resolved {
+                Type::Record(n) => n.clone(),
+                _ => {
+                    return Err(TypeError::AmbiguousType {
+                        context: format!(
+                            "field access .{} on non-record value (resolved to {})",
+                            field, resolved
+                        ),
+                    });
+                }
+            };
+            let decl =
+                ctx.records
+                    .lookup(&record_name)
+                    .ok_or_else(|| TypeError::MissingSignature {
+                        context: format!("record decl for '{}'", record_name),
+                    })?;
+            let field_ty = decl
+                .iter()
+                .find(|(n, _)| n == field)
+                .map(|(_, t)| t.clone())
+                .ok_or_else(|| TypeError::MissingSignature {
+                    context: format!("field '{}' on record '{}'", field, record_name),
+                })?;
+            Ok(field_ty)
         }
         Term::Record { name, fields, .. } => {
-            // TODO(Task #7 残): record decl テーブルから宣言を引き、
-            // 各 field 値型と宣言の field 型を unify、Type::Record(name) を返す。
-            // 現状は record decl table が ctx に存在しないため AmbiguousType。
-            // ただし field 値の推論自体は走らせて未定義 functor 等は検出する。
-            for (_, v) in fields {
-                let _ = infer_term(v, ctx)?;
+            let decl =
+                ctx.records
+                    .lookup(name)
+                    .ok_or_else(|| TypeError::MissingSignature {
+                        context: format!("record decl for '{}'", name),
+                    })?
+                    .to_vec();
+            // 各 (field_name, value) について宣言された field 型と unify。
+            // 提供されていない field は宣言の default が利用される想定で skip
+            // (default 値の型整合性は record decl 構築時に検査する方向で別途実装)。
+            for (provided_name, value) in fields {
+                let expected = decl
+                    .iter()
+                    .find(|(n, _)| n == provided_name)
+                    .map(|(_, t)| t.clone())
+                    .ok_or_else(|| TypeError::MissingSignature {
+                        context: format!(
+                            "field '{}' is not declared on record '{}'",
+                            provided_name, name
+                        ),
+                    })?;
+                let actual = infer_term(value, ctx)?;
+                unify(&expected, &actual, ctx.subst)?;
             }
-            Err(TypeError::AmbiguousType {
-                context: format!("record literal '{}': record decl table not yet available", name),
-            })
+            Ok(Type::Record(name.clone()))
         }
     }
 }
@@ -419,6 +504,7 @@ pub fn infer_clause<S: Clone>(
     clause: &crate::parse::Clause<S>,
     builtins: &crate::builtins::BuiltinRegistry,
     user_sigs: &UserSignatures,
+    records: &RecordDeclTable,
 ) -> Result<(), TypeError> {
     use crate::parse::{Clause, Term};
     let (head, body) = match clause {
@@ -458,6 +544,7 @@ pub fn infer_clause<S: Clone>(
         var_gen: &mut var_gen,
         builtins,
         user_sigs,
+        records,
     };
 
     for goal in body {
@@ -484,9 +571,14 @@ pub fn infer_database<S: Clone>(
 ) -> Vec<ClauseDiagnostic> {
     use crate::parse::{Clause, Term};
     let user_sigs = collect_user_signatures(clauses);
+    // record decl の field 型 (`f.ty`) が None だった場合に fresh α を割り当てるための gen。
+    // infer_clause 側の gen と別ライフタイムだが、α の id 空間が異なっても問題ない
+    // (RecordDeclTable 内では同一 record の field 間で一貫していればよい)。
+    let mut decl_gen = VarGen::new();
+    let records = RecordDeclTable::from_clauses(clauses, &mut decl_gen);
     let mut diags = Vec::new();
     for (idx, clause) in clauses.iter().enumerate() {
-        if let Err(err) = infer_clause(clause, builtins, &user_sigs) {
+        if let Err(err) = infer_clause(clause, builtins, &user_sigs, &records) {
             let functor = match clause {
                 Clause::Fact { head: Term::Struct { functor, .. }, .. }
                 | Clause::Rule { head: Term::Struct { functor, .. }, .. } => {
@@ -646,6 +738,7 @@ mod tests {
         var_gen: &'a mut VarGen,
         builtins: &'a crate::builtins::BuiltinRegistry,
         user_sigs: &'a UserSignatures,
+        records: &'a RecordDeclTable,
     ) -> InferCtx<'a> {
         InferCtx {
             env: TypeEnv::new(),
@@ -653,6 +746,7 @@ mod tests {
             var_gen,
             builtins,
             user_sigs,
+            records,
         }
     }
 
@@ -662,7 +756,8 @@ mod tests {
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
         let us = UserSignatures::new();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
+        let rd = RecordDeclTable::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         let t = infer_term::<()>(&number(Rational::from_integer(42)), &mut ctx).unwrap();
         assert_eq!(t, Type::Number);
     }
@@ -673,7 +768,8 @@ mod tests {
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
         let us = UserSignatures::new();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
+        let rd = RecordDeclTable::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         let t = struc::<()>(
             "cube".to_string(),
             vec![
@@ -692,7 +788,8 @@ mod tests {
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
         let us = UserSignatures::new();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
+        let rd = RecordDeclTable::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         let cube = |sz: i64| {
             struc::<()>(
                 "cube".to_string(),
@@ -714,7 +811,8 @@ mod tests {
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
         let us = UserSignatures::new();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
+        let rd = RecordDeclTable::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         let ty = infer_term::<()>(&var("X".to_string()), &mut ctx).unwrap();
         assert!(matches!(ty, Type::Var(_)));
     }
@@ -725,7 +823,8 @@ mod tests {
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
         let us = UserSignatures::new();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
+        let rd = RecordDeclTable::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         let v = Term::<()>::Var {
             name: "X".to_string(),
             scope: (),
@@ -747,7 +846,8 @@ mod tests {
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
         let us = UserSignatures::new();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
+        let rd = RecordDeclTable::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         let lst = Term::<()>::List {
             items: vec![
                 number(Rational::from_integer(1)),
@@ -766,7 +866,8 @@ mod tests {
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
         let us = UserSignatures::new();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
+        let rd = RecordDeclTable::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         let lst = Term::<()>::List {
             items: vec![
                 number(Rational::from_integer(1)),
@@ -784,7 +885,8 @@ mod tests {
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
         let us = UserSignatures::new();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
+        let rd = RecordDeclTable::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         // X = cube(10, 10, 10): X should be Shape3D
         let eq = Term::<()>::Eq {
             left: Box::new(var("X".to_string())),
@@ -808,7 +910,8 @@ mod tests {
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
         let us = UserSignatures::new();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
+        let rd = RecordDeclTable::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         let expr = Term::<()>::InfixExpr {
             op: ArithOp::Add,
             left: Box::new(number(Rational::from_integer(1))),
@@ -851,7 +954,13 @@ mod tests {
             body,
             return_type: Some(Type::Shape3D),
         };
-        infer_clause(&clause, &b, &UserSignatures::new()).unwrap();
+        infer_clause(
+            &clause,
+            &b,
+            &UserSignatures::new(),
+            &RecordDeclTable::new(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -890,7 +999,7 @@ mod tests {
             body,
             return_type: None,
         };
-        let r = infer_clause(&clause, &b, &UserSignatures::new());
+        let r = infer_clause(&clause, &b, &UserSignatures::new(), &RecordDeclTable::new());
         assert!(matches!(r, Err(TypeError::Mismatch { .. })));
     }
 
@@ -1016,13 +1125,173 @@ mod tests {
         assert!(matches!(diags[0].error, TypeError::Mismatch { .. }));
     }
 
+    fn point_record_decl<S>() -> crate::parse::Clause<S> {
+        crate::parse::Clause::RecordDecl {
+            name: "p".to_string(),
+            fields: vec![
+                crate::parse::RecordField {
+                    name: "x".to_string(),
+                    default: None,
+                    ty: Some(Type::Number),
+                },
+                crate::parse::RecordField {
+                    name: "y".to_string(),
+                    default: None,
+                    ty: Some(Type::Number),
+                },
+            ],
+            span: None,
+        }
+    }
+
+    #[test]
+    fn infer_record_literal_ok() {
+        use crate::parse::{Clause, struc};
+        let decl = point_record_decl::<()>();
+        // make_p(O) -> p :- O = p { x: 1, y: 2 }.
+        let rule = Clause::<()>::Rule {
+            head: struc::<()>("make_p".to_string(), vec![var("O".to_string())]),
+            body: vec![Term::Eq {
+                left: Box::new(var("O".to_string())),
+                right: Box::new(Term::Record {
+                    name: "p".to_string(),
+                    fields: vec![
+                        (
+                            "x".to_string(),
+                            number(Rational::from_integer(1)),
+                        ),
+                        (
+                            "y".to_string(),
+                            number(Rational::from_integer(2)),
+                        ),
+                    ],
+                    span: None,
+                }),
+            }],
+            return_type: Some(Type::Record("p".to_string())),
+        };
+        let clauses = vec![decl, rule];
+        let b = crate::builtins::registry();
+        let diags = infer_database(&clauses, &b);
+        assert!(diags.is_empty(), "expected no diagnostics, got {:?}", diags);
+    }
+
+    #[test]
+    fn infer_record_literal_wrong_field_type_errors() {
+        use crate::parse::{Clause, struc};
+        let decl = point_record_decl::<()>();
+        // bad(O) -> p :- O = p { x: cube(1,1,1), y: 2 }.   ← x should be Number
+        let rule = Clause::<()>::Rule {
+            head: struc::<()>("bad".to_string(), vec![var("O".to_string())]),
+            body: vec![Term::Eq {
+                left: Box::new(var("O".to_string())),
+                right: Box::new(Term::Record {
+                    name: "p".to_string(),
+                    fields: vec![
+                        (
+                            "x".to_string(),
+                            struc::<()>(
+                                "cube".to_string(),
+                                vec![
+                                    number(Rational::from_integer(1)),
+                                    number(Rational::from_integer(1)),
+                                    number(Rational::from_integer(1)),
+                                ],
+                            ),
+                        ),
+                        (
+                            "y".to_string(),
+                            number(Rational::from_integer(2)),
+                        ),
+                    ],
+                    span: None,
+                }),
+            }],
+            return_type: Some(Type::Record("p".to_string())),
+        };
+        let clauses = vec![decl, rule];
+        let b = crate::builtins::registry();
+        let diags = infer_database(&clauses, &b);
+        assert_eq!(diags.len(), 1);
+        assert!(matches!(diags[0].error, TypeError::Mismatch { .. }));
+    }
+
+    #[test]
+    fn infer_field_access_returns_declared_field_type() {
+        use crate::parse::{Clause, struc};
+        let decl = point_record_decl::<()>();
+        // use_field(R: p) :- N = R.x.   ← N should resolve to Number
+        let rule = Clause::<()>::Rule {
+            head: struc::<()>(
+                "use_field".to_string(),
+                vec![Term::Var {
+                    name: "R".to_string(),
+                    scope: (),
+                    default_value: None,
+                    min: None,
+                    max: None,
+                    span: None,
+                    type_annotation: Some(Type::Record("p".to_string())),
+                }],
+            ),
+            body: vec![Term::Eq {
+                left: Box::new(var("N".to_string())),
+                right: Box::new(Term::FieldAccess {
+                    record: Box::new(var("R".to_string())),
+                    field: "x".to_string(),
+                    span: None,
+                }),
+            }],
+            return_type: None,
+        };
+        let clauses = vec![decl, rule];
+        let b = crate::builtins::registry();
+        let diags = infer_database(&clauses, &b);
+        assert!(diags.is_empty(), "expected no diagnostics, got {:?}", diags);
+    }
+
+    #[test]
+    fn infer_field_access_unknown_field_errors() {
+        use crate::parse::{Clause, struc};
+        let decl = point_record_decl::<()>();
+        let rule = Clause::<()>::Rule {
+            head: struc::<()>(
+                "bad".to_string(),
+                vec![Term::Var {
+                    name: "R".to_string(),
+                    scope: (),
+                    default_value: None,
+                    min: None,
+                    max: None,
+                    span: None,
+                    type_annotation: Some(Type::Record("p".to_string())),
+                }],
+            ),
+            body: vec![Term::Eq {
+                left: Box::new(var("N".to_string())),
+                right: Box::new(Term::FieldAccess {
+                    record: Box::new(var("R".to_string())),
+                    field: "z".to_string(),
+                    span: None,
+                }),
+            }],
+            return_type: None,
+        };
+        let clauses = vec![decl, rule];
+        let b = crate::builtins::registry();
+        let diags = infer_database(&clauses, &b);
+        assert_eq!(diags.len(), 1);
+        assert!(matches!(diags[0].error, TypeError::MissingSignature { .. }));
+    }
+
     #[test]
     fn infer_unknown_functor_errors_with_missing_sig() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
         let us = UserSignatures::new();
-        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us);
+        let rd = RecordDeclTable::new();
+        let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         let t = struc::<()>("unknown_op".to_string(), vec![]);
         let r = infer_term(&t, &mut ctx);
         assert!(matches!(r, Err(TypeError::MissingSignature { .. })));
