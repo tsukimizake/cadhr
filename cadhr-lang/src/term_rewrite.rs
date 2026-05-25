@@ -1329,13 +1329,6 @@ fn handle_assert_eq(
 /// 解けた束縛は `shared_env` に反映され、以降のサブゴール展開で利用可能になる。
 ///
 /// 構造的 unify を先に処理する: Var → Struct の束縛が後段の算術判定に必要なため。
-fn resolve_equality_goals(
-    goals: &mut Vec<ScopedTerm>,
-    shared_env: &mut ScopedEnv,
-) -> Result<(), RewriteError> {
-    resolve_equality_goals_with_decls(goals, shared_env, &HashMap::new())
-}
-
 fn resolve_equality_goals_with_decls(
     goals: &mut Vec<ScopedTerm>,
     shared_env: &mut ScopedEnv,
@@ -1750,115 +1743,6 @@ fn extract_record_decls(db: &[Clause]) -> HashMap<String, Vec<RecordField>> {
 }
 
 /// `make_NAME(Spec, R)` builtin の本体。
-/// - `Spec` は `[field_name(value), ...]` 形式の List
-/// - 各 field について Spec を検索、見つからなければ default、default も無ければエラー
-/// - 構築した `NAME(v1, v2, ...)` を `R` と unify
-fn handle_make_record(
-    record_name: &str,
-    fields: &[RecordField],
-    spec_term: &ScopedTerm,
-    target_term: &ScopedTerm,
-    scope: ScopeId,
-    shared_env: &mut ScopedEnv,
-    span: Option<SrcSpan>,
-) -> Result<Vec<ScopedTerm>, RewriteError> {
-    let spec_resolved = resolve(spec_term, shared_env);
-    let items = match &spec_resolved {
-        Term::List { items, tail } => {
-            if tail.is_some() {
-                return Err(RewriteError {
-                    message: format!("make_{} spec list must not have a tail", record_name),
-                    goal: spec_resolved.clone(),
-                });
-            }
-            items.clone()
-        }
-        _ => {
-            return Err(RewriteError {
-                message: format!("make_{} spec must be a list", record_name),
-                goal: spec_resolved,
-            });
-        }
-    };
-
-    // Spec を field 名で索引化。重複指定はエラー (誤記検出)。
-    // モジュール内で書かれた `f(value)` は `mod::f(value)` に prefix されているので、
-    // 最後の `::` 以降をフィールド名として扱う。
-    let mut by_field: HashMap<String, ScopedTerm> = HashMap::new();
-    for item in items {
-        let item_resolved = resolve(&item, shared_env);
-        match &item_resolved {
-            Term::Struct { functor, args, .. } if args.len() == 1 => {
-                let field_name = functor
-                    .rsplit("::")
-                    .next()
-                    .unwrap_or(functor.as_str())
-                    .to_string();
-                if by_field.contains_key(&field_name) {
-                    return Err(RewriteError {
-                        message: format!(
-                            "make_{} spec contains duplicate field `{}`",
-                            record_name, field_name
-                        ),
-                        goal: item_resolved.clone(),
-                    });
-                }
-                by_field.insert(field_name, args[0].clone());
-            }
-            _ => {
-                return Err(RewriteError {
-                    message: format!(
-                        "make_{} spec items must be `field(value)` structs",
-                        record_name
-                    ),
-                    goal: item_resolved,
-                });
-            }
-        }
-    }
-
-    let mut record_args: Vec<ScopedTerm> = Vec::with_capacity(fields.len());
-    for field in fields {
-        if let Some(value) = by_field.remove(&field.name) {
-            record_args.push(value);
-        } else if let Some(default) = &field.default {
-            // default は unscoped (parse 時の `()` scope) なので、現在の scope を割り当てる。
-            record_args.push(assign_scope_to_term(default.clone(), scope, shared_env));
-        } else {
-            return Err(RewriteError {
-                message: format!(
-                    "make_{} missing field `{}` and no default available",
-                    record_name, field.name
-                ),
-                goal: spec_resolved,
-            });
-        }
-    }
-
-    if !by_field.is_empty() {
-        let unknown: Vec<_> = by_field.keys().cloned().collect();
-        return Err(RewriteError {
-            message: format!(
-                "make_{} spec contains unknown field(s): {}",
-                record_name,
-                unknown.join(", ")
-            ),
-            goal: spec_resolved,
-        });
-    }
-
-    let built = Term::Struct {
-        functor: record_name.to_string(),
-        args: record_args,
-        span,
-    };
-    unify(target_term.clone(), built, shared_env).map_err(|e| RewriteError {
-        message: format!("make_{} unify failed: {}", record_name, e.message),
-        goal: target_term.clone(),
-    })?;
-    Ok(vec![])
-}
-
 /// 項を深さ優先で再帰的に書き換える
 /// 書き換えが成功すれば書き換え後の項のリストを返す（複数になる場合がある）
 /// other_goals は書き換え中に発生した変数束縛を反映するため
@@ -1884,42 +1768,9 @@ fn rewrite_term_recursive(
         if functor == "assert_eq" && (args.len() == 2 || args.len() == 3) {
             return handle_assert_eq(args, *span, shared_env);
         }
-
-        // __make_record__("NAME", Spec, R): auto-generated `make_NAME` rule の本体。
-        // 第 1 引数 (StringLit) で record 名を、第 2/3 引数で spec/target を受ける。
-        if functor == "__make_record__" && args.len() == 3 {
-            let record_name = match &args[0] {
-                Term::StringLit { value } => value.clone(),
-                other => {
-                    return Err(RewriteError {
-                        message: format!(
-                            "__make_record__: 1st arg must be a string literal of the record name, got {:?}",
-                            other
-                        ),
-                        goal: term.clone(),
-                    });
-                }
-            };
-            let fields = record_decls.get(&record_name).cloned().ok_or_else(|| {
-                RewriteError {
-                    message: format!("__make_record__: unknown record `{}`", record_name),
-                    goal: term.clone(),
-                }
-            })?;
-            let scope = match &args[2] {
-                Term::Var { scope, .. } => *scope,
-                _ => 0,
-            };
-            return handle_make_record(
-                &record_name,
-                &fields,
-                &args[1],
-                &args[2],
-                scope,
-                shared_env,
-                *span,
-            );
-        }
+        // __make_record__ は廃止。`Term::Record { ... }` リテラルが
+        // desugar_record_terms_in で `Term::Struct` に展開され、`Term::FieldAccess`
+        // が project_in_term で投影される (LANG_SPEC §4.4)。
     }
 
     // range付きVarがゴールとして出現: 値の範囲チェックのみ行い、結果は返さない
@@ -3940,85 +3791,14 @@ test(B, C) :- constrain([item(a, 3), item(b, B), item(c, C)]).\n";
         );
     }
 
-    // ===== record tests =====
+    // ===== record native tests =====
     //
-    // make_NAME / NAME_FIELD / set_FIELD_of_NAME の正しさは、束縛された変数を
-    // assert_eq で観測することで間接的に確認する (現状の暗黙 Model セマンティクスでは
-    // 述語の引数束縛が直接 result list に出ないため)。
-
-    #[test]
-    fn record_getter_extracts_field_by_position() {
-        // R = point(3, 4) → point_x(R, X) → X = 3
-        let db = ":- record point(x=0, y=0).\n\
-                  test :- R = point(3, 4), point_x(R, X), assert_eq(X, 3).";
-        run_with_records(db, "test.");
-    }
-
-    #[test]
-    fn record_setter_replaces_one_field() {
-        // R0 = point(1, 2), set_x_of_point(9, R0, R1) → R1 = point(9, 2)
-        let db = ":- record point(x=0, y=0).\n\
-                  test :- R0 = point(1, 2), set_x_of_point(9, R0, R1), \
-                  point_x(R1, X), point_y(R1, Y), assert_eq(X, 9), assert_eq(Y, 2).";
-        run_with_records(db, "test.");
-    }
-
-    #[test]
-    fn make_record_uses_defaults_for_omitted_fields() {
-        // make_point([x(3)], R) → R = point(3, 0) (y は default 0)
-        let db = ":- record point(x=0, y=0).\n\
-                  test :- make_point([x(3)], R), point_x(R, X), point_y(R, Y), \
-                  assert_eq(X, 3), assert_eq(Y, 0).";
-        run_with_records(db, "test.");
-    }
-
-    #[test]
-    fn make_record_all_fields_specified() {
-        let db = ":- record point(x=0, y=0).\n\
-                  test :- make_point([x(3), y(4)], R), point_x(R, X), point_y(R, Y), \
-                  assert_eq(X, 3), assert_eq(Y, 4).";
-        run_with_records(db, "test.");
-    }
-
-    #[test]
-    fn make_record_rejects_unknown_field() {
-        use crate::module::{ModuleResolver, resolve_modules};
-        use crate::parse::FileRegistry;
-        let db_raw = database(
-            ":- record point(x=0, y=0).\n\
-             test(R) :- make_point([z(99)], R).",
-        )
-        .expect("parse db");
-        let mut resolver = ModuleResolver::new();
-        let mut registry = FileRegistry::new();
-        let mut db = resolve_modules(db_raw, &[], &mut resolver, &mut registry).expect("resolve");
-        let q = query("test(R).").expect("parse query").1;
-        let err = execute(&mut db, q).expect_err("unknown field should fail");
-        assert!(
-            err.error_message().contains("unknown field"),
-            "expected unknown field error, got: {}",
-            err.error_message()
-        );
-    }
-
-    #[test]
-    fn make_record_missing_field_no_default_fails() {
-        use crate::module::{ModuleResolver, resolve_modules};
-        use crate::parse::FileRegistry;
-        let db_raw = database(
-            ":- record point(x, y=0).\n\
-             test(R) :- make_point([], R).",
-        )
-        .expect("parse db");
-        let mut resolver = ModuleResolver::new();
-        let mut registry = FileRegistry::new();
-        let mut db = resolve_modules(db_raw, &[], &mut resolver, &mut registry).expect("resolve");
-        let q = query("test(R).").expect("parse query").1;
-        let err = execute(&mut db, q).expect_err("missing required field should fail");
-        assert!(
-            err.error_message().contains("missing field"),
-            "expected missing field error, got: {}",
-            err.error_message()
-        );
-    }
+    // record literal (`{ f: v, ... }`) と field access (`R.field`) の動作は
+    // test_record_literal_desugars_to_positional_struct / field_order_independent /
+    // uses_default_for_missing_field と test_field_access_resolves_to_arg_position
+    // で確認している (上方の "record literal desugar" / "Term::FieldAccess runtime
+    // projection" セクション)。
+    //
+    // 旧 make_NAME / NAME_FIELD / set_FIELD_of_NAME のテストは auto-gen 廃止
+    // (LANG_SPEC §4.4) に伴い削除した。
 }

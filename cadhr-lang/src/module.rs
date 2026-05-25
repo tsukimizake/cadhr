@@ -3,22 +3,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::parse::{database, Clause, FileRegistry, RecordField, Term};
-use crate::term_processor::{is_builtin_functor, BuiltinFunctorSet};
+use crate::term_processor::is_builtin_functor;
 
-// `__make_record__(RecordNameStr, Spec, R)` は auto-generated `make_NAME` rule の
-// 本体から呼ばれる builtin。term_rewrite が intercept して handle_make_record に
-// 委譲する。引数を builtin 側で自動 resolve すると Spec list 内の field 名 struct
-// (`x(3)` 等) が再帰展開されてしまうため、resolve_args は false にする。
-inventory::submit! {
-    BuiltinFunctorSet {
-        functors: &[("__make_record__", &[3_usize] as &[usize])],
-        resolve_args: false,
-    }
-}
-
-/// `:- record NAME(...).` を実行時参照しやすい形に保管したもの。
-/// `make_NAME/2` builtin の引数解決と `NAME_FIELD/2` / `set_FIELD_of_NAME/3`
-/// 自動生成の両方で参照される。
+/// `:- record NAME(...).` / `#record NAME { ... }.` を実行時参照しやすい形に保管したもの。
+/// `Term::Record` の field 順 desugar と `Term::FieldAccess` の投影で参照される。
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordDecl {
     pub name: String,
@@ -155,126 +143,22 @@ fn resolve_modules_inner(
             }
             Clause::RecordDecl { name, fields, span } => {
                 register_record_decl(resolver, &name, &fields)?;
-                // decl 自体も clauses に残す。term_rewrite で make_NAME builtin が参照する。
+                // decl 自体は clauses に残す。term_rewrite が `Term::Record` の
+                // desugar (field 順並び替え) と `Term::FieldAccess` の投影で参照する。
+                // make_NAME / NAME_FIELD / set_FIELD_of_NAME の auto-generation は廃止
+                // (LANG_SPEC §4.4): ユーザは `R = NAME { f: v, ... }` リテラルと
+                // `V = R.field` アクセスで構築・参照する。
                 result.push(Clause::RecordDecl {
                     name: name.clone(),
                     fields: fields.clone(),
                     span,
                 });
-                // record 宣言と同じ位置に getter/setter Fact を inline 生成する。
-                // 通常の rule と同じく、外側 resolve_use の prefix_clause を通って
-                // モジュール名で prefix される。これにより `make_X` / `X_field` /
-                // `set_field_of_X` も通常の述語と同じ namespace 規則に従う。
-                result.extend(generate_predicates_for_record(&name, &fields));
             }
             other => result.push(other),
         }
     }
 
     Ok(result)
-}
-
-/// 1 つの record decl について、`make_NAME/2` constructor rule、
-/// `NAME_FIELD/2` getter Fact、`set_FIELD_of_NAME/3` setter Fact を
-/// auto-generate して返す。`record` 宣言と同じ位置に inline 注入するので、
-/// 外側のモジュール prefix が自然に適用される (= 通常の rule と同じ namespace
-/// 規則に従う)。`make_NAME` の本体は builtin `__make_record__` を呼ぶだけで、
-/// 実際の構築は term_rewrite が行う。
-fn generate_predicates_for_record(name: &str, fields: &[RecordField]) -> Vec<Clause> {
-    let mut result = Vec::new();
-
-    // make_NAME(Spec, R) :- __make_record__("NAME", Spec, R).
-    // record 名を StringLit にすることで、prefix されてもデータが変わらない。
-    result.push(Clause::Rule {
-        head: struct_term(
-            &format!("make_{}", name),
-            vec![named_var("Spec"), named_var("R")],
-        ),
-        body: vec![struct_term(
-            "__make_record__",
-            vec![
-                Term::StringLit {
-                    value: name.to_string(),
-                },
-                named_var("Spec"),
-                named_var("R"),
-            ],
-        )],
-        return_type: None,
-    });
-
-    let arity = fields.len();
-    for (i, field) in fields.iter().enumerate() {
-        // Getter: NAME_FIELD(NAME(_, ..., V, ..., _), V).
-        // V を i 番目に、他は無名 (`_`)。
-        let mut record_args = (0..arity).map(|_| anon_var()).collect::<Vec<Term>>();
-        record_args[i] = named_var("V");
-        let record_pat = struct_term(name, record_args);
-        result.push(Clause::Fact {
-            head: struct_term(
-                &format!("{}_{}", name, field.name),
-                vec![record_pat, named_var("V")],
-            ),
-            return_type: None,
-        });
-
-        // Setter: set_FIELD_of_NAME(V, NAME(_/Old, Others...), NAME(V, SameOthers...)).
-        // i 番目以外は同じ変数 (両 record で共有)、i 番目は新値 V。
-        let mut r0_args = Vec::with_capacity(arity);
-        let mut r1_args = Vec::with_capacity(arity);
-        for j in 0..arity {
-            if j == i {
-                r0_args.push(anon_var()); // 旧値は破棄
-                r1_args.push(named_var("V"));
-            } else {
-                let shared = named_var(&format!("F{}", j));
-                r0_args.push(shared.clone());
-                r1_args.push(shared);
-            }
-        }
-        let r0 = struct_term(name, r0_args);
-        let r1 = struct_term(name, r1_args);
-        result.push(Clause::Fact {
-            head: struct_term(
-                &format!("set_{}_of_{}", field.name, name),
-                vec![named_var("V"), r0, r1],
-            ),
-            return_type: None,
-        });
-    }
-    result
-}
-
-fn anon_var() -> Term {
-    Term::Var {
-        name: "_".to_string(),
-        scope: (),
-        default_value: None,
-        min: None,
-        max: None,
-        span: None,
-        type_annotation: None,
-    }
-}
-
-fn named_var(name: &str) -> Term {
-    Term::Var {
-        name: name.to_string(),
-        scope: (),
-        default_value: None,
-        min: None,
-        max: None,
-        span: None,
-        type_annotation: None,
-    }
-}
-
-fn struct_term(functor: &str, args: Vec<Term>) -> Term {
-    Term::Struct {
-        functor: functor.to_string(),
-        args,
-        span: None,
-    }
 }
 
 /// record decl をテーブルに登録する。同名既存 decl があれば field 構造を比較して
@@ -745,115 +629,14 @@ mod tests {
         assert!(resolver.record_decls.contains_key("output"));
     }
 
-    /// std 経由で record を `#use` し、`expose([point])` で派生述語まで自動 expose されることを確認する。
-    /// expose リストに record 名を 1 つ書けば make_NAME/NAME_FIELD/set_FIELD_of_NAME が
-    /// 全て unprefixed で見えるようになる。
-    #[test]
-    fn test_record_predicates_callable_from_use_module() {
-        use crate::term_rewrite::execute;
-        use crate::parse::{database, query};
-        let dir = tempfile::tempdir().unwrap();
-        let std_path = dir.path().join("std/db.cadhr");
-        fs::create_dir_all(std_path.parent().unwrap()).unwrap();
-        fs::write(&std_path, ":- record point(x=0, y=0).\n").unwrap();
-
-        // user db: std を expose([point]) で use し、派生述語が unprefixed で使えるか確認。
-        let user_src = "#use(\"std\", expose([point])).\n\
-                        test :- make_point([x(3), y(4)], R), point_x(R, X), assert_eq(X, 3).";
-        let user_clauses = database(user_src).expect("parse user db");
-        let mut resolver = ModuleResolver::new();
-        let mut registry = FileRegistry::new();
-        let mut db = resolve_modules(
-            user_clauses,
-            &[dir.path().to_path_buf()],
-            &mut resolver,
-            &mut registry,
-        )
-        .expect("resolve modules");
-
-        let q = query("test.").expect("parse query").1;
-        execute(&mut db, q).expect("test should succeed");
-    }
-
-    /// expose なしでは派生述語に `std::` prefix が必要であることを確認する。
-    #[test]
-    fn test_record_predicates_require_qualification_without_expose() {
-        use crate::parse::{database, query};
-        use crate::term_rewrite::execute;
-        let dir = tempfile::tempdir().unwrap();
-        let std_path = dir.path().join("std/db.cadhr");
-        fs::create_dir_all(std_path.parent().unwrap()).unwrap();
-        fs::write(&std_path, ":- record point(x=0, y=0).\n").unwrap();
-
-        // expose なし、bare 呼び出し → 失敗するはず
-        let user_src = "#use(\"std\").\n\
-                        test :- make_point([x(3), y(4)], R), point_x(R, X), assert_eq(X, 3).";
-        let user_clauses = database(user_src).expect("parse user db");
-        let mut resolver = ModuleResolver::new();
-        let mut db = resolve_modules(
-            user_clauses,
-            &[dir.path().to_path_buf()],
-            &mut resolver,
-            &mut FileRegistry::new(),
-        )
-        .expect("resolve modules");
-        let q = query("test.").expect("parse query").1;
-        assert!(
-            execute(&mut db, q).is_err(),
-            "bare make_point/point_x without expose should fail"
-        );
-
-        // qualified 呼び出しなら expose なしでも動く
-        let user_src2 = "#use(\"std\").\n\
-                         test :- std::make_point([x(3), y(4)], R), std::point_x(R, X), assert_eq(X, 3).";
-        let user_clauses2 = database(user_src2).expect("parse user db");
-        let mut resolver2 = ModuleResolver::new();
-        let mut db2 = resolve_modules(
-            user_clauses2,
-            &[dir.path().to_path_buf()],
-            &mut resolver2,
-            &mut FileRegistry::new(),
-        )
-        .expect("resolve modules");
-        let q2 = query("test.").expect("parse query").1;
-        execute(&mut db2, q2).expect("qualified call should succeed");
-    }
-
-    /// モジュール内 rule body から make_X / X_FIELD を呼び出せることを確認する。
-    /// module 内の `make_point` は prefix された `std::make_point` 経由で auto-rule
-    /// に解決し、その body の `__make_record__` が builtin として動く。
-    #[test]
-    fn test_record_predicates_callable_from_inside_module() {
-        use crate::parse::{database, query};
-        use crate::term_rewrite::execute;
-        let dir = tempfile::tempdir().unwrap();
-        let std_path = dir.path().join("std/db.cadhr");
-        fs::create_dir_all(std_path.parent().unwrap()).unwrap();
-        fs::write(
-            &std_path,
-            ":- record point(x=0, y=0).\n\
-             helper_build(X_VAL, Y_VAL, R) :- make_point([x(X_VAL), y(Y_VAL)], R).\n\
-             helper_x(R, X) :- point_x(R, X).\n",
-        )
-        .unwrap();
-
-        // 敢えて expose せず、qualified で helper を呼び出す。helper の中で bare の
-        // `make_point` / `point_x` が prefix されて `std::make_point` / `std::point_x`
-        // になっていても、それぞれ auto-rule にマッチして動く。
-        let user_src = "#use(\"std\").\n\
-                        test :- std::helper_build(3, 4, R), std::helper_x(R, X), assert_eq(X, 3).";
-        let user_clauses = database(user_src).expect("parse user db");
-        let mut resolver = ModuleResolver::new();
-        let mut db = resolve_modules(
-            user_clauses,
-            &[dir.path().to_path_buf()],
-            &mut resolver,
-            &mut FileRegistry::new(),
-        )
-        .expect("resolve modules");
-        let q = query("test.").expect("parse query").1;
-        execute(&mut db, q).expect("module-internal record use should succeed");
-    }
+    // make_NAME / NAME_FIELD / set_FIELD_of_NAME の auto-generation を廃止
+    // (LANG_SPEC §4.4) したため、その挙動を検証していた以下の 3 テストは削除:
+    //   - test_record_predicates_callable_from_use_module
+    //   - test_record_predicates_require_qualification_without_expose
+    //   - test_record_predicates_callable_from_inside_module
+    // 新しい record literal (`R = name { f: v, ... }`) と field access (`R.field`)
+    // のテストは cadhr-lang/src/term_rewrite.rs::tests と
+    // cadhr-lang/src/typecheck.rs::tests にある。
 
     /// 同名 record を field 構造の異なる形で 2 つ定義するとエラー。
     #[test]
