@@ -894,26 +894,6 @@ fn comp_op(input: &str) -> PResult<'_, CompOp> {
     .parse(input)
 }
 
-fn default_value_suffix(input: &str) -> PResult<'_, (crate::rational::Rational, SrcSpan)> {
-    let (input, _) = ws(char('@')).parse(input)?;
-    let (input, _) = space_or_comment0(input)?;
-    let value_start = input.as_ptr() as usize;
-    let (input, value) = fixed_number(input)?;
-    let value_end = input.as_ptr() as usize;
-    Ok((
-        input,
-        (
-            value,
-            SrcSpan {
-                start: value_start,
-                end: value_end,
-                file_id: 0,
-            },
-        ),
-    ))
-}
-
-/// annotated_var: `X@25`, `0<X@20<50`, `0<X<10`, `X<10`, `0<X` など
 /// `: Type` 注釈をパースする。`:-` (rule head/body 区切り) と衝突しないよう、
 /// `:` の直後が `-` でないことを確認してから type_expr を読む。
 fn type_annotation_suffix(input: &str) -> PResult<'_, crate::types::Type> {
@@ -931,7 +911,8 @@ fn type_annotation_suffix(input: &str) -> PResult<'_, crate::types::Type> {
     type_expr(input)
 }
 
-/// left_bound? Variable (@value)? right_bound? (: Type)?
+/// left_bound? Variable right_bound? (: Type)?
+/// `X@N` default annotation は LANG_SPEC §1.5 / §13 で廃止。
 fn annotated_var_term(input: &str) -> PResult<'_, Term> {
     // 左側: (num op)?
     let (input, left) = opt((ws(fixed_number), comp_op)).parse(input)?;
@@ -944,8 +925,6 @@ fn annotated_var_term(input: &str) -> PResult<'_, Term> {
         end: var_name_end,
         file_id: 0,
     };
-    // =value (optional)
-    let (input, default_with_span) = opt(default_value_suffix).parse(input)?;
     // 右側: (op num)?
     let (input, right) = opt((comp_op, ws(fixed_number))).parse(input)?;
     // 型注釈: (: Type)?
@@ -981,19 +960,13 @@ fn annotated_var_term(input: &str) -> PResult<'_, Term> {
         None => None,
     };
 
-    let (default_value, span) = match default_with_span {
-        Some((val, sp)) => (Some(val), Some(sp)),
-        None => (
-            None,
-            Some(SrcSpan {
-                start: var_name_span.end,
-                end: var_name_span.end,
-                file_id: 0,
-            }),
-        ),
-    };
+    let span = Some(SrcSpan {
+        start: var_name_span.end,
+        end: var_name_span.end,
+        file_id: 0,
+    });
 
-    if min.is_none() && max.is_none() && default_value.is_none() && type_annotation.is_none() {
+    if min.is_none() && max.is_none() && type_annotation.is_none() {
         Ok((input, var_with_span(name, var_name_span)))
     } else {
         Ok((
@@ -1001,7 +974,7 @@ fn annotated_var_term(input: &str) -> PResult<'_, Term> {
             Term::Var {
                 name,
                 scope: (),
-                default_value,
+                default_value: None,
                 min,
                 max,
                 span,
@@ -1641,18 +1614,13 @@ pub fn substitute_query_params(
 
 fn substitute_term(term: &Term, values: &std::collections::HashMap<String, f64>) -> Term {
     match term {
-        Term::Var {
-            name, min, max, span, ..
-        } if name != "_" => {
+        Term::Var { name, span, .. } if name != "_" => {
             if let Some(&val) = values.get(name) {
-                Term::Var {
-                    name: name.clone(),
-                    scope: (),
-                    default_value: Some(crate::rational::Rational::from_f64(val)),
-                    min: min.clone(),
-                    max: max.clone(),
+                // slider 値を直接 Number に置き換える。
+                // (旧 X@N 経路は廃止。LANG_SPEC §1.5)
+                Term::Number {
+                    value: crate::rational::Rational::from_f64(val),
                     span: *span,
-                    type_annotation: None,
                 }
             } else {
                 term.clone()
@@ -1892,29 +1860,9 @@ mod tests {
         assert!(clause_parser(src).is_err());
     }
 
-    #[test]
-    fn parse_default_var() {
-        let src = "hoge(X@25).";
-        let (_, clause) = clause_parser(src).unwrap();
-
-        match clause {
-            Clause::Fact { head: term, .. } => match &term {
-                Term::Struct { args, .. } => match &args[0] {
-                    Term::Var {
-                        name,
-                        default_value,
-                        ..
-                    } => {
-                        assert_eq!(name, "X");
-                        assert_eq!(*default_value, Some(crate::rational::Rational::from_integer(25)));
-                    }
-                    _ => panic!("Expected Var"),
-                },
-                _ => panic!("Expected Struct"),
-            },
-            _ => panic!("Expected Fact"),
-        }
-    }
+    // X@N default annotation は LANG_SPEC §1.5 で廃止。parse_default_var / _decimal /
+    // parse_annotated_var_with_default_and_range_in_body / _inclusive_range_in_body は
+    // 機能と共に削除。
 
     #[test]
     fn parse_fixed_point_integer() {
@@ -1961,26 +1909,6 @@ mod tests {
         assert_eq!(format!("{}", crate::rational::Rational::from_ratio(10001, 100)), "100.01");
         assert_eq!(format!("{}", crate::rational::Rational::from_ratio(350, 100)), "3.5");
         assert_eq!(format!("{}", crate::rational::Rational::from_ratio(-350, 100)), "-3.5");
-    }
-
-    #[test]
-    fn parse_default_var_decimal() {
-        let src = "hoge(X@2.5).";
-        let (_, clause) = clause_parser(src).unwrap();
-        match clause {
-            Clause::Fact { head: Term::Struct { args, .. }, .. } => match &args[0] {
-                Term::Var {
-                    name,
-                    default_value,
-                    ..
-                } => {
-                    assert_eq!(name, "X");
-                    assert_eq!(*default_value, Some(crate::rational::Rational::from_ratio(250, 100)));
-                }
-                _ => panic!("Expected Var"),
-            },
-            _ => panic!("Expected Fact"),
-        }
     }
 
     #[test]
@@ -2081,66 +2009,44 @@ mod tests {
     }
 
     #[test]
-    fn parse_annotated_var_with_default_and_range_in_body() {
-        let src = "hoge(X@20) :- 0<X<50, cube(X).";
+    fn parse_range_only_in_body() {
+        // 旧 parse_annotated_var_with_default_and_range_in_body から @20 を外したもの。
+        let src = "hoge(X) :- 0<X<50, cube(X).";
         let (_, clause) = clause_parser(src).unwrap();
-
         match clause {
-            Clause::Rule { head, body, .. } => {
-                match &head {
-                    Term::Struct { args, .. } => match &args[0] {
-                        Term::Var {
-                            name,
-                            default_value,
-                            ..
-                        } => {
-                            assert_eq!(name, "X");
-                            assert_eq!(*default_value, Some(crate::rational::Rational::from_integer(20)));
-                        }
-                        _ => panic!("Expected Var"),
-                    },
-                    _ => panic!("Expected Struct"),
+            Clause::Rule { body, .. } => match &body[0] {
+                Term::Var {
+                    name, min, max, ..
+                } => {
+                    assert_eq!(name, "X");
+                    assert_eq!(
+                        *min,
+                        Some(Bound {
+                            value: crate::rational::Rational::from_integer(0),
+                            inclusive: false
+                        })
+                    );
+                    assert_eq!(
+                        *max,
+                        Some(Bound {
+                            value: crate::rational::Rational::from_integer(50),
+                            inclusive: false
+                        })
+                    );
                 }
-                match &body[0] {
-                    Term::Var {
-                        name, min, max, ..
-                    } => {
-                        assert_eq!(name, "X");
-                        assert_eq!(
-                            *min,
-                            Some(Bound {
-                                value: crate::rational::Rational::from_integer(0),
-                                inclusive: false
-                            })
-                        );
-                        assert_eq!(
-                            *max,
-                            Some(Bound {
-                                value: crate::rational::Rational::from_integer(50),
-                                inclusive: false
-                            })
-                        );
-                    }
-                    _ => panic!("Expected Var"),
-                }
-            }
+                _ => panic!("Expected Var"),
+            },
             _ => panic!("Expected Rule"),
         }
     }
 
     #[test]
-    fn parse_annotated_var_inclusive_range_in_body() {
-        let src = "hoge(X@20) :- 0<=X<=50, cube(X).";
+    fn parse_inclusive_range_in_body() {
+        let src = "hoge(X) :- 0<=X<=50, cube(X).";
         let (_, clause) = clause_parser(src).unwrap();
-
         match clause {
             Clause::Rule { body, .. } => match &body[0] {
-                Term::Var {
-                    name,
-                    min,
-                    max,
-                    ..
-                } => {
+                Term::Var { name, min, max, .. } => {
                     assert_eq!(name, "X");
                     assert!(min.as_ref().unwrap().inclusive);
                     assert!(max.as_ref().unwrap().inclusive);
@@ -2171,7 +2077,7 @@ mod tests {
         values.insert("X".to_string(), 5.0);
         values.insert("Y".to_string(), 10.0);
         let substituted = substitute_query_params(&terms, &values);
-        assert_eq!(format!("{:?}", substituted), "[main(X@5, Y@10)]");
+        assert_eq!(format!("{:?}", substituted), "[main(5, 10)]");
     }
 
     #[test]

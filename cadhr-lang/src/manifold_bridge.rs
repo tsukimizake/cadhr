@@ -2830,14 +2830,16 @@ mod tests {
 
     #[test]
     fn test_control_shared_var_with_geometry() {
+        // 旧 X@10 を `X = 10` の明示的 Eq goal で書き換え。X は control3d と extrude の
+        // 両方で参照され、unify 経由で値が伝播する。
         let mut resolved = execute_main_args(
-            "main(L) :- L = [linear_extrude(rotateToXY(sketch(p2(0, 0), [line_to(p2(0, 40)), line_to(p2(30, 0))])), X@10), control3d(p3(X, 0, 0), \"width\")].",
+            "main(L) :- X = 10, L = [linear_extrude(rotateToXY(sketch(p2(0, 0), [line_to(p2(0, 40)), line_to(p2(30, 0))])), X), control3d(p3(X, 0, 0), \"width\")].",
         );
         let cps = extract_control_points(&mut resolved, &Default::default());
 
         assert_eq!(cps.len(), 1);
         assert_eq!(cps[0].name.as_deref(), Some("width"));
-        // X=10 のデフォルト値がcontrolにも伝播
+        // X=10 が control にも伝播
         assert_eq!(cps[0].x.value, 10.0);
         // 残りのgeometryでメッシュ生成が成功する
         assert_eq!(resolved.len(), 1);
@@ -3005,11 +3007,12 @@ mod tests {
     #[test]
     fn test_control_2d_unify_multi_reference_with_range() {
         let mut resolved = execute_main_args(
-            "inner(CENTER, M) :- M = sketch(p2(0,0), [line_to(p2(XIN@14.6,0)), line_to(p2(XIN,INNERLEN@49.8)), line_to(p2(0,INNERLEN))])
+            "inner(CENTER, M) :- XIN = 14.6, INNERLEN = 49.8,
+              M = sketch(p2(0,0), [line_to(p2(XIN,0)), line_to(p2(XIN,INNERLEN)), line_to(p2(0,INNERLEN))])
                 |> center2d(CENTER).
-             battery_box(M, C) :-
+             battery_box(M, C) :- X = 20, Y = 58,
                inner(CENTER, INNER),
-               M = (((sketch(p2(0,0), [line_to(p2(X@20,0)), line_to(p2(X,Y@58)), line_to(p2(0,Y))]) |> center2d(CENTER))
+               M = (((sketch(p2(0,0), [line_to(p2(X,0)), line_to(p2(X,Y)), line_to(p2(0,Y))]) |> center2d(CENTER))
                      - INNER) |> rotateToYZ |> linear_extrude(20))
                     + (INNER |> rotateToYZ |> linear_extrude(2)),
                C = control2d(-100<CENTER<100).
@@ -3032,11 +3035,12 @@ mod tests {
     #[test]
     fn test_control_2d_unify_multi_reference_mesh_generation() {
         let mut resolved = execute_main_args(
-            "inner(CENTER, M) :- M = sketch(p2(0,0), [line_to(p2(XIN@14.6,0)), line_to(p2(XIN,INNERLEN@49.8)), line_to(p2(0,INNERLEN))])
+            "inner(CENTER, M) :- XIN = 14.6, INNERLEN = 49.8,
+              M = sketch(p2(0,0), [line_to(p2(XIN,0)), line_to(p2(XIN,INNERLEN)), line_to(p2(0,INNERLEN))])
                 |> center2d(CENTER).
-             battery_box(M, C) :-
+             battery_box(M, C) :- X = 20, Y = 58,
                inner(CENTER, INNER),
-               M = (((sketch(p2(0,0), [line_to(p2(X@20,0)), line_to(p2(X,Y@58)), line_to(p2(0,Y))]) |> center2d(CENTER))
+               M = (((sketch(p2(0,0), [line_to(p2(X,0)), line_to(p2(X,Y)), line_to(p2(0,Y))]) |> center2d(CENTER))
                      - INNER) |> rotateToYZ |> linear_extrude(20))
                     + (INNER |> rotateToYZ |> linear_extrude(2)),
                C = control2d(-100<CENTER<100).
@@ -3461,8 +3465,9 @@ mod tests {
 
     #[test]
     fn test_center3d_with_control() {
+        // 旧 X@0 / Y@0 / Z@0 を明示的 Eq goal で書き換え。
         let mut resolved = execute_main_args(
-            "main(L) :- L = [control3d(p3(X@0, Y@0, Z@0)), cube(10,10,10) |> center3d(p3(X, Y, Z))].",
+            "main(L) :- X = 0, Y = 0, Z = 0, L = [control3d(p3(X, Y, Z)), cube(10,10,10) |> center3d(p3(X, Y, Z))].",
         );
         let cps = extract_control_points(&mut resolved, &Default::default());
         assert_eq!(cps.len(), 1);

@@ -392,104 +392,13 @@ impl CadhrError for RewriteError {
     }
 }
 
-fn collect_default_var_bindings(
-    term: &ScopedTerm,
-    bindings: &mut Vec<(String, ScopeId, crate::rational::Rational)>,
-) {
-    match term {
-        Term::Var {
-            name,
-            scope,
-            default_value: Some(value),
-            ..
-        } if name != "_" => {
-            bindings.push((name.clone(), *scope, value.clone()));
-        }
-        Term::Var { .. } => {}
-        Term::StringLit { .. } => {}
-        Term::Number { .. } => {}
-        Term::Struct { args, .. } => {
-            for arg in args {
-                collect_default_var_bindings(arg, bindings);
-            }
-        }
-        Term::List { items, tail } => {
-            for item in items {
-                collect_default_var_bindings(item, bindings);
-            }
-            if let Some(t) = tail {
-                collect_default_var_bindings(t, bindings);
-            }
-        }
-        Term::InfixExpr { left, right, .. } => {
-            collect_default_var_bindings(left, bindings);
-            collect_default_var_bindings(right, bindings);
-        }
-        Term::Eq { left, right } => {
-            collect_default_var_bindings(left, bindings);
-            collect_default_var_bindings(right, bindings);
-        }
-        Term::FieldAccess { record, .. } => {
-            collect_default_var_bindings(record, bindings);
-        }
-        Term::Record { fields, .. } => {
-            for (_, v) in fields {
-                collect_default_var_bindings(v, bindings);
-            }
-        }
-    }
-}
-
-fn apply_default_var_bindings(term: &mut ScopedTerm, goals: &mut Vec<ScopedTerm>) {
-    let mut bindings = Vec::new();
-    collect_default_var_bindings(term, &mut bindings);
-    let mut env = ScopedEnv::new();
-    for (name, scope, value) in bindings {
-        env.insert(scope, name, number(value));
-    }
-    *term = resolve(term, &env);
-    for goal in goals.iter_mut() {
-        *goal = resolve(goal, &env);
-    }
-}
-
-/// term に含まれる @-default を `targets` の各項に反映させる。
-/// rewrite_term_recursive 内の apply_default_var_bindings は other_goals にしか伝播しないので、
-/// 同じルール本体の未処理 body 項に @-default を波及させたい時はこのヘルパーを使う。
-fn propagate_defaults_to(term: &ScopedTerm, targets: &mut [ScopedTerm]) {
-    let mut bindings = Vec::new();
-    collect_default_var_bindings(term, &mut bindings);
-    if bindings.is_empty() {
-        return;
-    }
-    let mut env = ScopedEnv::new();
-    for (name, scope, value) in bindings {
-        env.insert(scope, name, number(value));
-    }
-    for t in targets.iter_mut() {
-        *t = resolve(t, &env);
-    }
-}
-
-/// body 全体から @-default を集めて、全 body 項に反映する。
-/// Eq ゴールが split_and_resolve_eq_goals で先に処理される前に、別 goal で宣言された
-/// `W@5` のような default を Eq の右辺に行き渡らせる必要があるため。
-fn propagate_defaults_across_body(body: &mut [ScopedTerm]) {
-    let mut bindings = Vec::new();
-    for t in body.iter() {
-        collect_default_var_bindings(t, &mut bindings);
-    }
-    if bindings.is_empty() {
-        return;
-    }
-    let mut env = ScopedEnv::new();
-    for (name, scope, value) in bindings {
-        env.insert(scope, name, number(value));
-    }
-    for t in body.iter_mut() {
-        *t = resolve(t, &env);
-    }
-}
+// X@N default annotation (LANG_SPEC §1.5 で廃止) 用の helper をすべて削除:
+//   - collect_default_var_bindings
+//   - apply_default_var_bindings
+//   - propagate_defaults_to
+//   - propagate_defaults_across_body
+//   - lower_default_annotations / collect_default_annotations / strip_default_annotations
+//   - LoweredAnnotation
 
 /// Number と InfixExpr だけで構成された算術式を畳み込む。
 /// Var は処理しない。unify の Var ハンドラが名前ベースの置換を伴って処理するため、
@@ -1754,8 +1663,7 @@ fn rewrite_term_recursive(
     other_goals: &mut Vec<ScopedTerm>,
     shared_env: &mut ScopedEnv,
 ) -> Result<Vec<ScopedTerm>, RewriteError> {
-    let mut term = term;
-    apply_default_var_bindings(&mut term, other_goals);
+    let term = term;
 
     // assert_eq(Expected, Actual) / assert_eq(Expected, Actual, "label"):
     // 両辺を数値に評価して比較。一致なら成功（結果空）、不一致なら RewriteError。
@@ -1841,10 +1749,6 @@ fn rewrite_term_recursive(
             };
             return Ok(vec![resolved_term]);
         } else {
-            // 全 body 項を見て @-default を相互伝播。Eq が先に split されて単体処理されるため、
-            // 他の body 項に書かれた `X@N` を Eq 側に行き渡らせておく必要がある。
-            let mut body = body;
-            propagate_defaults_across_body(&mut body);
             // Rule にマッチ: body を走らせるが戻り値は捨てる。返り値は head 単一化された
             // resolved_term。body 評価の効果は env への束縛追加のみ:
             //   - Eq ゴール (`X = ...`) が shared_env に束縛を入れる
@@ -1868,11 +1772,6 @@ fn rewrite_term_recursive(
 
             while let Some(b) = remaining_body.first().cloned() {
                 remaining_body.remove(0);
-
-                // b に含まれる @-default を未処理の body 項にも事前伝播。
-                // rewrite_term_recursive 内の apply_default_var_bindings は other_goals に
-                // しか伝播しないため、ここで明示的に行う必要がある。
-                propagate_defaults_to(&b, &mut remaining_body);
 
                 let _ = rewrite_term_recursive(
                     db,
@@ -2122,205 +2021,11 @@ fn resolve_builtin_fact_args(
     })
 }
 
-/// Body 内に集めた `@-default` 注釈情報。lowering で Eq goal と Var 復元に使う。
-struct LoweredAnnotation {
-    value: crate::rational::Rational,
-    value_span: Option<SrcSpan>,
-    min: Option<Bound>,
-    max: Option<Bound>,
-    var_span: Option<SrcSpan>,
-}
-
-/// `Var@N` 注釈を `Var = N` の Eq goal として body 先頭に注入し、Var 側の
-/// `default_value` を剥がす。`X@N` を「外側の `X = N` を書くシンタックスシュガー」
-/// として実装するのが意図。
-///
-/// - 同一名で異なる default が body 内に複数あればエラー
-/// - 同一名で同じ default が複数あれば、最初の値・最初の min/max/span を採用
-/// - Eq の RHS の `Number` には元の `@N` リテラル位置の span を継承させ、
-///   control point write-back 経路 (Number.span 経由) が動くようにする
-/// - `min` / `max` 注釈はそのまま Eq の LHS の Var に残す (range check 維持)
-pub fn lower_default_annotations(body: &mut Vec<Term>) -> Result<(), RewriteError> {
-    let mut collected: HashMap<String, LoweredAnnotation> = HashMap::new();
-    if let Err((name, existing, new_val, term)) =
-        collect_default_annotations(body, &mut collected)
-    {
-        let mut dummy_env = ScopedEnv::new();
-        return Err(RewriteError {
-            message: format!(
-                "variable `{}` has conflicting default annotations: {} vs {}",
-                name, existing, new_val
-            ),
-            goal: assign_scope_to_term(term, 0, &mut dummy_env),
-        });
-    }
-
-    if collected.is_empty() {
-        return Ok(());
-    }
-
-    for term in body.iter_mut() {
-        strip_default_annotations(term);
-    }
-
-    let mut eq_goals: Vec<Term> = Vec::with_capacity(collected.len());
-    for (name, info) in collected {
-        eq_goals.push(Term::Eq {
-            left: Box::new(Term::Var {
-                name,
-                scope: (),
-                default_value: None,
-                min: info.min,
-                max: info.max,
-                span: info.var_span,
-                type_annotation: None,
-            }),
-            right: Box::new(Term::Number {
-                value: info.value,
-                span: info.value_span,
-            }),
-        });
-    }
-
-    let original = std::mem::take(body);
-    body.extend(eq_goals);
-    body.extend(original);
-    Ok(())
-}
-
-fn collect_default_annotations(
-    body: &[Term],
-    collected: &mut HashMap<String, LoweredAnnotation>,
-) -> Result<(), (String, crate::rational::Rational, crate::rational::Rational, Term)> {
-    for term in body {
-        collect_default_annotations_in_term(term, collected)?;
-    }
-    Ok(())
-}
-
-fn collect_default_annotations_in_term(
-    term: &Term,
-    collected: &mut HashMap<String, LoweredAnnotation>,
-) -> Result<(), (String, crate::rational::Rational, crate::rational::Rational, Term)> {
-    match term {
-        Term::Var {
-            name,
-            default_value: Some(value),
-            min,
-            max,
-            span,
-            ..
-        } if name != "_" => match collected.get_mut(name) {
-            Some(existing) => {
-                if existing.value != *value {
-                    return Err((
-                        name.clone(),
-                        existing.value.clone(),
-                        value.clone(),
-                        term.clone(),
-                    ));
-                }
-                if existing.min.is_none() {
-                    existing.min = min.clone();
-                }
-                if existing.max.is_none() {
-                    existing.max = max.clone();
-                }
-                if existing.var_span.is_none() {
-                    existing.var_span = *span;
-                }
-                if existing.value_span.is_none() {
-                    existing.value_span = *span;
-                }
-            }
-            None => {
-                collected.insert(
-                    name.clone(),
-                    LoweredAnnotation {
-                        value: value.clone(),
-                        value_span: *span,
-                        min: min.clone(),
-                        max: max.clone(),
-                        var_span: *span,
-                    },
-                );
-            }
-        },
-        Term::Var { .. } | Term::Number { .. } | Term::StringLit { .. } => {}
-        Term::Struct { args, .. } => {
-            for a in args {
-                collect_default_annotations_in_term(a, collected)?;
-            }
-        }
-        Term::List { items, tail } => {
-            for it in items {
-                collect_default_annotations_in_term(it, collected)?;
-            }
-            if let Some(t) = tail {
-                collect_default_annotations_in_term(t, collected)?;
-            }
-        }
-        Term::InfixExpr { left, right, .. } => {
-            collect_default_annotations_in_term(left, collected)?;
-            collect_default_annotations_in_term(right, collected)?;
-        }
-        Term::Eq { left, right } => {
-            collect_default_annotations_in_term(left, collected)?;
-            collect_default_annotations_in_term(right, collected)?;
-        }
-        Term::FieldAccess { record, .. } => {
-            collect_default_annotations_in_term(record, collected)?;
-        }
-        Term::Record { fields, .. } => {
-            for (_, v) in fields {
-                collect_default_annotations_in_term(v, collected)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn strip_default_annotations(term: &mut Term) {
-    match term {
-        Term::Var {
-            name,
-            default_value,
-            ..
-        } if name != "_" => {
-            *default_value = None;
-        }
-        Term::Var { .. } | Term::Number { .. } | Term::StringLit { .. } => {}
-        Term::Struct { args, .. } => {
-            for a in args.iter_mut() {
-                strip_default_annotations(a);
-            }
-        }
-        Term::List { items, tail } => {
-            for it in items.iter_mut() {
-                strip_default_annotations(it);
-            }
-            if let Some(t) = tail.as_mut() {
-                strip_default_annotations(t);
-            }
-        }
-        Term::InfixExpr { left, right, .. } => {
-            strip_default_annotations(left);
-            strip_default_annotations(right);
-        }
-        Term::Eq { left, right } => {
-            strip_default_annotations(left);
-            strip_default_annotations(right);
-        }
-        Term::FieldAccess { record, .. } => {
-            strip_default_annotations(record);
-        }
-        Term::Record { fields, .. } => {
-            for (_, v) in fields.iter_mut() {
-                strip_default_annotations(v);
-            }
-        }
-    }
-}
+// X@N default annotation lowering (LANG_SPEC §1.5 で廃止) を削除:
+//   - LoweredAnnotation struct
+//   - lower_default_annotations
+//   - collect_default_annotations / collect_default_annotations_in_term
+//   - strip_default_annotations
 
 /// 用途: desugar 中の構造的エラー。呼出元で `RewriteError` にラップする。
 #[derive(Debug, Clone)]
@@ -2444,17 +2149,8 @@ pub fn execute(
     let mut db_with_builtins = db.to_vec();
     db_with_builtins.extend(builtin_cad_facts());
 
-    // 全 rule body と query を `Var@N` → `Var = N` の Eq goal に展開してから実行。
-    // これにより `@N` が InfixExpr の中に直接埋まっているケースでも、外側に `X = N`
-    // と書いたのと同じ伝播経路に乗る。
-    for clause in db_with_builtins.iter_mut() {
-        if let Clause::Rule { body, .. } = clause {
-            lower_default_annotations(body)?;
-        }
-    }
-    lower_default_annotations(&mut query)?;
-
-    // record decl テーブルを db から抽出。make_NAME builtin の引数解決に使う。
+    // X@N default annotation は廃止済み (LANG_SPEC §1.5)。
+    // record decl テーブルを db から抽出。Term::Record / Term::FieldAccess の処理で参照する。
     let record_decls = extract_record_decls(&db_with_builtins);
 
     // 新仕様 `Term::Record { ... }` を decl 順の `Term::Struct` に desugar。
@@ -2763,32 +2459,7 @@ mod tests {
         assert_eq!(resolved, vec!["f(5)"]);
     }
 
-    #[test]
-    fn default_var_matches_annotated_value() {
-        // `X@25` は `X = 25` のシンタックスシュガーとして body に展開され、X は数値 25 に解決される。
-        let resolved = run_success("f(25).", "f(X@25).");
-        assert_eq!(resolved, vec!["f(25)"]);
-    }
-
-    #[test]
-    fn default_var_conflict_fails() {
-        run_failure("f(30).", "f(X@25).");
-    }
-
-    #[test]
-    fn default_var_propagates_within_rule_body() {
-        // W@5 / X@25 はそれぞれ W = 5 / X = 25 として lowering され、出力上は数値に置換される。
-        let resolved = run_success(
-            "cut(W, MODEL) :- MODEL = cube(W, 50, 260). main(MODEL) :- cut(W@5, CUT), MODEL = cube(X@25, 50, 300) - (CUT |> translate(p3(0, 0, 0), p3(X / 2 - W, 0, 0))).",
-            "main(M).",
-        );
-        assert_eq!(
-            resolved,
-            vec![
-                "main((cube(25, 50, 300) - translate(cube(5, 50, 260), p3(0, 0, 0), p3(7.5, 0, 0))))"
-            ]
-        );
-    }
+    // X@N default annotation は LANG_SPEC §1.5 で廃止。default_var_* テスト 3 件を削除。
 
     // ===== basic fact tests =====
 
@@ -3304,11 +2975,13 @@ mod tests {
 
     #[test]
     fn rule_body_with_constraints_does_not_panic() {
-        // 再帰中の制約解消で temp_other_goals が縮むケース + 本体内サブゴール展開時に
-        // @-default が constraint に伝播するケースをまとめてカバーする。
+        // 再帰中の制約解消で temp_other_goals が縮むケース + 本体内サブゴール展開時の
+        // constraint 伝播をまとめてカバーする。元々 X@20 / Y@18 / OUTLEN@58 だった
+        // @-default は明示的 Eq goal `X = 20, Y = 18, OUTLEN = 58` に書き換えている。
         let db_src = "\
 main :- battery_box.\n\
-battery_box :- ((cube(X@20, Y@18, OUTLEN@58)\n\
+battery_box :- X = 20, Y = 18, OUTLEN = 58,\n\
+                ((cube(X, Y, OUTLEN)\n\
                 - wire_hole(X/2, WH_Y1, 0)\n\
                 - wire_hole(X/2, WH_Y2, 0)\n\
                 ) |> translate(p3(0, 0, 0), p3(0-X/2, 0-Y/2, 0))),\n\
@@ -3379,10 +3052,12 @@ wire_hole(X, Y, H) :- cylinder(0.4, 20) |> translate(p3(0, 0, 0), p3(X, Y, H)).\
 
     /// body で構造体を変数に束縛し、後続の `=` で各フィールドを取り出せる。
     /// 機構ライブラリで `G = gp(_, M, Z, _, _, _, _)` のように歯車のフィールド分解に使う。
+    /// (旧 @N 注釈は明示的 Eq goal に書き換えた)
     #[test]
     fn body_eq_unifies_structs() {
         let mut db = database(
-            "test(MODEL) :- G = gp(g1, 1, 20, X@10, Y@20, T@5, 5),\n\
+            "test(MODEL) :- X = 10, Y = 20, T = 5,\n\
+                            G = gp(g1, 1, 20, X, Y, T, 5),\n\
                             G = gp(_, M, Z, _, _, _, _),\n\
                             MODEL = cube(M, Z, T).",
         )
@@ -3486,192 +3161,16 @@ test(B, C) :- constrain([item(a, 3), item(b, B), item(c, C)]).\n";
         );
     }
 
-    /// 範囲注釈付きデフォルトの線形伝播: body 局所の T1 に範囲 + default 0 を与え、
-    /// `T2 = 0 - T1` を介して T2 = 0 が伝播する。`@N` は `X = N` のシンタックスシュガー
-    /// として lowering されるため、`T1 @ 0` は `T1 = 0` と同じ意味になる。
-    #[test]
-    fn range_annotated_default_propagates_linearly() {
-        let db_src = "test(MODEL) :- -180 < T1 @ 0 < 180,\n\
-                                     T2 = 0 - T1,\n\
-                                     MODEL = cylinder(5, T2).\n";
-        let mut db = database(db_src).expect("parse db");
-        let q = query("test(M).").expect("parse query").1;
-        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
-        let strs: Vec<String> = resolved.iter().map(|t| format!("{:?}", t)).collect();
-        assert_eq!(strs, vec!["test(cylinder(5, 0))"]);
-    }
-
-    /// `@N` は `X = N` のシンタックスシュガーなので、head 経由で別の値に縛られている
-    /// 変数に body で `@N` を付けると衝突して失敗する。
-    #[test]
-    fn head_var_annotated_in_body_conflicts_with_caller() {
-        let db_src = "test(T1, MODEL) :- -180 < T1 @ 0 < 180,\n\
-                                          MODEL = cylinder(5, T1).\n";
-        let mut db = database(db_src).expect("parse db");
-        let q = query("test(30, M).").expect("parse query").1;
-        let result = execute(&mut db, q);
-        assert!(
-            result.is_err(),
-            "expected conflict between caller T1=30 and body annotation T1@0, got {:?}",
-            result
-        );
-    }
-
-    /// `@N` 付き Var が InfixExpr の内部に埋まっているケースでも、`X = N` の
-    /// シンタックスシュガーとして展開されて算術式が評価できる。
-    /// (`line_to(p2(HOOK_L - HOOK_LEN@4, ...))` のような実用パターン)
-    #[test]
-    fn annotation_inside_infix_expr_resolves() {
-        let resolved = run_success(
-            "test(MODEL) :- MODEL = cube(HOOK_L@13 - HOOK_LEN@4, 50, 60).",
-            "test(M).",
-        );
-        assert_eq!(resolved, vec!["test(cube(9, 50, 60))"]);
-    }
-
-    /// 深いネスト位置 (sketch の line_to の p() の中) でも @N が解決される。
-    #[test]
-    fn annotation_inside_deeply_nested_struct() {
-        let resolved = run_success(
-            "test(MODEL) :- MODEL = sketch(p2(0, 0), [line_to(p2(X@10, Y@20)), line_to(p2(X - W@3, Y))]).",
-            "test(M).",
-        );
-        assert_eq!(
-            resolved,
-            vec!["test(sketch(p2(0, 0), [line_to(p2(10, 20)), line_to(p2(7, 20))]))"]
-        );
-    }
-
-    /// 同じ名前に異なる @default 値を付けると衝突エラーになる。
-    #[test]
-    fn conflicting_annotations_in_same_body_fail() {
-        let mut db = database("test(MODEL) :- MODEL = cube(X@10, X@20, 30).")
-            .expect("parse db");
-        let q = query("test(M).").expect("parse query").1;
-        let result = execute(&mut db, q);
-        assert!(
-            result.is_err(),
-            "expected conflict between X@10 and X@20, got {:?}",
-            result
-        );
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("conflicting default annotations"),
-            "expected conflict error message, got: {}",
-            err_msg
-        );
-    }
-
-    /// 同じ名前・同じ default 値を複数箇所に書くのは OK。
-    #[test]
-    fn duplicate_same_annotation_ok() {
-        let resolved = run_success(
-            "test(MODEL) :- MODEL = cube(X@10, X@10, X@10).",
-            "test(M).",
-        );
-        assert_eq!(resolved, vec!["test(cube(10, 10, 10))"]);
-    }
-
-    /// `0 < X@5 < 10` のように range 付きの @default も Eq goal lowering 後に
-    /// min/max 制約が維持される (= 範囲外の caller value を弾く)。
-    #[test]
-    fn range_annotation_preserved_after_lowering() {
-        // Body 内で `0 < X@5 < 10` と書き、X は body 局所なので 5 に解決される。
-        let resolved = run_success(
-            "test(MODEL) :- 0 < X@5 < 10, MODEL = cube(X, X, X).",
-            "test(M).",
-        );
-        assert_eq!(resolved, vec!["test(cube(5, 5, 5))"]);
-    }
-
-    /// ユーザーの実コード相当: `xz` の sketch 内に `HOOK_LEN@4` などの注釈付き
-    /// 変数が InfixExpr の中に直接書かれているケース。lowering 経由で全て数値に
-    /// 解決される。
-    #[test]
-    fn user_code_pattern_xz_sketch_resolves() {
-        let resolved = run_success(
-            "xz(X_OUTER, Z_OUTER, MODEL) :- \
-               HOOK_L = 13, HOOK_W = 7, HOOK_R = HOOK_L + HOOK_W, \
-               MODEL = sketch(p2(2, 0), [\
-                 line_to(p2(X_OUTER, 0)), \
-                 line_to(p2(X_OUTER, TOP_Z@7)), \
-                 line_to(p2(HOOK_R, TOP_Z)), \
-                 line_to(p2(HOOK_R, Z_OUTER)), \
-                 line_to(p2(HOOK_L, Z_OUTER)), \
-                 line_to(p2(HOOK_L - HOOK_LEN@4, Z_OUTER)), \
-                 line_to(p2(HOOK_L - HOOK_LEN, Z_OUTER - HOOK_WIDTH@3)), \
-                 line_to(p2(HOOK_L, Z_OUTER - HOOK_WIDTH)), \
-                 line_to(p2(HOOK_L, TOP_Z)), \
-                 line_to(p2(LOW_W@12, LOW_H@2)), \
-                 line_to(p2(2, LOW_H))\
-               ]).",
-            "xz(80, 15, M).",
-        );
-        // 期待値: 全ての @N 注釈付き変数が解決され、p(...) の座標が全て数値になる。
-        assert_eq!(
-            resolved,
-            vec![
-                "xz(80, 15, sketch(p2(2, 0), [\
-                    line_to(p2(80, 0)), \
-                    line_to(p2(80, 7)), \
-                    line_to(p2(20, 7)), \
-                    line_to(p2(20, 15)), \
-                    line_to(p2(13, 15)), \
-                    line_to(p2(9, 15)), \
-                    line_to(p2(9, 12)), \
-                    line_to(p2(13, 12)), \
-                    line_to(p2(13, 7)), \
-                    line_to(p2(12, 2)), \
-                    line_to(p2(2, 2))\
-                  ]))"
-            ]
-        );
-    }
-
-    /// Eq goal lowering で挿入された Number は、元の `@N` リテラル位置の span を
-    /// 継承する。これにより control point の write-back が `@N` の `N` 部分を
-    /// 正しく書き換えられる。
-    #[test]
-    fn lowering_propagates_span_from_annotation_to_number() {
-        let db_src = "test(MODEL) :- MODEL = cube(X@10, X, X).";
-        let mut db = database(db_src).expect("parse db");
-        let q = query("test(M).").expect("parse query").1;
-        let (resolved, _) = execute(&mut db, q).expect("execute should succeed");
-        // resolved 中の最初の Number の span が元の `10` リテラルを指していることを確認。
-        fn find_first_number_span<S>(term: &Term<S>) -> Option<SrcSpan> {
-            match term {
-                Term::Number { span, .. } => *span,
-                Term::Struct { args, .. } => {
-                    for a in args {
-                        if let Some(s) = find_first_number_span(a) {
-                            return Some(s);
-                        }
-                    }
-                    None
-                }
-                Term::List { items, tail } => {
-                    for it in items {
-                        if let Some(s) = find_first_number_span(it) {
-                            return Some(s);
-                        }
-                    }
-                    tail.as_ref().and_then(|t| find_first_number_span(t))
-                }
-                Term::InfixExpr { left, right, .. } | Term::Eq { left, right } => {
-                    find_first_number_span(left).or_else(|| find_first_number_span(right))
-                }
-                _ => None,
-            }
-        }
-        let span = find_first_number_span(&resolved[0])
-            .expect("expected at least one Number with span in resolved result");
-        let snippet = &db_src[span.start..span.end];
-        assert_eq!(
-            snippet, "10",
-            "span should point to `10` in source, got `{}`",
-            snippet
-        );
-    }
+    // X@N default annotation (LANG_SPEC §1.5 で廃止) のテスト 9 件を削除:
+    //   range_annotated_default_propagates_linearly
+    //   head_var_annotated_in_body_conflicts_with_caller
+    //   annotation_inside_infix_expr_resolves
+    //   annotation_inside_deeply_nested_struct
+    //   conflicting_annotations_in_same_body_fail
+    //   duplicate_same_annotation_ok
+    //   range_annotation_preserved_after_lowering
+    //   user_code_pattern_xz_sketch_resolves
+    //   lowering_propagates_span_from_annotation_to_number
 
     /// `assert_eq(L, R)` は両辺が等しければ結果に何も残さず通過する。
     #[test]

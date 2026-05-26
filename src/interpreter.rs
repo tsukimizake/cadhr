@@ -255,19 +255,15 @@ pub fn run_mesh_job(params: MeshJobParams) -> MeshJobResult {
         infer_query_param_ranges(&query_terms, &db, &mut query_params)
             .map_err(|e| (format!("Range inference error: {}", e), None))?;
 
-        // range / default のいずれも持たない query Var は「出力束縛変数」
-        // (`main(OUT)` の OUT 等) とみなし、スライダー化しない。
-        // stale な override が残っていても適用せず、make_output 等の unify を壊さない。
-        query_params.retain(|p| {
-            p.default_value.is_some() || p.min.is_some() || p.max.is_some()
-        });
+        // range を持たない query Var は「出力束縛変数」 (`main(OUT)` の OUT 等)
+        // とみなし、スライダー化しない。stale な override が残っていても適用しない。
+        // (X@N default は LANG_SPEC §1.5 で廃止済み、min/max のみで判定)
+        query_params.retain(|p| p.min.is_some() || p.max.is_some());
 
         let mut values = HashMap::new();
         for param in &query_params {
             let val = if let Some(&v) = params.query_param_overrides.get(&param.name) {
                 v
-            } else if let Some(dv) = &param.default_value {
-                dv.to_f64()
             } else if let (Some(min), Some(max)) = (param.min.as_ref(), param.max.as_ref()) {
                 (min.value.to_f64() + max.value.to_f64()) / 2.0
             } else {
