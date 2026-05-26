@@ -79,6 +79,10 @@ pub enum MeshJobResult {
     Success {
         vertices: Vec<Vertex>,
         indices: Vec<u32>,
+        /// 将来的な raycast / node-tree UI 用に MeshGenerator から伝搬している。
+        /// 現状 main.rs / preview.rs は読まないが、`MeshGenerator::process` の
+        /// 出力をそのまま保持する形にしておくと組込みが楽。
+        #[allow(dead_code)]
         evaluated_nodes: Vec<EvaluatedNode>,
         control_points: Vec<ControlPoint>,
         bom_entries: Vec<BomEntry>,
