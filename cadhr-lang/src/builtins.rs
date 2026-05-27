@@ -307,6 +307,85 @@ pub fn registry() -> BuiltinRegistry {
             doc: "Sweep a 2D profile along a 2D path.",
             snippet: "sweep_extrude($1, $2)",
         })
+        // ----- Path segments (sketch / path の中身) -----
+        // sketch / path の `[line_to(...), bezier_to(...), ...]` の要素を表す。
+        // 戻り値の型は `Atom` で代用 (opaque) — list 要素として均質性さえ保たれれば
+        // 詳細な型は不要。
+        .add(Builtin {
+            name: "line_to",
+            params: vec![p2()],
+            return_ty: Type::Atom,
+            usage: "line_to(End: Point2D) -> PathSegment",
+            doc: "Straight-line path segment to End point.",
+            snippet: "line_to(p2($1))",
+        })
+        .add(Builtin {
+            name: "bezier_to",
+            params: vec![p2(), p2()],
+            return_ty: Type::Atom,
+            usage: "bezier_to(CP: Point2D, End: Point2D) -> PathSegment",
+            doc: "Quadratic Bézier path segment with 1 control point.",
+            snippet: "bezier_to(p2($1), p2($2))",
+        })
+        .add(Builtin {
+            name: "bezier_to",
+            params: vec![p2(), p2(), p2()],
+            return_ty: Type::Atom,
+            usage: "bezier_to(CP1: Point2D, CP2: Point2D, End: Point2D) -> PathSegment",
+            doc: "Cubic Bézier path segment with 2 control points.",
+            snippet: "bezier_to(p2($1), p2($2), p2($3))",
+        })
+        // ----- 2D profiles / paths -----
+        .add(Builtin {
+            name: "sketch",
+            params: vec![p2(), Type::list_of(Type::Atom)],
+            return_ty: s2(),
+            usage: "sketch(Start: Point2D, Segments: List(PathSegment)) -> Shape2D",
+            doc: "Closed 2D sketch profile. Auto-closes the last segment back to Start.",
+            snippet: "sketch(p2($1), [$2])",
+        })
+        .add(Builtin {
+            name: "path",
+            params: vec![p2(), Type::list_of(Type::Atom)],
+            return_ty: path(),
+            usage: "path(Start: Point2D, Segments: List(PathSegment)) -> Path2D",
+            doc: "Open 2D polyline for sweep_extrude.",
+            snippet: "path(p2($1), [$2])",
+        })
+        // ----- Control points (slider UI) -----
+        // 戻り値は Bool (goal-like; 純粋な値としては使われない)。
+        .add(Builtin {
+            name: "control2d",
+            params: vec![p2()],
+            return_ty: Type::Bool,
+            usage: "control2d(P: Point2D)",
+            doc: "Register a 2D draggable control point (z=0).",
+            snippet: "control2d(p2($1))",
+        })
+        .add(Builtin {
+            name: "control2d",
+            params: vec![p2(), str_()],
+            return_ty: Type::Bool,
+            usage: "control2d(P: Point2D, Name: String)",
+            doc: "Register a 2D draggable control point with a name.",
+            snippet: "control2d(p2($1), \"$2\")",
+        })
+        .add(Builtin {
+            name: "control3d",
+            params: vec![p3()],
+            return_ty: Type::Bool,
+            usage: "control3d(P: Point3D)",
+            doc: "Register a 3D draggable control point.",
+            snippet: "control3d(p3($1))",
+        })
+        .add(Builtin {
+            name: "control3d",
+            params: vec![p3(), str_()],
+            return_ty: Type::Bool,
+            usage: "control3d(P: Point3D, Name: String)",
+            doc: "Register a 3D draggable control point with a name.",
+            snippet: "control3d(p3($1), \"$2\")",
+        })
         // ----- I/O -----
         .add(Builtin {
             name: "stl",
@@ -315,6 +394,23 @@ pub fn registry() -> BuiltinRegistry {
             usage: "stl(Path: String) -> Shape3D",
             doc: "Import a mesh from an STL file (resolved at runtime).",
             snippet: "stl(\"$1\")",
+        })
+        // ----- Assertions -----
+        .add(Builtin {
+            name: "assert_eq",
+            params: vec![n(), n()],
+            return_ty: Type::Bool,
+            usage: "assert_eq(L: Number, R: Number)",
+            doc: "Assert L == R numerically. Mismatch raises a runtime error.",
+            snippet: "assert_eq($1, $2)",
+        })
+        .add(Builtin {
+            name: "assert_eq",
+            params: vec![n(), n(), str_()],
+            return_ty: Type::Bool,
+            usage: "assert_eq(L: Number, R: Number, Label: String)",
+            doc: "Assert L == R numerically; Label appears in the error message.",
+            snippet: "assert_eq($1, $2, \"$3\")",
         })
 }
 

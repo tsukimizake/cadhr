@@ -397,24 +397,38 @@ pub fn infer_term<S>(
             }
         }
         Term::Struct { functor, args, .. } => {
-            // builtin → user sig の順で探す。両方に無ければ MissingSignature。
-            let (params_template, ret_template) =
-                if let Some(b) = ctx.builtins.lookup(functor, args.len()) {
-                    (b.params.clone(), b.return_ty.clone())
-                } else if let Some((p, r)) = ctx.user_sigs.lookup(functor, args.len()) {
-                    (p.clone(), r.clone())
-                } else {
-                    return Err(TypeError::MissingSignature {
-                        context: format!("{}/{}", functor, args.len()),
-                    });
-                };
-            let (params, ret_ty) =
-                instantiate_signature(&params_template, &ret_template, ctx.var_gen);
-            for (arg, expected) in args.iter().zip(params.iter()) {
-                let actual = infer_term(arg, ctx)?;
-                unify(expected, &actual, ctx.subst)?;
+            // builtin → user sig の順で探す。両方に無ければ「シグネチャ未注釈の
+            // user predicate (legacy code)」と解釈し、各引数を再帰的に型推論
+            // (ネストした型エラーは捕捉) しつつ、戻り値型は fresh α を返す。
+            // typo はランタイムの "no clause matches" で catch されるため、
+            // typecheck はここで MissingSignature を出さない (best-effort モード)。
+            let sig_template = ctx
+                .builtins
+                .lookup(functor, args.len())
+                .map(|b| (b.params.clone(), b.return_ty.clone()))
+                .or_else(|| {
+                    ctx.user_sigs
+                        .lookup(functor, args.len())
+                        .map(|(p, r)| (p.clone(), r.clone()))
+                });
+            match sig_template {
+                Some((params_template, ret_template)) => {
+                    let (params, ret_ty) =
+                        instantiate_signature(&params_template, &ret_template, ctx.var_gen);
+                    for (arg, expected) in args.iter().zip(params.iter()) {
+                        let actual = infer_term(arg, ctx)?;
+                        unify(expected, &actual, ctx.subst)?;
+                    }
+                    Ok(ret_ty)
+                }
+                None => {
+                    // Unknown functor: arg を一通り推論しつつ fresh α を返す。
+                    for arg in args {
+                        let _ = infer_term(arg, ctx)?;
+                    }
+                    Ok(ctx.var_gen.fresh())
+                }
             }
-            Ok(ret_ty)
         }
         Term::Eq { left, right } => {
             let l = infer_term(left, ctx)?;
@@ -1287,7 +1301,10 @@ mod tests {
     }
 
     #[test]
-    fn infer_unknown_functor_errors_with_missing_sig() {
+    fn infer_unknown_functor_returns_fresh_var() {
+        // best-effort 型推論: 未注釈 user predicate (= builtins と user_sigs の
+        // どちらにも無い functor) は MissingSignature を出さず fresh α を返す。
+        // タイポ等のランタイムエラー catch は "no clause matches" 経由。
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
@@ -1295,7 +1312,7 @@ mod tests {
         let rd = RecordDeclTable::new();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         let t = struc::<()>("unknown_op".to_string(), vec![]);
-        let r = infer_term(&t, &mut ctx);
-        assert!(matches!(r, Err(TypeError::MissingSignature { .. })));
+        let ty = infer_term(&t, &mut ctx).unwrap();
+        assert!(matches!(ty, Type::Var(_)));
     }
 }
