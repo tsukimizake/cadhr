@@ -131,22 +131,22 @@ pub fn registry() -> BuiltinRegistry {
         "2 つの 3D 形状の凸包",
     ));
 
-    // -- Transform 3D
+    // -- Transform 3D (Shape3D を最後の引数にしてパイプフレンドリーに)
     let r = r.add(mono(
         "translate3d",
-        vec![shape3d(), point3d(), point3d()],
+        vec![point3d(), point3d(), shape3d()],
         shape3d(),
-        "Shape3D の点 src を点 dst に運ぶ",
+        "Shape3D の点 src を点 dst に運ぶ (`s |> translate3d src dst`)",
     ));
     let r = r.add(mono(
         "scale3d",
-        vec![shape3d(), point3d()],
+        vec![point3d(), shape3d()],
         shape3d(),
         "Shape3D を Point3D の各軸倍率で拡縮",
     ));
     let r = r.add(mono(
         "rotate3d",
-        vec![shape3d(), point3d()],
+        vec![point3d(), shape3d()],
         shape3d(),
         "Shape3D を Point3D の各軸回転角 (度) で回転",
     ));

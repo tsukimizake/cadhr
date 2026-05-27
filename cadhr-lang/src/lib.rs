@@ -4,5 +4,6 @@
 // 本クレートは LANG_SPEC.md に沿って Phase 1 (AST + Parser) から組み直す。
 
 pub mod diagnostic;
+pub mod runtime;
 pub mod sema;
 pub mod syntax;

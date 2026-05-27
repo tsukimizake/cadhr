@@ -9,5 +9,6 @@
 pub mod builtin;
 pub mod env;
 pub mod infer;
+pub mod slider;
 pub mod subst;
 pub mod ty;
