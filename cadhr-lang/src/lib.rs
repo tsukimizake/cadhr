@@ -1,25 +1,7 @@
-#[cfg(test)]
-#[macro_use]
-mod test_helpers;
+// cadhr-lang: Elm-like CAD DSL (under active reimplementation).
+//
+// 旧 Prolog ベースの実装は cadhr-lang/legacy_prolog/ に退避済み。
+// 本クレートは LANG_SPEC.md に沿って Phase 1 (AST + Parser) から組み直す。
 
-pub mod assertions;
-pub mod bezier;
-pub mod bom;
-pub mod builtins;
-pub mod collision;
-pub mod constraint;
-pub mod manifold_bridge;
-pub mod module;
-pub mod parse;
-pub mod rational;
-pub mod sweep;
-pub mod term_processor;
-pub mod term_rewrite;
-pub mod typecheck;
-pub mod types;
-
-/// 標準ライブラリ (`std/db.cadhr`) を探すための既定 include path。
-/// 現時点では開発用に CARGO_MANIFEST_DIR を返す。将来的に配布時の解決を考える必要あり。
-pub fn default_include_paths() -> Vec<std::path::PathBuf> {
-    vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]
-}
+pub mod diagnostic;
+pub mod syntax;

@@ -14,8 +14,10 @@ opt-level = 3
 [workspace]
 members = [
     "cadhr-lang",
-    "cadhr-lsp",
-    "tree-sitter-cadhr-lang",
+    # cadhr-lsp / tree-sitter-cadhr-lang は新仕様 (Elm-like) 対応中。
+    # Phase 7 / Phase 8 で復活させる。
+    # "cadhr-lsp",
+    # "tree-sitter-cadhr-lang",
 ]
 
 [dependencies]
