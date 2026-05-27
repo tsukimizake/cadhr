@@ -32,6 +32,13 @@ fn dspan(s: SimpleSpan) -> DSpan {
     DSpan::from(s)
 }
 
+/// 改行トークン (0 個以上) を skip する parser。
+/// expression / pattern / type の atom 間で line continuation を許すために使う。
+fn nl<'tokens, 'src: 'tokens>(
+) -> impl Parser<'tokens, ParserInput<'tokens, 'src>, (), ParserError<'tokens, 'src>> + Clone {
+    just(Token::Newline).repeated().ignored()
+}
+
 /// 小文字始まりの識別子を取り出す。
 fn lower_ident<'tokens, 'src: 'tokens>(
 ) -> impl Parser<'tokens, ParserInput<'tokens, 'src>, String, ParserError<'tokens, 'src>> + Clone {
@@ -396,14 +403,17 @@ pub fn expr_parser<'tokens, 'src: 'tokens>(
                 span: dspan(e.span()),
             });
         let let_expr = just(Token::Let)
+            .ignore_then(nl())
             .ignore_then(
                 value_binding
                     .clone()
-                    .separated_by(just(Token::Comma).or(just(Token::Pipe)))
+                    .separated_by(just(Token::Comma).or(just(Token::Pipe)).or(just(Token::Newline)))
                     .at_least(1)
                     .collect::<Vec<_>>(),
             )
+            .then_ignore(nl())
             .then_ignore(just(Token::In))
+            .then_ignore(nl())
             .then(expr.clone())
             .map_with(|(bindings, body), e| Expr::Let {
                 bindings,
@@ -656,9 +666,11 @@ pub fn decl_parser<'tokens, 'src: 'tokens>(
         });
 
     // `name pat... = body` の value 宣言。signature と区別するため `=` の存在で確定。
+    // `=` の直後で改行を許可する (Elm 流の複数行 body)。
     let value = lower_ident()
         .then(pat.clone().repeated().collect::<Vec<_>>())
         .then_ignore(just(Token::Eq))
+        .then_ignore(nl())
         .then(expr.clone())
         .map_with(|((name, params), body), e| {
             Decl::Value(ValueDecl {
@@ -672,10 +684,12 @@ pub fn decl_parser<'tokens, 'src: 'tokens>(
     // `type T a b = C1 a | C2 b`
     // constructor の引数は **atomic** な type expr のみ (パイプ `|` で次の constructor に
     // 進めるよう、空白区切りの繰り返しで type_expr を全部食べないようにする)。
+    // `=` の直後と `|` の直前後で改行を許容する。
     let type_decl = just(Token::Type)
         .ignore_then(upper_ident())
         .then(lower_ident().repeated().collect::<Vec<_>>())
         .then_ignore(just(Token::Eq))
+        .then_ignore(nl())
         .then({
             let ctor = upper_ident()
                 .then(type_atom_parser().repeated().collect::<Vec<_>>())
@@ -684,7 +698,7 @@ pub fn decl_parser<'tokens, 'src: 'tokens>(
                     args,
                     span: dspan(e.span()),
                 });
-            ctor.separated_by(just(Token::Pipe))
+            ctor.separated_by(nl().then(just(Token::Pipe)).then(nl()))
                 .at_least(1)
                 .collect::<Vec<_>>()
         })
@@ -703,6 +717,7 @@ pub fn decl_parser<'tokens, 'src: 'tokens>(
         .ignore_then(upper_ident())
         .then(lower_ident().repeated().collect::<Vec<_>>())
         .then_ignore(just(Token::Eq))
+        .then_ignore(nl())
         .then(ty.clone())
         .map_with(|((name, params), body), e| {
             Decl::TypeAlias(TypeAliasDecl {
@@ -717,6 +732,7 @@ pub fn decl_parser<'tokens, 'src: 'tokens>(
     let slider = just(Token::Slider)
         .ignore_then(lower_ident())
         .then_ignore(just(Token::Eq))
+        .then_ignore(nl())
         .then(expr.clone())
         .map_with(|(name, body), e| {
             Decl::Slider(SliderDecl {
@@ -799,16 +815,27 @@ fn import_parser<'tokens, 'src: 'tokens>(
 
 pub fn module_parser<'tokens, 'src: 'tokens>(
 ) -> impl Parser<'tokens, ParserInput<'tokens, 'src>, Module, ParserError<'tokens, 'src>> + Clone {
-    module_header_parser()
-        .or_not()
-        .then(import_parser().repeated().collect::<Vec<_>>())
-        .then(decl_parser().repeated().collect::<Vec<_>>())
-        .map_with(|((header, imports), decls), e| Module {
-            header,
-            imports,
-            decls,
-            span: dspan(e.span()),
-        })
+    // 各 top-level 要素は前後に Newline を許容する。Newline は decl 境界として
+    // 振る舞うが、ここでは consumed して透過扱いにする (各 decl 自身が「自分の終端
+    // の直前で type_expr / body が greedy にならない」のは、各 decl が自身の構造で
+    // 自然に終わる前提)。decl 間の Newline は明示的に消費しないと、parser が
+    // 「expected EOF」エラーを出す可能性があるため、ここで吸収する。
+    let header = module_header_parser().then_ignore(nl());
+    let import = import_parser().then_ignore(nl());
+    let decl = decl_parser().then_ignore(nl());
+
+    nl().ignore_then(
+        header
+            .or_not()
+            .then(import.repeated().collect::<Vec<_>>())
+            .then(decl.repeated().collect::<Vec<_>>())
+            .map_with(|((header, imports), decls), e| Module {
+                header,
+                imports,
+                decls,
+                span: dspan(e.span()),
+            }),
+    )
 }
 
 /// 高レベル API: ソース文字列を直接 `Module` にパースする。

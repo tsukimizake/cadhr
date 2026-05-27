@@ -84,6 +84,11 @@ pub enum Token<'src> {
     RBracket,
     Comma,
     Underscore,
+
+    /// 改行 (1 個以上連続する `\n` を 1 つの Newline トークンに集約)。
+    /// expression / pattern / type 内では parser 側で whitespace と同等に skip され、
+    /// top-level decl の境界では区切りとして意味を持つ。
+    Newline,
 }
 
 impl<'src> std::fmt::Display for Token<'src> {
@@ -142,6 +147,7 @@ impl<'src> std::fmt::Display for Token<'src> {
             Token::RBracket => f.write_str("]"),
             Token::Comma => f.write_str(","),
             Token::Underscore => f.write_str("_"),
+            Token::Newline => f.write_str("<newline>"),
         }
     }
 }
@@ -169,8 +175,11 @@ pub fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Spanned<Token<'src>>>, 
 
     let comment = choice((line_comment, block_comment));
 
+    // 改行以外の whitespace のみを ws として扱う。改行は別 token として残す。
     let ws = choice((
-        any().filter(|c: &char| c.is_whitespace()).ignored(),
+        any()
+            .filter(|c: &char| c.is_whitespace() && *c != '\n')
+            .ignored(),
         comment,
     ))
     .repeated()
@@ -280,7 +289,15 @@ pub fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Spanned<Token<'src>>>, 
 
     let single = choice((ident_or_keyword, number, string, op));
 
-    single
+    // 改行 `\n+` を 1 つの Newline トークンに集約。
+    let newline_tok = just('\n')
+        .then(just('\n').or(any().filter(|c: &char| c.is_whitespace() && *c != '\n')).repeated())
+        .ignored()
+        .map(|_| Token::Newline);
+
+    let any_tok = choice((newline_tok, single));
+
+    any_tok
         .map_with(|tok, e| Spanned {
             inner: tok,
             span: e.span(),
@@ -364,13 +381,30 @@ mod tests {
 
     #[test]
     fn comments_are_skipped() {
+        // 行コメントは `\n` を残すので Newline が混じる
         assert_eq!(
             lex_strip("x -- a comment\n y"),
-            vec![Token::LowerIdent("x"), Token::LowerIdent("y")]
+            vec![Token::LowerIdent("x"), Token::Newline, Token::LowerIdent("y")]
         );
+        // ブロックコメントは内部の `\n` を吸収する (同一行扱い)
         assert_eq!(
             lex_strip("x {- nested {- inner -} still -} y"),
             vec![Token::LowerIdent("x"), Token::LowerIdent("y")]
+        );
+    }
+
+    #[test]
+    fn newlines_are_tokens() {
+        // `\n+` は 1 つの Newline に集約
+        assert_eq!(
+            lex_strip("a\nb\n\n\nc"),
+            vec![
+                Token::LowerIdent("a"),
+                Token::Newline,
+                Token::LowerIdent("b"),
+                Token::Newline,
+                Token::LowerIdent("c"),
+            ]
         );
     }
 
