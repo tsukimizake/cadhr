@@ -353,36 +353,37 @@ pub fn registry() -> BuiltinRegistry {
             snippet: "path(p2($1), [$2])",
         })
         // ----- Control points (slider UI) -----
-        // 戻り値は Bool (goal-like; 純粋な値としては使われない)。
+        // 戻り値は opaque な Atom (`output { controls: List(Atom) }` の要素として
+        // list に入れる用途。GUI 側で extract_control_points が解釈する)。
         .add(Builtin {
             name: "control2d",
             params: vec![p2()],
-            return_ty: Type::Bool,
-            usage: "control2d(P: Point2D)",
+            return_ty: Type::Atom,
+            usage: "control2d(P: Point2D) -> Control",
             doc: "Register a 2D draggable control point (z=0).",
             snippet: "control2d(p2($1))",
         })
         .add(Builtin {
             name: "control2d",
             params: vec![p2(), str_()],
-            return_ty: Type::Bool,
-            usage: "control2d(P: Point2D, Name: String)",
+            return_ty: Type::Atom,
+            usage: "control2d(P: Point2D, Name: String) -> Control",
             doc: "Register a 2D draggable control point with a name.",
             snippet: "control2d(p2($1), \"$2\")",
         })
         .add(Builtin {
             name: "control3d",
             params: vec![p3()],
-            return_ty: Type::Bool,
-            usage: "control3d(P: Point3D)",
+            return_ty: Type::Atom,
+            usage: "control3d(P: Point3D) -> Control",
             doc: "Register a 3D draggable control point.",
             snippet: "control3d(p3($1))",
         })
         .add(Builtin {
             name: "control3d",
             params: vec![p3(), str_()],
-            return_ty: Type::Bool,
-            usage: "control3d(P: Point3D, Name: String)",
+            return_ty: Type::Atom,
+            usage: "control3d(P: Point3D, Name: String) -> Control",
             doc: "Register a 3D draggable control point with a name.",
             snippet: "control3d(p3($1), \"$2\")",
         })
@@ -394,6 +395,50 @@ pub fn registry() -> BuiltinRegistry {
             usage: "stl(Path: String) -> Shape3D",
             doc: "Import a mesh from an STL file (resolved at runtime).",
             snippet: "stl(\"$1\")",
+        })
+        // ----- BOM (bill of materials) -----
+        // bom("name", [len(100), count(2), ...]) のような形で部品を記録する。
+        // 内部の prop 構造 (len/count/width/height) は opaque な Atom を返すだけの
+        // タグ。新しい prop 名を使いたい場合は builtins.rs に追加する。
+        .add(Builtin {
+            name: "bom",
+            params: vec![str_(), Type::list_of(Type::Atom)],
+            return_ty: Type::Atom,
+            usage: "bom(Name: String, Props: List(BomProp)) -> BomEntry",
+            doc: "Bill-of-materials entry. Props is a list of `prop_name(value)` tags.",
+            snippet: "bom(\"$1\", [$2])",
+        })
+        .add(Builtin {
+            name: "len",
+            params: vec![n()],
+            return_ty: Type::Atom,
+            usage: "len(L: Number) -> BomProp",
+            doc: "BOM property: length.",
+            snippet: "len($1)",
+        })
+        .add(Builtin {
+            name: "count",
+            params: vec![n()],
+            return_ty: Type::Atom,
+            usage: "count(N: Number) -> BomProp",
+            doc: "BOM property: quantity.",
+            snippet: "count($1)",
+        })
+        .add(Builtin {
+            name: "width",
+            params: vec![n()],
+            return_ty: Type::Atom,
+            usage: "width(W: Number) -> BomProp",
+            doc: "BOM property: width.",
+            snippet: "width($1)",
+        })
+        .add(Builtin {
+            name: "height",
+            params: vec![n()],
+            return_ty: Type::Atom,
+            usage: "height(H: Number) -> BomProp",
+            doc: "BOM property: height.",
+            snippet: "height($1)",
         })
         // ----- Assertions -----
         .add(Builtin {

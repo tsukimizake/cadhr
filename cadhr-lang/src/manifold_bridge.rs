@@ -190,6 +190,12 @@ pub const BUILTIN_FUNCTORS: &[(&str, &[usize])] = &[
     ("control3d", &[1, 2]),
     ("center3d", &[2]),
     ("center2d", &[2]),
+    // BOM とその tag は module prefix を受けない builtin として扱う。
+    ("bom", &[2]),
+    ("len", &[1]),
+    ("count", &[1]),
+    ("width", &[1]),
+    ("height", &[1]),
 ];
 
 inventory::submit! {

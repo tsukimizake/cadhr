@@ -818,18 +818,27 @@ fn type_ident(input: &str) -> PResult<'_, String> {
 }
 
 /// `List(T)` などの applied 型をパース。
+/// - `List(T)` は applied form
+/// - 大文字始まり: 既知の built-in (`Number`, `Shape3D` ...) なら対応する Type、
+///   それ以外は量化型変数 `Type::Forall(name)`
+/// - 小文字始まり: record 型参照 (`Type::Record(name)`)。decl は typecheck 時に
+///   検証される。
 fn applied_type(input: &str) -> PResult<'_, crate::types::Type> {
     use crate::types::Type;
     let (input, head) = ws(type_ident).parse(input)?;
     if head == "List" {
         let (input, inner) = delimited(ws(char('(')), type_expr, cut(ws(char(')')))).parse(input)?;
-        Ok((input, Type::list_of(inner)))
-    } else if let Some(t) = builtin_type_name(&head) {
-        Ok((input, t))
-    } else {
-        // 未知の大文字始まり identifier → 量化型変数として扱う。Record 型なら
-        // 後段の resolver が `Type::Record(name)` に書き換える。
+        return Ok((input, Type::list_of(inner)));
+    }
+    if let Some(t) = builtin_type_name(&head) {
+        return Ok((input, t));
+    }
+    let first = head.chars().next();
+    let is_upper = matches!(first, Some(c) if c.is_ascii_uppercase());
+    if is_upper {
         Ok((input, Type::Forall(head)))
+    } else {
+        Ok((input, Type::Record(head)))
     }
 }
 

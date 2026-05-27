@@ -261,10 +261,16 @@ impl UserSignatures {
 }
 
 /// database から `head -> Type` の付いた Clause のシグネチャを抽出する。
-/// head 引数の `type_annotation` (型) または min/max (range = Number) から params を組み、
-/// return_type フィールドを return_ty に使う。type_annotation も range も無い引数があれば
-/// その Clause は登録をスキップ (シグネチャ不完全と判断)。
-pub fn collect_user_signatures<S>(clauses: &[crate::parse::Clause<S>]) -> UserSignatures {
+/// 各 head 引数の型を以下の優先順で決める:
+///   1. `Var: Type` 注釈 → その Type
+///   2. range Var (`0<X<100`) → Number
+///   3. Struct パターン (`p3(X, Y, Z)` 等) で functor が builtin として登録されていれば
+///      その return_ty を採用 (パターンマッチによる destructure を許す)
+///   4. それ以外 → シグネチャ不完全とみなしスキップ
+pub fn collect_user_signatures<S>(
+    clauses: &[crate::parse::Clause<S>],
+    builtins: &crate::builtins::BuiltinRegistry,
+) -> UserSignatures {
     use crate::parse::{Clause, Term};
     let mut us = UserSignatures::new();
     for clause in clauses {
@@ -282,6 +288,17 @@ pub fn collect_user_signatures<S>(clauses: &[crate::parse::Clause<S>]) -> UserSi
                 Term::Var { type_annotation: Some(t), .. } => params.push(t.clone()),
                 Term::Var { min, max, .. } if min.is_some() || max.is_some() => {
                     params.push(Type::Number);
+                }
+                Term::Struct { functor: f, args: pat_args, .. } => {
+                    // Struct パターンの型は builtin の return_ty で取れる。
+                    // 同名 arity overload があっても return_ty は通常同一なので
+                    // 最初の一致を採用。
+                    if let Some(b) = builtins.lookup(f, pat_args.len()) {
+                        params.push(b.return_ty.clone());
+                    } else {
+                        complete = false;
+                        break;
+                    }
                 }
                 _ => {
                     complete = false;
@@ -319,12 +336,11 @@ impl RecordDeclTable {
 
     /// `RecordField.ty` が `None` の field はそのフィールドの型注釈が省略されていた
     /// (default 値から推論される予定の) ケース。新仕様 §4.4 では推論は型推論器の役割。
-    /// 現状の typecheck は型注釈付き field のみ扱うため、注釈なしフィールドは fresh α
-    /// として登録する。型を pin したい場合はソース側で `field: T = default` と書く。
-    pub fn from_clauses<S>(
-        clauses: &[crate::parse::Clause<S>],
-        var_gen: &mut VarGen,
-    ) -> Self {
+    /// 現状の typecheck は型注釈付き field のみ扱うため、注釈なしフィールドは
+    /// `Forall("rec_field")` として登録し、lookup 時に呼び出し側 var_gen で fresh
+    /// Var に instantiate する (clause-local var_gen と ID 衝突しないよう Forall 名で
+    /// 名前空間を区切る)。型を pin したい場合はソース側で `field: T = default` と書く。
+    pub fn from_clauses<S>(clauses: &[crate::parse::Clause<S>]) -> Self {
         use crate::parse::Clause;
         let mut t = Self::new();
         for c in clauses {
@@ -332,7 +348,9 @@ impl RecordDeclTable {
                 let fs = fields
                     .iter()
                     .map(|f| {
-                        let ty = f.ty.clone().unwrap_or_else(|| var_gen.fresh());
+                        let ty = f.ty.clone().unwrap_or_else(|| {
+                            Type::Forall(format!("{}_{}", name, f.name))
+                        });
                         (f.name.clone(), ty)
                     })
                     .collect();
@@ -384,51 +402,42 @@ pub fn infer_term<S>(
         }
         Term::InfixExpr { op, left, right } => {
             // 算術: Number * Number = Number
-            // CSG: Shape * Shape = Shape (op-specific) は dimension-suffixed builtin
-            // (union3d 等) に置き換わる前提なので、ここでは算術のみ。
-            let _ = op;
+            // CSG: Shape + Shape = Shape (Add=union, Sub=difference, Mul=intersection)
+            // `/` は Number 専用。
             let l = infer_term(left, ctx)?;
             let r = infer_term(right, ctx)?;
-            unify(&l, &Type::Number, ctx.subst)?;
-            unify(&r, &Type::Number, ctx.subst)?;
-            // ArithOp::Add etc — 全部 Number 返す
-            match op {
-                ArithOp::Add | ArithOp::Sub | ArithOp::Mul | ArithOp::Div => Ok(Type::Number),
+            if matches!(op, ArithOp::Div) {
+                unify(&l, &Type::Number, ctx.subst)?;
+                unify(&r, &Type::Number, ctx.subst)?;
+                Ok(Type::Number)
+            } else {
+                // 両辺を一致させる: Number-Number / Shape3D-Shape3D / Shape2D-Shape2D の
+                // いずれでも通る。返り値は左辺と同じ型 (= resolved 両辺)。
+                unify(&l, &r, ctx.subst)?;
+                Ok(ctx.subst.apply(&l))
             }
         }
         Term::Struct { functor, args, .. } => {
-            // builtin → user sig の順で探す。両方に無ければ「シグネチャ未注釈の
-            // user predicate (legacy code)」と解釈し、各引数を再帰的に型推論
-            // (ネストした型エラーは捕捉) しつつ、戻り値型は fresh α を返す。
-            // typo はランタイムの "no clause matches" で catch されるため、
-            // typecheck はここで MissingSignature を出さない (best-effort モード)。
-            let sig_template = ctx
-                .builtins
-                .lookup(functor, args.len())
-                .map(|b| (b.params.clone(), b.return_ty.clone()))
-                .or_else(|| {
-                    ctx.user_sigs
-                        .lookup(functor, args.len())
-                        .map(|(p, r)| (p.clone(), r.clone()))
-                });
-            match sig_template {
-                Some((params_template, ret_template)) => {
-                    let (params, ret_ty) =
-                        instantiate_signature(&params_template, &ret_template, ctx.var_gen);
-                    for (arg, expected) in args.iter().zip(params.iter()) {
-                        let actual = infer_term(arg, ctx)?;
-                        unify(expected, &actual, ctx.subst)?;
-                    }
-                    Ok(ret_ty)
-                }
-                None => {
-                    // Unknown functor: arg を一通り推論しつつ fresh α を返す。
-                    for arg in args {
-                        let _ = infer_term(arg, ctx)?;
-                    }
-                    Ok(ctx.var_gen.fresh())
-                }
+            // builtin → user sig の順で探す。両方に無ければ MissingSignature。
+            // user predicate は `head(...) -> Type :- body.` 形式でシグネチャを
+            // 明示することが求められる (LANG_SPEC §5.2)。
+            let (params_template, ret_template) =
+                if let Some(b) = ctx.builtins.lookup(functor, args.len()) {
+                    (b.params.clone(), b.return_ty.clone())
+                } else if let Some((p, r)) = ctx.user_sigs.lookup(functor, args.len()) {
+                    (p.clone(), r.clone())
+                } else {
+                    return Err(TypeError::MissingSignature {
+                        context: format!("{}/{}", functor, args.len()),
+                    });
+                };
+            let (params, ret_ty) =
+                instantiate_signature(&params_template, &ret_template, ctx.var_gen);
+            for (arg, expected) in args.iter().zip(params.iter()) {
+                let actual = infer_term(arg, ctx)?;
+                unify(expected, &actual, ctx.subst)?;
             }
+            Ok(ret_ty)
         }
         Term::Eq { left, right } => {
             let l = infer_term(left, ctx)?;
@@ -458,15 +467,19 @@ pub fn infer_term<S>(
                     .lookup(&record_name)
                     .ok_or_else(|| TypeError::MissingSignature {
                         context: format!("record decl for '{}'", record_name),
-                    })?;
-            let field_ty = decl
+                    })?
+                    .to_vec();
+            let field_ty_raw = decl
                 .iter()
                 .find(|(n, _)| n == field)
                 .map(|(_, t)| t.clone())
                 .ok_or_else(|| TypeError::MissingSignature {
                     context: format!("field '{}' on record '{}'", field, record_name),
                 })?;
-            Ok(field_ty)
+            // decl に Forall (注釈なし field) が含まれる場合は呼び出し側 var_gen で
+            // fresh Var に instantiate する。これにより RecordDeclTable の α が
+            // clause-local var_gen の α と ID 衝突するのを防ぐ。
+            Ok(instantiate(&field_ty_raw, ctx.var_gen))
         }
         Term::Record { name, fields, .. } => {
             let decl =
@@ -476,22 +489,28 @@ pub fn infer_term<S>(
                         context: format!("record decl for '{}'", name),
                     })?
                     .to_vec();
-            // 各 (field_name, value) について宣言された field 型と unify。
-            // 提供されていない field は宣言の default が利用される想定で skip
-            // (default 値の型整合性は record decl 構築時に検査する方向で別途実装)。
+            // 全 field 型を 1 つの mapping で instantiate (同一 record 内で同じ
+            // Forall 名は同じ Var を共有)。decl 順に展開してから provided fields の
+            // 値型と unify する。
+            let decl_types: Vec<Type> = decl.iter().map(|(_, t)| t.clone()).collect();
+            let (instantiated, _ret) = instantiate_signature(
+                &decl_types,
+                &Type::Record(name.clone()),
+                ctx.var_gen,
+            );
             for (provided_name, value) in fields {
-                let expected = decl
+                let idx = decl
                     .iter()
-                    .find(|(n, _)| n == provided_name)
-                    .map(|(_, t)| t.clone())
+                    .position(|(n, _)| n == provided_name)
                     .ok_or_else(|| TypeError::MissingSignature {
                         context: format!(
                             "field '{}' is not declared on record '{}'",
                             provided_name, name
                         ),
                     })?;
+                let expected = &instantiated[idx];
                 let actual = infer_term(value, ctx)?;
-                unify(&expected, &actual, ctx.subst)?;
+                unify(expected, &actual, ctx.subst)?;
             }
             Ok(Type::Record(name.clone()))
         }
@@ -584,12 +603,10 @@ pub fn infer_database<S: Clone>(
     builtins: &crate::builtins::BuiltinRegistry,
 ) -> Vec<ClauseDiagnostic> {
     use crate::parse::{Clause, Term};
-    let user_sigs = collect_user_signatures(clauses);
-    // record decl の field 型 (`f.ty`) が None だった場合に fresh α を割り当てるための gen。
-    // infer_clause 側の gen と別ライフタイムだが、α の id 空間が異なっても問題ない
-    // (RecordDeclTable 内では同一 record の field 間で一貫していればよい)。
-    let mut decl_gen = VarGen::new();
-    let records = RecordDeclTable::from_clauses(clauses, &mut decl_gen);
+    let user_sigs = collect_user_signatures(clauses, builtins);
+    // 注釈なし field は `Forall("rec_field")` で記録される (clause-local var_gen
+    // との ID 衝突回避)。lookup 時に instantiate される。
+    let records = RecordDeclTable::from_clauses(clauses);
     let mut diags = Vec::new();
     for (idx, clause) in clauses.iter().enumerate() {
         if let Err(err) = infer_clause(clause, builtins, &user_sigs, &records) {
@@ -1048,7 +1065,7 @@ mod tests {
                 return_type: None,
             },
         ];
-        let us = collect_user_signatures(&clauses);
+        let us = collect_user_signatures(&clauses, &crate::builtins::registry());
         assert!(us.lookup("foo", 1).is_some());
         assert!(us.lookup("bar", 1).is_none(), "untyped clause should be skipped");
     }
@@ -1301,10 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn infer_unknown_functor_returns_fresh_var() {
-        // best-effort 型推論: 未注釈 user predicate (= builtins と user_sigs の
-        // どちらにも無い functor) は MissingSignature を出さず fresh α を返す。
-        // タイポ等のランタイムエラー catch は "no clause matches" 経由。
+    fn infer_unknown_functor_errors_with_missing_sig() {
         let mut s = Substitution::new();
         let mut g = VarGen::new();
         let b = crate::builtins::registry();
@@ -1312,7 +1326,7 @@ mod tests {
         let rd = RecordDeclTable::new();
         let mut ctx = fresh_ctx(&mut s, &mut g, &b, &us, &rd);
         let t = struc::<()>("unknown_op".to_string(), vec![]);
-        let ty = infer_term(&t, &mut ctx).unwrap();
-        assert!(matches!(ty, Type::Var(_)));
+        let r = infer_term(&t, &mut ctx);
+        assert!(matches!(r, Err(TypeError::MissingSignature { .. })));
     }
 }
