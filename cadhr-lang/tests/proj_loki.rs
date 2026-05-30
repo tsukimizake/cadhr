@@ -1,4 +1,4 @@
-//! 実際の `~/cadhr-proj/loki_home_key/db.cadhr` + `~/cadhr-proj/Bolts.cadhr` を
+//! 実際の `~/cadhr-proj/loki_home_key/db.cadhr` + `~/cadhr-proj/Bolts/db.cadhr` を
 //! 直接ロードして新仕様で評価できるかを smoke check する。
 //!
 //! 個人環境依存なので、ファイルが無いときは自動的に skip する。

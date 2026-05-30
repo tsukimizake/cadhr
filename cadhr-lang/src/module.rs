@@ -184,7 +184,9 @@ impl<'a> State<'a> {
     }
 
     fn read_module_source(&mut self, qname: &str, span: Span) -> Option<(String, PathBuf)> {
-        let rel = qname.replace('.', "/") + ".cadhr";
+        // 各モジュールはディレクトリ単位: `<search>/Foo/Bar/db.cadhr`。これは
+        // セッション (cadhr-proj/<project>/db.cadhr) とも揃った形にするため。
+        let rel = qname.replace('.', "/") + "/db.cadhr";
         for base in self.search_paths {
             let candidate = base.join(&rel);
             if candidate.exists() {
@@ -235,7 +237,8 @@ mod tests {
     use tempfile::tempdir;
 
     fn write_module(dir: &Path, qname: &str, content: &str) -> PathBuf {
-        let rel = qname.replace('.', "/") + ".cadhr";
+        // Resolver は `<base>/<qname>/db.cadhr` を探すので、テストもその構造で書く。
+        let rel = qname.replace('.', "/") + "/db.cadhr";
         let path = dir.join(&rel);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();

@@ -2,7 +2,8 @@
 //! `module Foo exposing (..)` ベースで再現できるかを確認する。
 //!
 //! 旧版は `#use("../bolts").` で別ディレクトリの db.cadhr を参照していた。新版は
-//! `import Bolts exposing (m3)` で `<search_path>/Bolts.cadhr` を引く。
+//! `import Bolts exposing (m3)` で `<search_path>/Bolts/db.cadhr` を引く
+//! (モジュール = ディレクトリ + db.cadhr の慣習)。
 
 use cadhr_lang::{Inputs, compile_with_paths, run_main};
 use std::fs;
@@ -38,7 +39,8 @@ main =
 #[test]
 fn bolts_library_cross_module() {
     let tmp = tempdir().unwrap();
-    fs::write(tmp.path().join("Bolts.cadhr"), BOLTS_SRC).unwrap();
+    fs::create_dir_all(tmp.path().join("Bolts")).unwrap();
+    fs::write(tmp.path().join("Bolts/db.cadhr"), BOLTS_SRC).unwrap();
     let prog = compile_with_paths(MAIN_SRC, &[tmp.path().to_path_buf()]).expect("compile");
     let out = run_main(&prog, &Inputs::default()).expect("run_main");
     assert_eq!(out.models.len(), 2);

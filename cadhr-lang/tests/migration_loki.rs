@@ -1,7 +1,7 @@
 //! loki_home_key の migration テスト。
 //!
 //! 旧版は `#use("../bolts")` で別ディレクトリの bolts library を参照していた。
-//! 新版は同じディレクトリに `Bolts.cadhr` を置き `import Bolts` する形に変える。
+//! 新版は同じディレクトリに `Bolts/db.cadhr` を置き `import Bolts` する形に変える。
 //! 3 平面 sketch を extrude → intersect3d で 3 個の押し出しを合わせて、最後に
 //! ボルト穴を diff3d で抜くという旧版の挙動を新 API で再構築する。
 

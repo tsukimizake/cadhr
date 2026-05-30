@@ -314,14 +314,16 @@ mod tests {
         );
     }
 
+    fn write_lib(tmp: &tempfile::TempDir, src: &str) {
+        // Resolver は `<base>/Lib/db.cadhr` を探す。
+        std::fs::create_dir_all(tmp.path().join("Lib")).unwrap();
+        std::fs::write(tmp.path().join("Lib/db.cadhr"), src).unwrap();
+    }
+
     #[test]
     fn import_resolves_and_runs() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("Lib.cadhr"),
-            "module Lib exposing (..)\n\nside = 5.0\n",
-        )
-        .unwrap();
+        write_lib(&tmp, "module Lib exposing (..)\n\nside = 5.0\n");
         let src = "import Lib exposing (side)\n\nmain = cube side side side";
         let prog = compile_with_paths(src, &[tmp.path().to_path_buf()]).expect("compile");
         let out = run_main(&prog, &Inputs::default()).expect("run_main");
@@ -331,11 +333,7 @@ mod tests {
     #[test]
     fn import_qualified_only() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("Lib.cadhr"),
-            "module Lib exposing (..)\n\nside = 5.0\n",
-        )
-        .unwrap();
+        write_lib(&tmp, "module Lib exposing (..)\n\nside = 5.0\n");
         let src = "import Lib\n\nmain = cube Lib.side Lib.side Lib.side";
         let prog = compile_with_paths(src, &[tmp.path().to_path_buf()]).expect("compile");
         let out = run_main(&prog, &Inputs::default()).expect("run_main");
@@ -354,11 +352,7 @@ mod tests {
     #[test]
     fn import_with_alias() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("Lib.cadhr"),
-            "module Lib exposing (..)\n\nside = 5.0\n",
-        )
-        .unwrap();
+        write_lib(&tmp, "module Lib exposing (..)\n\nside = 5.0\n");
         let src = "import Lib as L\n\nmain = cube L.side L.side L.side";
         let prog = compile_with_paths(src, &[tmp.path().to_path_buf()]).expect("compile");
         let out = run_main(&prog, &Inputs::default()).expect("run_main");
