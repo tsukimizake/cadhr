@@ -1,24 +1,37 @@
+//! セッション (db.cadhr + previews.json) の保存・読み込み。
+//!
+//! セッションはディレクトリ単位:
+//!   - `db.cadhr` — ソースコード
+//!   - `previews.json` — プレビュー (slider 値・カメラ視点など) の永続化
+//!
+//! `~/.local/share/cadhr/last_session_path` に最後のセッションパスを記録し、
+//! 起動時に自動復元する。
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SessionPreview {
     pub preview_id: u64,
-    pub query: String,
     #[serde(default)]
     pub order: usize,
+    /// slider 名 → 値 (新仕様)。旧 query_param_overrides は破棄。
     #[serde(default)]
-    pub control_point_overrides: HashMap<String, f64>,
+    pub slider_values: HashMap<String, f64>,
+    /// control point 名 → (x, y, z) override。CP ドラッグ後のスナップ位置を保存。
     #[serde(default)]
-    pub query_param_overrides: HashMap<String, f64>,
+    pub control_point_overrides: HashMap<String, [f64; 3]>,
     #[serde(default)]
     pub view_at_object_center: bool,
     #[serde(default)]
     pub minimized: bool,
+    /// 衝突チェックプレビューかどうか。
+    #[serde(default)]
+    pub is_collision: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SessionPreviews {
     pub previews: Vec<SessionPreview>,
 }
@@ -28,34 +41,32 @@ pub fn save_session(
     editor_text: &str,
     previews: &[SessionPreview],
 ) -> Result<(), String> {
-    // 同名のファイルが残っていた場合に備えて削除してからディレクトリを作る
     let _ = std::fs::remove_file(dir);
-    std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create directory: {}", e))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create directory: {e}"))?;
 
     let db_path = dir.join("db.cadhr");
     std::fs::write(&db_path, editor_text)
-        .map_err(|e| format!("Failed to save db file: {}", e))?;
+        .map_err(|e| format!("Failed to save db file: {e}"))?;
 
     let session = SessionPreviews {
         previews: previews.to_vec(),
     };
     let json = serde_json::to_string_pretty(&session)
-        .map_err(|e| format!("Failed to serialize: {}", e))?;
+        .map_err(|e| format!("Failed to serialize: {e}"))?;
     let previews_path = dir.join("previews.json");
     std::fs::write(&previews_path, json)
-        .map_err(|e| format!("Failed to save previews: {}", e))?;
+        .map_err(|e| format!("Failed to save previews: {e}"))?;
 
     Ok(())
 }
 
 pub fn load_session(dir: &Path) -> Option<(String, SessionPreviews)> {
     let db_path = dir.join("db.cadhr");
-    let previews_path = dir.join("previews.json");
-
     let db_content = std::fs::read_to_string(&db_path).ok()?;
-    let previews_json = std::fs::read_to_string(&previews_path).ok()?;
-    let previews: SessionPreviews = serde_json::from_str(&previews_json).ok()?;
-
+    let previews = match std::fs::read_to_string(dir.join("previews.json")) {
+        Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+        Err(_) => SessionPreviews::default(),
+    };
     Some((db_content, previews))
 }
 

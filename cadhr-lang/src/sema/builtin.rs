@@ -170,6 +170,134 @@ pub fn registry() -> BuiltinRegistry {
         "貼り付け 2D 形状を平面法線方向に押し出し",
     ));
 
+    // -- 2D ポリゴン + 平面別 extrude (Elm-like 簡略 API)
+    let r = r.add(mono(
+        "polygon",
+        vec![Type::app("List", vec![point2d()])],
+        shape2d(),
+        "Point2D の閉路リストから 2D ポリゴンを作る",
+    ));
+    // pipe フレンドリーに Shape2D を末尾引数にする: `polygon [..] |> extrude_xy 15.0`
+    let r = r.add(mono(
+        "extrude_xy",
+        vec![float(), shape2d()],
+        shape3d(),
+        "Shape2D を XY 平面上で Z 方向に Float だけ押し出す (`s |> extrude_xy h`)",
+    ));
+    let r = r.add(mono(
+        "extrude_yz",
+        vec![float(), shape2d()],
+        shape3d(),
+        "Shape2D を YZ 平面上で X 方向に Float だけ押し出す (`s |> extrude_yz h`)",
+    ));
+    let r = r.add(mono(
+        "extrude_xz",
+        vec![float(), shape2d()],
+        shape3d(),
+        "Shape2D を XZ 平面上で Y 方向に Float だけ押し出す (`s |> extrude_xz h`)",
+    ));
+
+    // -- 2D CSG (Phase 10 補完)
+    let r = r.add(mono(
+        "union2d",
+        vec![shape2d(), shape2d()],
+        shape2d(),
+        "2D 形状の和",
+    ));
+    let r = r.add(mono(
+        "diff2d",
+        vec![shape2d(), shape2d()],
+        shape2d(),
+        "2D 形状の差 (左 - 右)",
+    ));
+    let r = r.add(mono(
+        "intersect2d",
+        vec![shape2d(), shape2d()],
+        shape2d(),
+        "2D 形状の積",
+    ));
+
+    // -- revolve / complex_extrude / sweep_extrude (XY 平面上の profile)
+    let r = r.add(mono(
+        "revolve_xy",
+        vec![float(), shape2d()],
+        shape3d(),
+        "XY 平面上の Shape2D を Z 軸まわりに Float (度) 回転して 3D 化",
+    ));
+    let r = r.add(mono(
+        "revolve_yz",
+        vec![float(), shape2d()],
+        shape3d(),
+        "YZ 平面上の Shape2D を X 軸まわりに Float (度) 回転して 3D 化",
+    ));
+    let r = r.add(mono(
+        "revolve_xz",
+        vec![float(), shape2d()],
+        shape3d(),
+        "XZ 平面上の Shape2D を Y 軸まわりに Float (度) 回転して 3D 化",
+    ));
+
+    // complex_extrude (XY): height, twist (degree), scale_x, scale_y, profile (pipe-friendly に最後)
+    let r = r.add(poly(
+        "complex_extrude_xy",
+        vec![],
+        vec![float(), float(), float(), float(), shape2d()],
+        shape3d(),
+        "Shape2D を XY 平面で twist+scale 付き push out (height, twist_deg, sx, sy, profile)",
+    ));
+
+    // sweep_extrude (XY): 3D path に沿って 2D profile を押し出し
+    let r = r.add(mono(
+        "sweep_extrude_xy",
+        vec![Type::app("List", vec![point3d()]), shape2d()],
+        shape3d(),
+        "XY 平面上の Shape2D を Point3D 列 path に沿って sweep",
+    ));
+
+    // center3d / center2d: BBox 中心を指定点に持ってくる
+    let r = r.add(mono(
+        "center3d",
+        vec![point3d(), shape3d()],
+        shape3d(),
+        "Shape3D の AABB 中心を Point3D に合わせて translate (`s |> center3d p`)",
+    ));
+    let r = r.add(mono(
+        "center2d",
+        vec![point2d(), shape2d()],
+        shape2d(),
+        "Shape2D の AABB 中心を Point2D に合わせて translate (`s |> center2d p`)",
+    ));
+
+    // control point: GUI ドラッグ用。戻り値はそのまま Point に解決 (override 無し時)。
+    let r = r.add(mono(
+        "control3d",
+        vec![string(), point3d()],
+        point3d(),
+        "名前付き 3D control point。GUI ドラッグで上書き可能",
+    ));
+    let r = r.add(mono(
+        "control2d",
+        vec![string(), point2d()],
+        point2d(),
+        "名前付き 2D control point。GUI ドラッグで上書き可能",
+    ));
+
+    // -- Bezier 曲線サンプリング (Phase 10 補完)
+    // List Point2D を返すので polygon の入力にそのまま渡せる:
+    //   polygon ([p2 0 0] ++ bezier_quad (p2 0 0) (p2 5 10) (p2 10 0) 20)
+    let r = r.add(mono(
+        "bezier_quad",
+        vec![point2d(), point2d(), point2d(), int()],
+        Type::app("List", vec![point2d()]),
+        "2 次 Bezier (start, control, end, segments) → List Point2D",
+    ));
+    let r = r.add(mono(
+        "bezier_cubic",
+        vec![point2d(), point2d(), point2d(), point2d(), int()],
+        Type::app("List", vec![point2d()]),
+        "3 次 Bezier (start, c1, c2, end, segments) → List Point2D",
+    ));
+
     // -- Points
     let r = r.add(mono(
         "p3",

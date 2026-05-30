@@ -15,7 +15,7 @@ use crate::sema::env::TypeEnv;
 use crate::sema::subst::{unify, Subst, UnifyError};
 use crate::sema::ty::{Scheme, TyVar, TyVarGen, Type};
 use crate::syntax::ast::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Debug, Default)]
 pub struct Infer {
@@ -170,20 +170,112 @@ fn substitute_named(
     }
 }
 
-/// 1 つのモジュール全体の型推論。Phase 2 では「各 value decl の型が確定する」と
-/// 「型エラーを span 付きで返す」の 2 点を達成する。
-pub fn infer_module(
-    module: &Module,
+/// 値式の qualified 名 (`Foo.bar` 形式) を作る。
+fn qualify(module: Option<&ModuleName>, name: &str) -> String {
+    match module {
+        Some(m) if !m.segments.is_empty() => format!("{}.{}", m.segments.join("."), name),
+        _ => name.to_string(),
+    }
+}
+
+fn qualify_str(module: &str, name: &str) -> String {
+    if module.is_empty() {
+        name.to_string()
+    } else {
+        format!("{module}.{name}")
+    }
+}
+
+/// 解決済み複数モジュールの型推論。各モジュールの decl 名 → Scheme を返す。
+/// main モジュールは `""` キーで引ける。
+pub fn infer_unit(
+    unit: &crate::module::ResolvedUnit,
     builtins: &BuiltinRegistry,
+) -> (HashMap<String, HashMap<String, Scheme>>, Vec<Diagnostic>) {
+    let mut per_module: HashMap<String, HashMap<String, Scheme>> = HashMap::new();
+    let mut all_diag: Vec<Diagnostic> = Vec::new();
+
+    // import 解決時に「公開する local 名 → Scheme」が必要。順を追って構築する。
+    let mut module_locals: HashMap<String, HashMap<String, Scheme>> = HashMap::new();
+
+    for lm in &unit.modules {
+        let (schemes, diag) = infer_one(lm, builtins, &module_locals);
+        module_locals.insert(lm.qualified_name.clone(), schemes.clone());
+        per_module.insert(lm.qualified_name.clone(), schemes);
+        all_diag.extend(diag);
+    }
+    (per_module, all_diag)
+}
+
+fn infer_one(
+    lm: &crate::module::LoadedModule,
+    builtins: &BuiltinRegistry,
+    module_locals: &HashMap<String, HashMap<String, Scheme>>,
 ) -> (HashMap<String, Scheme>, Vec<Diagnostic>) {
     let mut infer = Infer::new();
     let mut diag: Vec<Diagnostic> = Vec::new();
-
-    // 1. builtin を環境に展開
     let mut env = TypeEnv::new();
+
+    // 1. builtins
     for b in builtins.iter() {
         env = env.extend(b.name, b.scheme.clone());
     }
+
+    // 2. import 由来の scheme を qualified + (exposing) unqualified で展開
+    for imp in &lm.module.imports {
+        let imp_qname = crate::module::join_name(&imp.module);
+        let Some(imp_schemes) = module_locals.get(&imp_qname) else {
+            diag.push(Diagnostic::error(
+                imp.span,
+                format!("import 先 `{imp_qname}` の型情報がまだロードされていません"),
+            ));
+            continue;
+        };
+        let prefix = imp.alias.clone().unwrap_or_else(|| imp_qname.clone());
+        for (k, sc) in imp_schemes {
+            env = env.extend(&qualify_str(&prefix, k), sc.clone());
+        }
+        match &imp.exposing {
+            Some(Exposing::All(_)) => {
+                for (k, sc) in imp_schemes {
+                    env = env.extend(k, sc.clone());
+                }
+            }
+            Some(Exposing::Some(items, _)) => {
+                for item in items {
+                    if let Some(sc) = imp_schemes.get(&item.name) {
+                        env = env.extend(&item.name, sc.clone());
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    // 3. 自モジュールに対して既存ロジック (型 alias 収集 → ctor → signature → value) を回す
+    let (schemes, mut m_diag) = infer_module_into(&lm.module, &mut infer, &mut env);
+    diag.append(&mut m_diag);
+
+    // qualified 名も追加して返す
+    let mut out = HashMap::new();
+    for (k, v) in &schemes {
+        out.insert(k.clone(), v.clone());
+        if !lm.qualified_name.is_empty() {
+            out.insert(qualify_str(&lm.qualified_name, k), v.clone());
+        }
+    }
+    (out, diag)
+}
+
+/// `infer_module` の中身を抜き出した本体。`env` には builtins と import 由来の
+/// scheme をあらかじめ詰めて渡す。
+fn infer_module_into(
+    module: &Module,
+    infer: &mut Infer,
+    env_in: &mut TypeEnv,
+) -> (HashMap<String, Scheme>, Vec<Diagnostic>) {
+    let mut diag: Vec<Diagnostic> = Vec::new();
+    let mut env = env_in.clone();
 
     // 2. type alias / type decl / signature を先に収集
     let mut sig_var_maps: HashMap<String, HashMap<String, TyVar>> = HashMap::new();
@@ -273,7 +365,7 @@ pub fn infer_module(
     let mut result: HashMap<String, Scheme> = HashMap::new();
     for decl in &module.decls {
         if let Decl::Value(v) = decl {
-            let (ty, subst) = match infer_value_decl(&mut infer, &env, v, &mut diag) {
+            let (ty, subst) = match infer_value_decl(infer, &env, v, &mut diag) {
                 Some(r) => r,
                 None => continue,
             };
@@ -305,7 +397,21 @@ pub fn infer_module(
         }
     }
 
+    *env_in = env;
     (result, diag)
+}
+
+/// 1 つのモジュール全体の型推論。後方互換 API (builtins だけ環境に入れて呼ぶ)。
+pub fn infer_module(
+    module: &Module,
+    builtins: &BuiltinRegistry,
+) -> (HashMap<String, Scheme>, Vec<Diagnostic>) {
+    let mut infer = Infer::new();
+    let mut env = TypeEnv::new();
+    for b in builtins.iter() {
+        env = env.extend(b.name, b.scheme.clone());
+    }
+    infer_module_into(module, &mut infer, &mut env)
 }
 
 fn remap_named_vars(
@@ -482,23 +588,29 @@ pub fn infer_expr(
 ) -> Option<(Type, Subst)> {
     match e {
         Expr::Lit(l, _) => Some((lit_type(l), Subst::empty())),
-        Expr::Var { name, span, .. } => match env.lookup(name) {
-            Some(sc) => Some((infer.instantiate(sc), Subst::empty())),
-            None => {
-                diag.push(Diagnostic::error(*span, format!("未定義の変数 `{name}`")));
-                None
+        Expr::Var { module, name, span } => {
+            let key = qualify(module.as_ref(), name);
+            match env.lookup(&key) {
+                Some(sc) => Some((infer.instantiate(sc), Subst::empty())),
+                None => {
+                    diag.push(Diagnostic::error(*span, format!("未定義の変数 `{key}`")));
+                    None
+                }
             }
-        },
-        Expr::Ctor { name, span, .. } => match env.lookup(name) {
-            Some(sc) => Some((infer.instantiate(sc), Subst::empty())),
-            None => {
-                diag.push(Diagnostic::error(
-                    *span,
-                    format!("未定義のコンストラクタ `{name}`"),
-                ));
-                None
+        }
+        Expr::Ctor { module, name, span } => {
+            let key = qualify(module.as_ref(), name);
+            match env.lookup(&key) {
+                Some(sc) => Some((infer.instantiate(sc), Subst::empty())),
+                None => {
+                    diag.push(Diagnostic::error(
+                        *span,
+                        format!("未定義のコンストラクタ `{key}`"),
+                    ));
+                    None
+                }
             }
-        },
+        }
         Expr::App { func, arg, span } => {
             let (f_ty, s1) = infer_expr(infer, env, func, diag)?;
             let env2 = env.clone();
@@ -702,7 +814,7 @@ pub fn infer_expr(
         }
         Expr::RecordUpdate { base, updates, span } => {
             let (b_ty, s) = infer_expr(infer, env, base, diag)?;
-            let mut subst = s;
+            let subst = s;
             // updates の各 field の型は base record の同名 field と一致する必要
             let _ = updates;
             let _ = span;

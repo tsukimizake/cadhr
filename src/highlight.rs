@@ -1,11 +1,11 @@
-use cadhr_lang::parse::SrcSpan;
 use iced::advanced::text::highlighter;
 use iced::advanced::text::Highlighter;
 use std::ops::Range;
 
+/// エラー span は (byte_start, byte_end) のタプル。cadhr_lang::Span 互換。
 #[derive(Clone, PartialEq)]
 pub struct Settings {
-    pub error_span: Option<SrcSpan>,
+    pub error_span: Option<(usize, usize)>,
     pub has_error: bool,
 }
 
@@ -60,9 +60,9 @@ impl Highlighter for SpanHighlighter {
             return vec![(0..0, Highlight::Normal)].into_iter();
         }
 
-        let spans = if let Some(span) = self.settings.error_span {
-            let span_start = span.start.max(line_start);
-            let span_end = span.end.min(line_end);
+        let spans = if let Some((s, e)) = self.settings.error_span {
+            let span_start = s.max(line_start);
+            let span_end = e.min(line_end);
 
             if span_start < span_end {
                 let local_start = span_start - line_start;

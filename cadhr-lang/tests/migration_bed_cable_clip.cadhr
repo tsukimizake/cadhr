@@ -1,0 +1,15 @@
+-- bed-cable-clip を新 cadhr-lang で書き直し。
+-- 旧版は 2D `sketch - cut |> linear_extrude` のように 2D CSG → extrude していたが、
+-- 新版は 2D CSG が無いので「各 polygon を別個に extrude してから 3D で diff3d」する。
+
+main =
+    let
+        slit = 18.0
+        w = 40.0
+        h = 120.0
+        x = (w - slit) / 2.0
+        outer = polygon [ p2 0.0 0.0, p2 70.0 0.0, p2 70.0 120.0, p2 0.0 120.0 ]
+        cut = polygon [ p2 x 0.0, p2 (slit + w) 0.0, p2 (slit + w) (h - 20.0), p2 x (h - 20.0) ]
+        shape = diff3d (extrude_xy 100.0 outer) (extrude_xy 100.0 cut)
+    in
+    { models = [shape], bom = [], controls = [] }

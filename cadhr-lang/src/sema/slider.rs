@@ -38,7 +38,7 @@ pub fn extract_sliders(module: &Module) -> (Vec<SliderDecl>, Vec<Diagnostic>) {
     // top-level の Range 定数を集める (slider rhs で参照可能)
     let mut const_env = Env::new();
     let reg = runtime_registry();
-    let mut ev = Evaluator::new(&reg);
+    let ev = Evaluator::new(&reg);
 
     // builtin の Value を環境に追加
     for (name, b) in &reg.by_name {

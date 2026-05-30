@@ -1,0 +1,53 @@
+-- mechanism: 平歯車 (spur gear) の機構記述。新 cadhr-lang (Elm-like) 版。
+--
+-- 旧 Prolog 版は隣接歯車間の `Z1*T1 + Z2*T2 = 0` を線形ソルバで逆方向に解いて
+-- T2 / T3 を求めていた。新版は `next_theta` の forward 関数として書き直し、
+-- 上流の回転角から下流の回転角を順次計算する。
+
+type Gear
+    = Gear Float Float Float Float Float Float
+
+-- gear のフィールドアクセサ (case で分解)
+gear_z : Gear -> Float
+gear_z g =
+    case g of
+        | Gear _ z _ _ _ _ -> z
+
+gear_theta : Gear -> Float
+gear_theta g =
+    case g of
+        | Gear _ _ _ _ t _ -> t
+
+-- 歯車本体をピッチ円半径の円柱で描画。ローカル原点 = 中心。
+render : Gear -> Shape3D
+render g =
+    case g of
+        | Gear m z x y theta th ->
+            cylinder (m * z / 2.0) th
+                |> rotate3d (p3 0.0 0.0 theta)
+                |> translate3d (p3 0.0 0.0 0.0) (p3 x y 0.0)
+
+-- 上流歯車から下流歯車の回転角を計算。外接平歯車は逆比反転。
+next_theta : Gear -> Gear -> Float
+next_theta g1 g2 = (0.0 - gear_z g1 * gear_theta g1) / gear_z g2
+
+-- 中心 (x,y) と回転角を渡して Gear を構築するヘルパ
+mkGear : Float -> Float -> Float -> Float -> Float -> Float -> Gear
+mkGear m z x y theta th = Gear m z x y theta th
+
+main t1 =
+    let
+        g1 = mkGear 1.0 20.0 0.0 0.0 t1 5.0
+        g2_seed = mkGear 1.0 40.0 30.0 0.0 0.0 5.0
+        t2 = next_theta g1 g2_seed
+        g2 = mkGear 1.0 40.0 30.0 0.0 t2 5.0
+        g3_seed = mkGear 1.0 20.0 60.0 0.0 0.0 5.0
+        t3 = next_theta g2 g3_seed
+        g3 = mkGear 1.0 20.0 60.0 0.0 t3 5.0
+    in
+    { models = [render g1, render g2, render g3]
+    , bom = []
+    , controls = []
+    }
+
+slider t1 = 0.0 .. 360.0

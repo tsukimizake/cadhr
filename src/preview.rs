@@ -28,6 +28,7 @@ const MAX_PITCH: f64 = std::f64::consts::FRAC_PI_2 - 0.001;
 const EDGE_ANGLE_THRESHOLD_DEG: f32 = 25.0;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum SceneMessage {
     /// UV coordinates + camera state at click time + widget aspect ratio
     Clicked {
@@ -114,35 +115,39 @@ impl Scene {
         self.mesh_version = NEXT_MESH_VERSION.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// control points を球体としてメインメッシュに追加してから書き戻す。
+    /// 旧 GUI の `set_mesh_with_control_points` の再復活。CP の色は `selected_cp`
+    /// で 1 つだけ強調表示する。
     pub fn set_mesh_with_control_points(
         &mut self,
         mut vertices: Vec<Vertex>,
         mut indices: Vec<u32>,
-        control_points: &[cadhr_lang::manifold_bridge::ControlPoint],
+        control_points: &[(String, [f64; 3])],
         selected_cp: Option<usize>,
     ) {
         self.update_bbox(&vertices);
-
-        // CP 球体を追加する前のメインメッシュからエッジ抽出
         let edge_indices = extract_sharp_edges(&vertices, &indices, EDGE_ANGLE_THRESHOLD_DEG);
-
         let cp_radius = (self.aabb_max_abs() * 0.03).max(0.5);
-        for (ci, cp) in control_points.iter().enumerate() {
-            let color = if selected_cp == Some(ci) {
+        for (i, (_, pos)) in control_points.iter().enumerate() {
+            let color = if Some(i) == selected_cp {
                 [0.0, 1.0, 0.5, 1.0]
             } else {
                 [1.0, 0.9, 0.0, 1.0]
             };
-            let center = [cp.x.value as f32, cp.y.value as f32, cp.z.value as f32];
+            let center = [pos[0] as f32, pos[1] as f32, pos[2] as f32];
             append_sphere(&mut vertices, &mut indices, center, cp_radius, color, 8);
         }
-
         self.mesh = Arc::new(MeshData {
             vertices,
             indices,
             edge_indices,
         });
         self.mesh_version = NEXT_MESH_VERSION.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn aabb_max_abs(&self) -> f32 {
+        let v = self.bbox_min.abs().max(self.bbox_max.abs());
+        v.x.max(v.y).max(v.z)
     }
 
     fn update_bbox(&mut self, vertices: &[Vertex]) {
@@ -183,12 +188,6 @@ impl Scene {
         (max * 2.4 * 3.0).max(5.0)
     }
 
-    /// CP 球体半径計算用: 原点からの最大距離
-    fn aabb_max_abs(&self) -> f32 {
-        let v = self.bbox_min.abs().max(self.bbox_max.abs());
-        v.x.max(v.y).max(v.z)
-    }
-
     fn build_uniforms(&self, cam: &CameraState, bounds: Rectangle) -> Uniforms {
         let aspect = (bounds.width / bounds.height.max(1.0)).max(0.01);
 
@@ -219,6 +218,7 @@ impl Scene {
 
 /// Generate ray from UV coordinates (0..1) through the camera.
 /// Returns (origin, direction) in world space.
+#[allow(dead_code)]
 pub fn generate_ray_from_uv(
     u: f32,
     v: f32,
@@ -257,6 +257,7 @@ pub fn generate_ray_from_uv(
 }
 
 /// Ray-sphere intersection, returns distance t or None.
+#[allow(dead_code)]
 pub fn ray_sphere_intersect(
     origin: &[f64; 3],
     dir: &[f64; 3],
@@ -292,16 +293,13 @@ fn append_sphere(
     let base_idx = vertices.len() as u32;
     let stacks = segments;
     let slices = segments * 2;
-
     for i in 0..=stacks {
         let phi = std::f32::consts::PI * i as f32 / stacks as f32;
         for j in 0..=slices {
             let theta = 2.0 * std::f32::consts::PI * j as f32 / slices as f32;
-
             let nx = phi.sin() * theta.cos();
             let ny = phi.sin() * theta.sin();
             let nz = phi.cos();
-
             vertices.push(Vertex {
                 position: [
                     center[0] + radius * nx,
@@ -313,7 +311,6 @@ fn append_sphere(
             });
         }
     }
-
     for i in 0..stacks {
         for j in 0..slices {
             let row1 = base_idx + (i * (slices + 1)) as u32;

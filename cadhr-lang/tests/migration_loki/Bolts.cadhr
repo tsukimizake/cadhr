@@ -1,0 +1,28 @@
+module Bolts exposing (..)
+
+body r len = cylinder r len
+
+hexhead e s k =
+    let
+        ne = 0.0 - e
+        pts = [ p2 0.0 (ne / 2.0), p2 (0.0 - s / 2.0) (ne / 4.0), p2 (0.0 - s / 2.0) (e / 4.0), p2 0.0 (e / 2.0), p2 (s / 2.0) (e / 4.0), p2 (s / 2.0) (ne / 4.0) ]
+        profile = polygon pts
+    in
+    extrude_xy k profile
+        |> translate3d (p3 0.0 0.0 0.0) (p3 0.0 0.0 (0.0 - k))
+
+m3 len = union3d (hexhead 6.4 5.5 2.0) (body 1.5 len)
+m4 len = union3d (hexhead 8.1 7.0 2.8) (body 2.0 len)
+m5 len = union3d (hexhead 9.2 8.0 3.5) (body 2.5 len)
+m6 len = union3d (hexhead 11.5 10.0 4.0) (body 3.0 len)
+m8 len = union3d (hexhead 15.0 13.0 5.5) (body 4.0 len)
+m10 len = union3d (hexhead 19.6 17.0 7.0) (body 5.0 len)
+m12 len = union3d (hexhead 21.9 19.0 8.0) (body 6.0 len)
+
+m3_hole len = body 1.5 len
+m4_hole len = body 2.0 len
+m5_hole len = body 2.5 len
+m6_hole len = body 3.0 len
+m8_hole len = body 4.0 len
+m10_hole len = body 5.0 len
+m12_hole len = body 6.0 len

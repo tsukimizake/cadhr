@@ -43,6 +43,8 @@ pub enum Value {
     },
     /// 3D 幾何形状 (宣言ツリー)。Phase 4 で manifold-rs に橋渡しする。
     Shape3D(Model3D),
+    /// 2D 幾何形状 (extrude / revolve の入力)。
+    Shape2D(Model2D),
     /// 2D 形状 / 平面など。Phase 5 以降で具体化。
     Opaque(String, Vec<Value>),
 }
@@ -118,7 +120,68 @@ pub enum Model3D {
     Diff(Box<Model3D>, Box<Model3D>),
     Intersect(Box<Model3D>, Box<Model3D>),
     Hull(Box<Model3D>, Box<Model3D>),
+    /// 2D 形状を指定平面上に置いて高さ方向へ押し出す。
+    LinearExtrude {
+        profile: Model2D,
+        plane: Plane3D,
+        height: f64,
+    },
+    /// 2D 形状を twist (deg) + scale (sx, sy) 付きで押し出す。Phase 10 補完。
+    ComplexExtrude {
+        profile: Model2D,
+        plane: Plane3D,
+        height: f64,
+        twist: f64,
+        scale_x: f64,
+        scale_y: f64,
+    },
+    /// 2D 形状を回転軸まわりに回して 3D に。`degrees` 360 で全周、180 で半周。
+    Revolve {
+        profile: Model2D,
+        plane: Plane3D,
+        degrees: f64,
+    },
+    /// STL ファイルから読み込んだ Mesh。`search_paths` で見つかるパスを期待する。
+    Stl {
+        path: String,
+    },
+    /// 2D profile を 3D path (連続 Point3D) に沿って sweep。
+    SweepExtrude {
+        profile: Model2D,
+        plane: Plane3D,
+        path: Vec<(f64, f64, f64)>,
+    },
+    /// BBox 中心を `target` に持ってくる。bridge 内で AABB を計測してから translate する。
+    Center3D {
+        shape: Box<Model3D>,
+        target: (f64, f64, f64),
+    },
     Empty,
+}
+
+/// 2D 形状の宣言ツリー (manifold-rs の polygon ring に変換する前段)。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Model2D {
+    /// 単一閉路ポリゴン。先頭点と終点が同じでも違ってもよく、bridge 側で閉じる。
+    Polygon(Vec<(f64, f64)>),
+    /// 2D CSG ノード。
+    Union2D(Box<Model2D>, Box<Model2D>),
+    Diff2D(Box<Model2D>, Box<Model2D>),
+    Intersect2D(Box<Model2D>, Box<Model2D>),
+    /// BBox 中心移動。`target` (cx, cy) に bbox 中心を持ってくる。
+    Center2D {
+        shape: Box<Model2D>,
+        target: (f64, f64),
+    },
+    Empty2D,
+}
+
+/// Shape2D を 3D に持ち上げるときの基準平面。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plane3D {
+    XY,
+    YZ,
+    XZ,
 }
 
 impl fmt::Display for Value {
@@ -167,6 +230,7 @@ impl fmt::Display for Value {
                 write!(f, "<builtin {name} ({}/{})>", args.len(), arity)
             }
             Value::Shape3D(m) => write!(f, "<Shape3D {m:?}>"),
+            Value::Shape2D(m) => write!(f, "<Shape2D {m:?}>"),
             Value::Opaque(tag, _) => write!(f, "<{tag}>"),
         }
     }

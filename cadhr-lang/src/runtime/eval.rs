@@ -6,9 +6,11 @@
 //! ADT コンストラクタを `Value::Ctor` として表現し、`case` で pattern match する。
 
 use crate::diagnostic::{Diagnostic, Span};
+use crate::module::{LoadedModule, ResolvedUnit};
 use crate::runtime::builtin::{BuiltinEval, BuiltinEvalRegistry};
 use crate::runtime::value::{ClosureBody, Env, Value};
 use crate::syntax::ast::*;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 pub struct Evaluator<'r> {
@@ -23,6 +25,137 @@ impl<'r> Evaluator<'r> {
             builtins,
             ctor_arities: Default::default(),
         }
+    }
+
+    /// 解決済み複数モジュール (`ResolvedUnit`) を依存順に評価し、
+    /// 各モジュールの完成 env を `qualified_name → Env` のマップで返す。
+    /// main モジュール (`unit.main_index`) は空名 `""` で引ける。
+    pub fn eval_unit(
+        &mut self,
+        unit: &ResolvedUnit,
+    ) -> Result<HashMap<String, Rc<Env>>, Vec<Diagnostic>> {
+        // ADT ctor arity を全モジュールから集める (qualified / unqualified 両方)
+        for lm in &unit.modules {
+            for d in &lm.module.decls {
+                if let Decl::Type(t) = d {
+                    for c in &t.constructors {
+                        self.ctor_arities.insert(c.name.clone(), c.args.len());
+                        if !lm.qualified_name.is_empty() {
+                            self.ctor_arities
+                                .insert(qualify_name(&lm.qualified_name, &c.name), c.args.len());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 各モジュールの「local 名 → Value」テーブル (import 公開時に再利用)
+        let mut module_locals: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut module_envs: HashMap<String, Rc<Env>> = HashMap::new();
+        let mut all_diag: Vec<Diagnostic> = Vec::new();
+
+        for lm in &unit.modules {
+            match self.eval_one_module(lm, &module_locals, &mut module_envs) {
+                Ok(locals) => {
+                    module_locals.insert(lm.qualified_name.clone(), locals);
+                }
+                Err(diags) => all_diag.extend(diags),
+            }
+        }
+
+        if all_diag.is_empty() {
+            Ok(module_envs)
+        } else {
+            Err(all_diag)
+        }
+    }
+
+    fn eval_one_module(
+        &self,
+        lm: &LoadedModule,
+        module_locals: &HashMap<String, HashMap<String, Value>>,
+        module_envs: &mut HashMap<String, Rc<Env>>,
+    ) -> Result<HashMap<String, Value>, Vec<Diagnostic>> {
+        let mut env = Env::new();
+        let mut locals: HashMap<String, Value> = HashMap::new();
+
+        // 1. builtins (全モジュール共通)
+        for (name, b) in &self.builtins.by_name {
+            env = env.extend(
+                name,
+                Value::Builtin {
+                    name: name.to_string(),
+                    arity: b.arity,
+                    args: Vec::new(),
+                },
+            );
+        }
+
+        // 2. 自モジュールの ADT ctor (unqualified + qualified)
+        for d in &lm.module.decls {
+            if let Decl::Type(t) = d {
+                for c in &t.constructors {
+                    let v = make_ctor_value(c);
+                    env = env.extend(&c.name, v.clone());
+                    if !lm.qualified_name.is_empty() {
+                        env = env
+                            .extend(&qualify_name(&lm.qualified_name, &c.name), v.clone());
+                    }
+                    locals.insert(c.name.clone(), v);
+                }
+            }
+        }
+
+        // 3. import 解決
+        for imp in &lm.module.imports {
+            let imp_qname = crate::module::join_name(&imp.module);
+            let imp_locals = module_locals.get(&imp_qname).cloned().ok_or_else(|| {
+                vec![Diagnostic::error(
+                    imp.span,
+                    format!("import 先 `{imp_qname}` がまだロードされていません (resolver bug?)"),
+                )]
+            })?;
+            let prefix = imp.alias.clone().unwrap_or_else(|| imp_qname.clone());
+
+            // qualified: prefix.{name} で常に引けるようにする
+            for (k, v) in &imp_locals {
+                env = env.extend(&qualify_name(&prefix, k), v.clone());
+            }
+
+            // unqualified: exposing に従って晒す
+            match &imp.exposing {
+                Some(Exposing::All(_)) => {
+                    for (k, v) in &imp_locals {
+                        env = env.extend(k, v.clone());
+                    }
+                }
+                Some(Exposing::Some(items, _)) => {
+                    for item in items {
+                        if let Some(v) = imp_locals.get(&item.name) {
+                            env = env.extend(&item.name, v.clone());
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+
+        // 4. local value decl を順次評価
+        for d in &lm.module.decls {
+            if let Decl::Value(v) = d {
+                let val = self
+                    .eval_value_decl(v, Rc::new(env.clone()))
+                    .map_err(|e| vec![e])?;
+                env = env.extend(&v.name, val.clone());
+                if !lm.qualified_name.is_empty() {
+                    env = env.extend(&qualify_name(&lm.qualified_name, &v.name), val.clone());
+                }
+                locals.insert(v.name.clone(), val);
+            }
+        }
+
+        module_envs.insert(lm.qualified_name.clone(), Rc::new(env));
+        Ok(locals)
     }
 
     /// 1 つのモジュールを評価し、top-level の `Env` を返す。
@@ -113,12 +246,18 @@ impl<'r> Evaluator<'r> {
     pub fn eval_expr(&self, e: &Expr, env: &Rc<Env>) -> Result<Value, Diagnostic> {
         match e {
             Expr::Lit(l, _) => Ok(lit_to_value(l)),
-            Expr::Var { name, span, .. } => env.lookup(name).cloned().ok_or_else(|| {
-                Diagnostic::error(*span, format!("評価時に未定義の変数 `{name}`"))
-            }),
-            Expr::Ctor { name, span, .. } => env.lookup(name).cloned().ok_or_else(|| {
-                Diagnostic::error(*span, format!("評価時に未定義のコンストラクタ `{name}`"))
-            }),
+            Expr::Var { module, name, span } => {
+                let key = qualify(module.as_ref(), name);
+                env.lookup(&key).cloned().ok_or_else(|| {
+                    Diagnostic::error(*span, format!("評価時に未定義の変数 `{key}`"))
+                })
+            }
+            Expr::Ctor { module, name, span } => {
+                let key = qualify(module.as_ref(), name);
+                env.lookup(&key).cloned().ok_or_else(|| {
+                    Diagnostic::error(*span, format!("評価時に未定義のコンストラクタ `{key}`"))
+                })
+            }
             Expr::List(items, _) => {
                 let vs = items
                     .iter()
@@ -340,6 +479,37 @@ impl<'r> Evaluator<'r> {
                 span,
                 format!("関数でない値 `{other}` に引数を適用できません"),
             )),
+        }
+    }
+}
+
+/// `Some(ModuleName)` を持つ Var/Ctor を `Foo.bar` 形式の lookup キーに正規化する。
+fn qualify(module: Option<&ModuleName>, name: &str) -> String {
+    match module {
+        Some(m) if !m.segments.is_empty() => format!("{}.{}", m.segments.join("."), name),
+        _ => name.to_string(),
+    }
+}
+
+fn qualify_name(module: &str, name: &str) -> String {
+    if module.is_empty() {
+        name.to_string()
+    } else {
+        format!("{module}.{name}")
+    }
+}
+
+fn make_ctor_value(c: &Constructor) -> Value {
+    if c.args.is_empty() {
+        Value::Ctor {
+            tag: c.name.clone(),
+            args: Vec::new(),
+        }
+    } else {
+        Value::Builtin {
+            name: format!("__ctor_{}", c.name),
+            arity: c.args.len(),
+            args: Vec::new(),
         }
     }
 }

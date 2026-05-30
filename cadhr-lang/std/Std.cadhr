@@ -1,0 +1,21 @@
+module Std exposing (..)
+
+-- main が返すレコード型。GUI / interpreter はこの 3 フィールドを取り出す。
+type alias Output =
+    { models : List Shape3D
+    , bom : List BomEntry
+    , controls : List ControlPoint
+    }
+
+-- BOM (Bill of Materials) 1 行。Length / Width / Count などの分類で管理する。
+type BomEntry
+    = Length Float
+    | Width Float
+    | Count Int
+
+-- 3D ドラッグ可能なコントロールポイント。
+type ControlPoint
+    = CP3 String Float Float Float
+
+empty3d : Shape3D
+empty3d = empty_3d

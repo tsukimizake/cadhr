@@ -1,0 +1,14 @@
+-- counter_cable_clip を新 cadhr-lang (Elm-like) で書き直したもの。
+-- 旧 Prolog 版の `a - b` (CSG difference) は `diff3d` 関数呼び出しに置換。
+
+main =
+    let
+        cablecut = 5.0
+        base = cube 60.0 60.0 20.0
+        cut1 = cube 41.0 30.0 20.0
+            |> translate3d (p3 0.0 0.0 0.0) (p3 10.0 0.0 0.0)
+        cut2 = cube (42.2 + cablecut) 30.0 20.0
+            |> translate3d (p3 0.0 0.0 0.0) (p3 (10.0 - cablecut) 20.0 0.0)
+        shape = diff3d (diff3d base cut1) cut2
+    in
+    { models = [shape], bom = [], controls = [] }

@@ -4,8 +4,39 @@
 //! 関数の実行時挙動をここに登録する。manifold-rs 呼び出しは行わず、宣言的な
 //! `Model3D` を組み立てるだけ (Phase 4 で `manifold_bridge::evaluate` に接続)。
 
-use crate::runtime::value::{Model3D, Value};
+use crate::runtime::value::{Model2D, Model3D, Plane3D, Value};
+use std::cell::RefCell;
 use std::collections::HashMap;
+
+thread_local! {
+    /// GUI が control point をドラッグした場合の override マップ。`run_main` 直前に
+    /// `set_control_overrides` で書き換える。eval 中 `control3d` / `control2d` builtin
+    /// がこのマップを参照する。
+    pub static CONTROL_OVERRIDES: RefCell<HashMap<String, [f64; 3]>> = RefCell::new(HashMap::new());
+    /// eval 中に呼ばれた control point の (name, current_value) を記録する。
+    /// `run_main` が完了したあと `take_recorded_controls` で取り出す。
+    pub static RECORDED_CONTROLS: RefCell<Vec<(String, [f64; 3])>> = RefCell::new(Vec::new());
+}
+
+/// `run_main` が eval 前に呼んで thread-local の override map を更新する。
+/// 同時に前回の `RECORDED_CONTROLS` を確実に初期化する (前回の eval が早期 return で
+/// take を呼ばずに終わった場合に備えて)。
+pub fn set_control_overrides(overrides: HashMap<String, [f64; 3]>) {
+    CONTROL_OVERRIDES.with(|c| *c.borrow_mut() = overrides);
+    RECORDED_CONTROLS.with(|r| r.borrow_mut().clear());
+}
+
+/// `run_main` が eval 後に呼んで recorded control points を取り出す。
+pub fn take_recorded_controls() -> Vec<(String, [f64; 3])> {
+    RECORDED_CONTROLS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+fn as_string(v: &Value) -> Result<String, String> {
+    match v {
+        Value::String(s) => Ok(s.clone()),
+        _ => Err(format!("String が期待されましたが {v} でした")),
+    }
+}
 
 pub type BuiltinFn = fn(&[Value]) -> Result<Value, String>;
 
@@ -64,6 +95,29 @@ fn as_point3d(v: &Value) -> Result<(f64, f64, f64), String> {
             Ok((as_f64(&args[0])?, as_f64(&args[1])?, as_f64(&args[2])?))
         }
         _ => Err(format!("Point3D が期待されましたが {v} でした")),
+    }
+}
+
+fn as_point2d(v: &Value) -> Result<(f64, f64), String> {
+    match v {
+        Value::Opaque(tag, args) if tag == "Point2D" && args.len() == 2 => {
+            Ok((as_f64(&args[0])?, as_f64(&args[1])?))
+        }
+        _ => Err(format!("Point2D が期待されましたが {v} でした")),
+    }
+}
+
+fn as_shape2d(v: &Value) -> Result<Model2D, String> {
+    match v {
+        Value::Shape2D(m) => Ok(m.clone()),
+        _ => Err(format!("Shape2D が期待されましたが {v} でした")),
+    }
+}
+
+fn as_list(v: &Value) -> Result<&[Value], String> {
+    match v {
+        Value::List(vs) => Ok(vs.as_slice()),
+        _ => Err(format!("List が期待されましたが {v} でした")),
     }
 }
 
@@ -192,16 +246,19 @@ pub fn registry() -> BuiltinEvalRegistry {
             )),
             _ => Err("stl: 文字列パス を要求".to_string()),
         })
-        // -- 2D primitives (簡略実装)
+        // -- 2D primitives
         .add("circle", 1, |args| {
-            Ok(Value::Opaque(
-                "Shape2D".to_string(),
-                vec![Value::Float(as_f64(&args[0])?)],
-            ))
+            let r = as_f64(&args[0])?;
+            // 32 角形で近似。GUI 描画でほとんど円に見える程度。
+            let n = 32;
+            let mut pts: Vec<(f64, f64)> = Vec::with_capacity(n);
+            for i in 0..n {
+                let t = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
+                pts.push((r * t.cos(), r * t.sin()));
+            }
+            Ok(Value::Shape2D(Model2D::Polygon(pts)))
         })
-        .add("empty_2d", 0, |_| {
-            Ok(Value::Opaque("Shape2D".to_string(), vec![]))
-        })
+        .add("empty_2d", 0, |_| Ok(Value::Shape2D(Model2D::Empty2D)))
         // place / linear_extrude (Shape2D を Shape3D に変換 — 当面 opaque で
         // データを保持するだけ)
         .add("place", 2, |args| {
@@ -212,9 +269,203 @@ pub fn registry() -> BuiltinEvalRegistry {
         })
         .add("linear_extrude", 2, |args| match &args[0] {
             Value::Opaque(tag, _) if tag == "PlacedShape2D" => {
-                // 仮実装: Empty Shape3D を返す。Phase 4 で manifold-rs に橋渡し。
+                // 旧 API (`place` 経由) は当面 Empty 返却。新コードは `extrude_xy`/_yz/_xz を使う。
                 Ok(Value::Shape3D(Model3D::Empty))
             }
             _ => Err("linear_extrude: PlacedShape2D を要求".to_string()),
+        })
+        // -- 2D ポリゴン + 平面別 extrude
+        .add("polygon", 1, |args| {
+            let points = as_list(&args[0])?;
+            let mut pts: Vec<(f64, f64)> = Vec::with_capacity(points.len());
+            for p in points {
+                pts.push(as_point2d(p)?);
+            }
+            Ok(Value::Shape2D(Model2D::Polygon(pts)))
+        })
+        .add("extrude_xy", 2, |args| {
+            Ok(Value::Shape3D(Model3D::LinearExtrude {
+                profile: as_shape2d(&args[1])?,
+                plane: Plane3D::XY,
+                height: as_f64(&args[0])?,
+            }))
+        })
+        .add("extrude_yz", 2, |args| {
+            Ok(Value::Shape3D(Model3D::LinearExtrude {
+                profile: as_shape2d(&args[1])?,
+                plane: Plane3D::YZ,
+                height: as_f64(&args[0])?,
+            }))
+        })
+        .add("extrude_xz", 2, |args| {
+            Ok(Value::Shape3D(Model3D::LinearExtrude {
+                profile: as_shape2d(&args[1])?,
+                plane: Plane3D::XZ,
+                height: as_f64(&args[0])?,
+            }))
+        })
+        // -- 2D CSG
+        .add("union2d", 2, |args| {
+            Ok(Value::Shape2D(Model2D::Union2D(
+                Box::new(as_shape2d(&args[0])?),
+                Box::new(as_shape2d(&args[1])?),
+            )))
+        })
+        .add("diff2d", 2, |args| {
+            Ok(Value::Shape2D(Model2D::Diff2D(
+                Box::new(as_shape2d(&args[0])?),
+                Box::new(as_shape2d(&args[1])?),
+            )))
+        })
+        .add("intersect2d", 2, |args| {
+            Ok(Value::Shape2D(Model2D::Intersect2D(
+                Box::new(as_shape2d(&args[0])?),
+                Box::new(as_shape2d(&args[1])?),
+            )))
+        })
+        // -- revolve
+        .add("revolve_xy", 2, |args| {
+            Ok(Value::Shape3D(Model3D::Revolve {
+                profile: as_shape2d(&args[1])?,
+                plane: Plane3D::XY,
+                degrees: as_f64(&args[0])?,
+            }))
+        })
+        .add("revolve_yz", 2, |args| {
+            Ok(Value::Shape3D(Model3D::Revolve {
+                profile: as_shape2d(&args[1])?,
+                plane: Plane3D::YZ,
+                degrees: as_f64(&args[0])?,
+            }))
+        })
+        .add("revolve_xz", 2, |args| {
+            Ok(Value::Shape3D(Model3D::Revolve {
+                profile: as_shape2d(&args[1])?,
+                plane: Plane3D::XZ,
+                degrees: as_f64(&args[0])?,
+            }))
+        })
+        // -- complex_extrude
+        .add("complex_extrude_xy", 5, |args| {
+            Ok(Value::Shape3D(Model3D::ComplexExtrude {
+                profile: as_shape2d(&args[4])?,
+                plane: Plane3D::XY,
+                height: as_f64(&args[0])?,
+                twist: as_f64(&args[1])?,
+                scale_x: as_f64(&args[2])?,
+                scale_y: as_f64(&args[3])?,
+            }))
+        })
+        // -- sweep_extrude (XY 平面 profile + 3D path)
+        .add("sweep_extrude_xy", 2, |args| {
+            let path_v = as_list(&args[0])?;
+            let mut path: Vec<(f64, f64, f64)> = Vec::with_capacity(path_v.len());
+            for p in path_v {
+                path.push(as_point3d(p)?);
+            }
+            Ok(Value::Shape3D(Model3D::SweepExtrude {
+                profile: as_shape2d(&args[1])?,
+                plane: Plane3D::XY,
+                path,
+            }))
+        })
+        // -- center3d / center2d
+        .add("center3d", 2, |args| {
+            let t = as_point3d(&args[0])?;
+            Ok(Value::Shape3D(Model3D::Center3D {
+                shape: Box::new(as_shape3d(&args[1])?),
+                target: t,
+            }))
+        })
+        .add("center2d", 2, |args| {
+            let t = as_point2d(&args[0])?;
+            Ok(Value::Shape2D(Model2D::Center2D {
+                shape: Box::new(as_shape2d(&args[1])?),
+                target: t,
+            }))
+        })
+        // -- control points: 第 1 引数を name (String) として保持しつつ第 2 引数の Point
+        //    を返す。GUI 側は MainOutput.controls から拾って描画 + ドラッグ override。
+        //    ここでは「裸の Point2D/3D」をそのまま返す簡易実装 (GUI 側で Ctor として
+        //    詰めなおす)。Phase 11 で GUI override を実装するときに Value::Ctor で
+        //    包む形に拡張する。
+        .add("control3d", 2, |args| {
+            let name = as_string(&args[0])?;
+            let default = as_point3d(&args[1])?;
+            let current = CONTROL_OVERRIDES.with(|c| {
+                c.borrow()
+                    .get(&name)
+                    .copied()
+                    .unwrap_or([default.0, default.1, default.2])
+            });
+            RECORDED_CONTROLS.with(|r| r.borrow_mut().push((name, current)));
+            Ok(Value::Opaque(
+                "Point3D".to_string(),
+                vec![
+                    Value::Float(current[0]),
+                    Value::Float(current[1]),
+                    Value::Float(current[2]),
+                ],
+            ))
+        })
+        .add("control2d", 2, |args| {
+            let name = as_string(&args[0])?;
+            let default = as_point2d(&args[1])?;
+            let current = CONTROL_OVERRIDES.with(|c| {
+                c.borrow()
+                    .get(&name)
+                    .copied()
+                    .unwrap_or([default.0, default.1, 0.0])
+            });
+            // 2D は z を 0 として記録する (GUI 側で扱いを分岐)。
+            RECORDED_CONTROLS.with(|r| r.borrow_mut().push((name, current)));
+            Ok(Value::Opaque(
+                "Point2D".to_string(),
+                vec![Value::Float(current[0]), Value::Float(current[1])],
+            ))
+        })
+        // -- Bezier サンプリング
+        .add("bezier_quad", 4, |args| {
+            let p0 = as_point2d(&args[0])?;
+            let c = as_point2d(&args[1])?;
+            let p1 = as_point2d(&args[2])?;
+            let n = as_int(&args[3])?.max(2) as usize;
+            let mut pts: Vec<Value> = Vec::with_capacity(n);
+            // start (t=0) は含めず、segments 個に分割した点列 (t=1..=n-1) と end (t=1) を返す。
+            // start を含めると polygon に append したときに duplicate が出やすいため。
+            for i in 1..=n {
+                let t = i as f64 / n as f64;
+                let mt = 1.0 - t;
+                let x = mt * mt * p0.0 + 2.0 * mt * t * c.0 + t * t * p1.0;
+                let y = mt * mt * p0.1 + 2.0 * mt * t * c.1 + t * t * p1.1;
+                pts.push(Value::Opaque(
+                    "Point2D".to_string(),
+                    vec![Value::Float(x), Value::Float(y)],
+                ));
+            }
+            Ok(Value::List(pts))
+        })
+        .add("bezier_cubic", 5, |args| {
+            let p0 = as_point2d(&args[0])?;
+            let c1 = as_point2d(&args[1])?;
+            let c2 = as_point2d(&args[2])?;
+            let p1 = as_point2d(&args[3])?;
+            let n = as_int(&args[4])?.max(2) as usize;
+            let mut pts: Vec<Value> = Vec::with_capacity(n);
+            for i in 1..=n {
+                let t = i as f64 / n as f64;
+                let mt = 1.0 - t;
+                let b0 = mt * mt * mt;
+                let b1 = 3.0 * mt * mt * t;
+                let b2 = 3.0 * mt * t * t;
+                let b3 = t * t * t;
+                let x = b0 * p0.0 + b1 * c1.0 + b2 * c2.0 + b3 * p1.0;
+                let y = b0 * p0.1 + b1 * c1.1 + b2 * c2.1 + b3 * p1.1;
+                pts.push(Value::Opaque(
+                    "Point2D".to_string(),
+                    vec![Value::Float(x), Value::Float(y)],
+                ));
+            }
+            Ok(Value::List(pts))
         })
 }

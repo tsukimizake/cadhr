@@ -8,6 +8,7 @@
 
 pub mod builtin;
 pub mod env;
+pub mod exhaustive;
 pub mod infer;
 pub mod slider;
 pub mod subst;
