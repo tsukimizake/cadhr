@@ -9,7 +9,7 @@
 //! - `Bool` / `List` は組み込みの仮想 ADT として扱う
 //! - 数値・文字列・未知の型は「無限の値集合」と見て、wildcard/var が無ければ非網羅
 //!
-//! Phase 5 完了版。`compile()` が warning として吐く。
+//! `compile()` が warning として吐く。
 
 use crate::diagnostic::{Diagnostic, Span};
 use crate::syntax::ast::*;

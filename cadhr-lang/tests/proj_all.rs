@@ -1,4 +1,4 @@
-//! `~/cadhr-proj/` 配下の全プロジェクトを新仕様で実際にロード + 評価する smoke test。
+//! `~/cadhr-proj/` 配下の全プロジェクトを実際にロード + 評価する smoke test。
 //! ローカル環境専用 (CI では skip)。
 
 use cadhr_lang::{Inputs, compile_with_paths};

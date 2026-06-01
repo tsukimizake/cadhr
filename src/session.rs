@@ -16,7 +16,7 @@ pub struct SessionPreview {
     pub preview_id: u64,
     #[serde(default)]
     pub order: usize,
-    /// slider 名 → 値 (新仕様)。旧 query_param_overrides は破棄。
+    /// slider 名 → 値。
     #[serde(default)]
     pub slider_values: HashMap<String, f64>,
     /// control point 名 → (x, y, z) override。CP ドラッグ後のスナップ位置を保存。

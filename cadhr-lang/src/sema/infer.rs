@@ -3,9 +3,6 @@
 //! 各 AST node に対して `infer_expr` で「推論結果型 + 累積置換」を返す。最終的に
 //! トップレベル decl の集合に対して `infer_module` を呼び、各値定義の型を確定する。
 //!
-//! Phase 2 の現状: 式レベルの最小サブセット (Lit / Var / App / Lambda / Let / If /
-//! BinOp / List / Record / Field / Range)。ADT / Case / Pattern は Phase 5 で本格化。
-//!
 //! 多相は rank-1 (let-polymorphism + シグネチャ全称量化)。シグネチャ宣言と value
 //! decl の name 一致で型を紐付ける。
 
@@ -87,7 +84,7 @@ impl Infer {
                     .iter()
                     .map(|a| self.ty_of_type_expr(a, var_map, diag))
                     .collect();
-                // 既知の type alias なら展開する (Phase 2 では shallow alias のみ)
+                // 既知の type alias なら展開する (shallow alias のみ)
                 if let Some(alias) = self.aliases.get(name) {
                     if alias.params.len() != args_ty.len() {
                         diag.push(Diagnostic::error(
@@ -486,8 +483,8 @@ fn infer_value_decl(
     Some((fun_ty, subst))
 }
 
-/// pattern を env に束縛 (Phase 2 では Var / Wildcard のみ厳密、Ctor は ctor_types
-/// から取得して args 数のみチェック)。
+/// pattern を env に束縛。Var / Wildcard を直接束縛し、Ctor は ctor_types から
+/// 取得して args 数のみチェックする。
 fn bind_pattern(
     infer: &mut Infer,
     env: &mut TypeEnv,
@@ -545,7 +542,7 @@ fn bind_pattern(
             bind_pattern(infer, env, tail, &list_ty, diag);
         }
         Pattern::Record(_, _) | Pattern::As { .. } => {
-            // Phase 5 で本実装
+            // TODO: record pattern と as pattern の型束縛
         }
     }
 }
@@ -718,7 +715,7 @@ pub fn infer_expr(
         }
         Expr::Negate(inner, _) => {
             let (ty, s) = infer_expr(infer, env, inner, diag)?;
-            // Float/Int どちらでも OK としたいが、Phase 2 は Float に固定
+            // Float に固定。Int は fresh で逃がす
             let s2 = match unify(&ty, &Type::con("Float")) {
                 Ok(s) => s,
                 Err(_) => {
@@ -766,7 +763,7 @@ pub fn infer_expr(
                 subst = subst.compose(&s);
                 fs.push((f.name.clone(), ty));
             }
-            // record literal は型エイリアスとの照合は Phase 5。今は anonymous record。
+            // record literal は anonymous record 型として推論する。
             Some((Type::Record(fs), subst))
         }
         Expr::Field {
@@ -818,11 +815,11 @@ pub fn infer_expr(
             // updates の各 field の型は base record の同名 field と一致する必要
             let _ = updates;
             let _ = span;
-            // Phase 5 で本実装。今は base の型をそのまま返す。
+            // TODO: updates の field 型を base record と単一化する
             Some((subst.apply(&b_ty), subst))
         }
         Expr::Case { .. } => {
-            // Phase 5 で本実装
+            // TODO: Case 式の本格的な型付け
             Some((infer.fresh(), Subst::empty()))
         }
         Expr::Error(span) => {

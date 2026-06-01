@@ -1,8 +1,8 @@
 //! 正格評価器。`Module` の top-level decl をすべて評価し、`Env` (識別子 → 値) を
 //! 完成させる。`run_main(env, inputs)` で main を呼ぶ。
 //!
-//! Phase 3 の現状: 式レベルの主要構文 (Lit / Var / Ctor / App / Lambda / Let / If /
-//! Case / BinOp / List / Record / RecordUpdate / Field / Range / Negate) を実装。
+//! 式レベルの構文 (Lit / Var / Ctor / App / Lambda / Let / If / Case / BinOp /
+//! List / Record / RecordUpdate / Field / Range / Negate) を実装。
 //! ADT コンストラクタを `Value::Ctor` として表現し、`case` で pattern match する。
 
 use crate::diagnostic::{Diagnostic, Span};

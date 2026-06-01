@@ -1,6 +1,5 @@
-//! cadhr-proj/ から取った代表的なユーザコードを新 cadhr-lang 仕様に書き直し、
-//! コンパイル + main 実行が通ることを確認する。Phase 10 (migration verification) の
-//! 一環。
+//! cadhr-proj/ から取った代表的なユーザコードのコンパイル + main 実行が通ることを
+//! 確認する。
 
 use cadhr_lang::{Inputs, Value, compile, run_main};
 

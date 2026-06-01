@@ -1,7 +1,7 @@
 //! Builtin functor の registry。
 //!
-//! Phase 2 では型シグネチャだけを持ち、Phase 3 で evaluator (`runtime/builtin.rs`)
-//! に評価実装を接続する。LSP の completion / hover もこのレジストリを参照する。
+//! 型シグネチャを持ち、評価実装は `runtime/builtin.rs` で接続する。
+//! LSP の completion / hover もこのレジストリを参照する。
 
 use crate::sema::ty::{Scheme, TyVar, TyVarGen, Type};
 use std::collections::HashMap;
@@ -37,9 +37,9 @@ impl BuiltinRegistry {
     }
 }
 
-/// 初期ビルトイン群。本仕様の最小セット (cube / sphere / cylinder / translate3d /
-/// union / difference / intersect / linear_extrude / p3 / p2 / stl / intersect (Range))。
-/// Phase 3 で evaluator 実装を `runtime/builtin.rs` に持たせて接続する。
+/// 初期ビルトイン群 (cube / sphere / cylinder / translate3d / union / difference /
+/// intersect / linear_extrude / p3 / p2 / stl / intersect (Range))。
+/// 評価実装は `runtime/builtin.rs` に登録する。
 pub fn registry() -> BuiltinRegistry {
     let mut g = TyVarGen::new();
     let r = BuiltinRegistry::new();
@@ -197,7 +197,7 @@ pub fn registry() -> BuiltinRegistry {
         "Shape2D を XZ 平面上で Y 方向に Float だけ押し出す (`s |> extrude_xz h`)",
     ));
 
-    // -- 2D CSG (Phase 10 補完)
+    // -- 2D CSG
     let r = r.add(mono(
         "union2d",
         vec![shape2d(), shape2d()],
@@ -282,7 +282,7 @@ pub fn registry() -> BuiltinRegistry {
         "名前付き 2D control point。GUI ドラッグで上書き可能",
     ));
 
-    // -- Bezier 曲線サンプリング (Phase 10 補完)
+    // -- Bezier 曲線サンプリング
     // List Point2D を返すので polygon の入力にそのまま渡せる:
     //   polygon ([p2 0 0] ++ bezier_quad (p2 0 0) (p2 5 10) (p2 10 0) 20)
     let r = r.add(mono(

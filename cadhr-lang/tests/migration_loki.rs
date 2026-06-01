@@ -1,9 +1,8 @@
-//! loki_home_key の migration テスト。
+//! loki_home_key の統合テスト。
 //!
-//! 旧版は `#use("../bolts")` で別ディレクトリの bolts library を参照していた。
-//! 新版は同じディレクトリに `Bolts/db.cadhr` を置き `import Bolts` する形に変える。
+//! 同じディレクトリに `Bolts/db.cadhr` を置き `import Bolts` する形。
 //! 3 平面 sketch を extrude → intersect3d で 3 個の押し出しを合わせて、最後に
-//! ボルト穴を diff3d で抜くという旧版の挙動を新 API で再構築する。
+//! ボルト穴を diff3d で抜く。
 
 use cadhr_lang::{Inputs, compile_with_paths, run_main};
 use std::path::PathBuf;

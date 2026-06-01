@@ -1,4 +1,4 @@
-//! Phase 10 補完で追加した builtin の動作テスト。
+//! 拡張 builtin の動作テスト。
 //! revolve / complex_extrude / sweep_extrude / 2D CSG / center / bezier。
 
 use cadhr_lang::{Inputs, compile, run_main};

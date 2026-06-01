@@ -40,7 +40,8 @@ pub enum CompileJobResult {
 }
 
 pub fn run_compile_job(params: CompileJobParams) -> CompileJobResult {
-    match compile_with_paths(&params.source, &params.search_paths) {
+    log_compile_request(&params);
+    let result = match compile_with_paths(&params.source, &params.search_paths) {
         Ok(prog) => {
             let signature = prog.main_signature.clone();
             let diagnostics = prog.diagnostics.iter().map(|d| d.message.clone()).collect();
@@ -60,7 +61,9 @@ pub fn run_compile_job(params: CompileJobParams) -> CompileJobResult {
                 diagnostics: errs.iter().map(|d| d.message.clone()).collect(),
             }
         }
-    }
+    };
+    log_compile_result(&result);
+    result
 }
 
 // ---------------- eval job ----------------
@@ -115,6 +118,7 @@ impl std::fmt::Debug for EvalJobResult {
 }
 
 pub fn run_eval_job(params: EvalJobParams) -> EvalJobResult {
+    log_eval_request("eval", &params);
     let mut inputs = Inputs::default();
     inputs.control_overrides = params.control_overrides.clone();
     for p in &params.program.main_signature.params {
@@ -127,21 +131,25 @@ pub fn run_eval_job(params: EvalJobParams) -> EvalJobResult {
     let output = match run_main(&params.program, &inputs) {
         Ok(o) => o,
         Err(d) => {
-            return EvalJobResult::Error {
+            let r = EvalJobResult::Error {
                 message: d.message,
                 span: Some(d.span),
             };
+            log_eval_result("eval", &r);
+            return r;
         }
     };
 
     let (vertices, indices) = build_mesh(&output.models, &params.search_paths);
     let bom: Vec<String> = output.bom.iter().map(|v| format!("{v}")).collect();
-    EvalJobResult::Success {
+    let result = EvalJobResult::Success {
         vertices,
         indices,
         bom,
         control_points: output.control_points,
-    }
+    };
+    log_eval_result("eval", &result);
+    result
 }
 
 /// 衝突チェック: `main` の出力 models をペア毎に intersect して、非空の交差を集める。
@@ -150,6 +158,7 @@ pub fn run_collision_job(params: EvalJobParams) -> EvalJobResult {
     use cadhr_lang::runtime::manifold_bridge::{evaluate_with_paths, to_mesh_arrays_with_paths};
     use cadhr_lang::Model3D;
 
+    log_eval_request("collision", &params);
     let mut inputs = Inputs::default();
     for p in &params.program.main_signature.params {
         let v = params.slider_values.get(&p.name).copied();
@@ -161,10 +170,12 @@ pub fn run_collision_job(params: EvalJobParams) -> EvalJobResult {
     let output = match run_main(&params.program, &inputs) {
         Ok(o) => o,
         Err(d) => {
-            return EvalJobResult::Error {
+            let r = EvalJobResult::Error {
                 message: d.message,
                 span: Some(d.span),
             };
+            log_eval_result("collision", &r);
+            return r;
         }
     };
 
@@ -221,12 +232,14 @@ pub fn run_collision_job(params: EvalJobParams) -> EvalJobResult {
         }
     }
 
-    EvalJobResult::Success {
+    let result = EvalJobResult::Success {
         vertices,
         indices,
         bom,
         control_points: Vec::new(),
-    }
+    };
+    log_eval_result("collision", &result);
+    result
 }
 
 fn build_param_value(range: Option<&SliderDecl>, v: Option<f64>) -> Value {
@@ -279,4 +292,97 @@ fn append_mesh(verts: &mut Vec<Vertex>, idxs: &mut Vec<u32>, arr: MeshArrays) {
     for i in arr.indices {
         idxs.push(base + i);
     }
+}
+
+// ---------------- debug logging ----------------
+
+fn log_compile_request(params: &CompileJobParams) {
+    eprintln!("───── cadhr-lang compile ─────");
+    if !params.search_paths.is_empty() {
+        eprintln!("[search_paths]");
+        for p in &params.search_paths {
+            eprintln!("  {}", p.display());
+        }
+    }
+    eprintln!("[source]");
+    for (i, line) in params.source.lines().enumerate() {
+        eprintln!("  {:>4} | {line}", i + 1);
+    }
+}
+
+fn log_compile_result(result: &CompileJobResult) {
+    match result {
+        CompileJobResult::Success {
+            signature,
+            diagnostics,
+            ..
+        } => {
+            eprintln!("[compile OK]");
+            let names: Vec<&str> = signature.params.iter().map(|p| p.name.as_str()).collect();
+            eprintln!("  main params: [{}]", names.join(", "));
+            for d in diagnostics {
+                eprintln!("  diag: {d}");
+            }
+        }
+        CompileJobResult::Error {
+            message,
+            span,
+            diagnostics,
+        } => {
+            eprintln!("[compile ERROR] {message} (span={span:?})");
+            for d in diagnostics {
+                eprintln!("  diag: {d}");
+            }
+        }
+    }
+    eprintln!("──────────────────────────────");
+}
+
+fn log_eval_request(kind: &str, params: &EvalJobParams) {
+    eprintln!("───── cadhr-lang {kind} ─────");
+    if !params.slider_values.is_empty() {
+        eprintln!("[sliders]");
+        let mut items: Vec<(&String, &f64)> = params.slider_values.iter().collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in items {
+            eprintln!("  {k} = {v}");
+        }
+    }
+    if !params.control_overrides.is_empty() {
+        eprintln!("[control_overrides]");
+        let mut items: Vec<(&String, &[f64; 3])> = params.control_overrides.iter().collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in items {
+            eprintln!("  {k} = [{}, {}, {}]", v[0], v[1], v[2]);
+        }
+    }
+}
+
+fn log_eval_result(kind: &str, result: &EvalJobResult) {
+    match result {
+        EvalJobResult::Success {
+            vertices,
+            indices,
+            bom,
+            control_points,
+        } => {
+            eprintln!(
+                "[{kind} OK] verts={} idx={} bom={} cp={}",
+                vertices.len(),
+                indices.len(),
+                bom.len(),
+                control_points.len()
+            );
+            for b in bom {
+                eprintln!("  bom: {b}");
+            }
+            for (n, p) in control_points {
+                eprintln!("  cp: {n} = [{}, {}, {}]", p[0], p[1], p[2]);
+            }
+        }
+        EvalJobResult::Error { message, span } => {
+            eprintln!("[{kind} ERROR] {message} (span={span:?})");
+        }
+    }
+    eprintln!("──────────────────────────────");
 }

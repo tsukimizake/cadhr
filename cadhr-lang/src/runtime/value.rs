@@ -1,6 +1,5 @@
 //! 実行時値 (`Value`)。
 //!
-//! Phase 3 の実装範囲:
 //! - 数値 / 文字列 / 真偽値 / リスト / レコード / Range
 //! - ユーザー定義 ADT の Constructor (`tag` + `args`)
 //! - 関数値 (Closure / Builtin)
@@ -41,11 +40,11 @@ pub enum Value {
         arity: usize,
         args: Vec<Value>,
     },
-    /// 3D 幾何形状 (宣言ツリー)。Phase 4 で manifold-rs に橋渡しする。
+    /// 3D 幾何形状 (宣言ツリー)。`manifold_bridge::evaluate` で manifold-rs に橋渡しする。
     Shape3D(Model3D),
     /// 2D 幾何形状 (extrude / revolve の入力)。
     Shape2D(Model2D),
-    /// 2D 形状 / 平面など。Phase 5 以降で具体化。
+    /// 名前付きの不透明値 (control point ハンドルなど)。
     Opaque(String, Vec<Value>),
 }
 
@@ -89,7 +88,7 @@ impl Env {
 }
 
 /// 3D 幾何形状を表す宣言ツリー (manifold-rs に渡す前の中間表現)。
-/// Phase 4 で `manifold_bridge::evaluate` に渡す。
+/// `manifold_bridge::evaluate` で実体化する。
 #[derive(Clone, Debug, PartialEq)]
 pub enum Model3D {
     Cube {
@@ -126,7 +125,7 @@ pub enum Model3D {
         plane: Plane3D,
         height: f64,
     },
-    /// 2D 形状を twist (deg) + scale (sx, sy) 付きで押し出す。Phase 10 補完。
+    /// 2D 形状を twist (deg) + scale (sx, sy) 付きで押し出す。
     ComplexExtrude {
         profile: Model2D,
         plane: Plane3D,

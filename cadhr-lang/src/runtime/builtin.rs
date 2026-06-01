@@ -2,7 +2,7 @@
 //!
 //! `sema::builtin::registry()` で型シグネチャを定義しているのと対応する形で、各
 //! 関数の実行時挙動をここに登録する。manifold-rs 呼び出しは行わず、宣言的な
-//! `Model3D` を組み立てるだけ (Phase 4 で `manifold_bridge::evaluate` に接続)。
+//! `Model3D` を組み立てて `manifold_bridge::evaluate` に渡す。
 
 use crate::runtime::value::{Model2D, Model3D, Plane3D, Value};
 use std::cell::RefCell;
@@ -238,7 +238,6 @@ pub fn registry() -> BuiltinEvalRegistry {
             }
             _ => Err("intersect: Range a を 2 つ要求".to_string()),
         })
-        // -- 簡単な I/O プレースホルダ (Phase 4 以降で実装)
         .add("stl", 1, |args| match &args[0] {
             Value::String(path) => Ok(Value::Opaque(
                 "Stl".to_string(),
@@ -269,7 +268,7 @@ pub fn registry() -> BuiltinEvalRegistry {
         })
         .add("linear_extrude", 2, |args| match &args[0] {
             Value::Opaque(tag, _) if tag == "PlacedShape2D" => {
-                // 旧 API (`place` 経由) は当面 Empty 返却。新コードは `extrude_xy`/_yz/_xz を使う。
+                // `place` 経由は当面 Empty 返却。`extrude_xy` / `_yz` / `_xz` を使う。
                 Ok(Value::Shape3D(Model3D::Empty))
             }
             _ => Err("linear_extrude: PlacedShape2D を要求".to_string()),
@@ -387,8 +386,7 @@ pub fn registry() -> BuiltinEvalRegistry {
         // -- control points: 第 1 引数を name (String) として保持しつつ第 2 引数の Point
         //    を返す。GUI 側は MainOutput.controls から拾って描画 + ドラッグ override。
         //    ここでは「裸の Point2D/3D」をそのまま返す簡易実装 (GUI 側で Ctor として
-        //    詰めなおす)。Phase 11 で GUI override を実装するときに Value::Ctor で
-        //    包む形に拡張する。
+        //    詰めなおす)。
         .add("control3d", 2, |args| {
             let name = as_string(&args[0])?;
             let default = as_point3d(&args[1])?;

@@ -123,7 +123,7 @@ pub fn evaluate_with_paths(
     }
 }
 
-/// 旧 API 互換のため `include_paths = &[]` で呼ぶラッパ。STL を使わない場合はこれで十分。
+/// `include_paths = &[]` で呼ぶラッパ。STL を使わない場合はこれで十分。
 pub fn evaluate(model: &Model3D) -> Result<Manifold, BridgeError> {
     evaluate_with_paths(model, &[])
 }
