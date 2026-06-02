@@ -463,6 +463,7 @@ version = "0.1.0"
 dependencies = [
  "cadhr-lang",
  "pretty",
+ "tempfile",
  "tokio",
  "tower-lsp",
  "tree-sitter",
