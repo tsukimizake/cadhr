@@ -434,11 +434,15 @@ pub fn expr_parser<'tokens, 'src: 'tokens>(
             });
 
         // `if cond then a else b`
+        // then-branch / else-branch を次行に書ける (`then`/`else` の前後の改行を許す)。
         let if_expr = just(Token::If)
             .ignore_then(expr.clone())
             .then_ignore(just(Token::Then))
+            .then_ignore(nl())
             .then(expr.clone())
+            .then_ignore(nl())
             .then_ignore(just(Token::Else))
+            .then_ignore(nl())
             .then(expr.clone())
             .map_with(|((cond, then_b), else_b), e| Expr::If {
                 cond: Box::new(cond),

@@ -2,7 +2,7 @@
 //!
 //! parse → pretty の round-trip テストと、cadhr-lsp の formatting で使う。
 //! 設計指針:
-//! - 出力は **deterministic** (2 回 pretty しても結果が同じ)
+//! - 出力は deterministic (2 回 pretty しても結果が同じ)
 //! - 演算子の優先順位を尊重して括弧を付ける
 //! - インデントは 4 スペース固定
 //! - 改行は decl の境界、`let` 内の body、関数定義の body などで挿入
@@ -156,7 +156,9 @@ fn pretty_type(t: &TypeExpr, buf: &mut String) {
 
 fn pretty_type_app(t: &TypeExpr, buf: &mut String) {
     match t {
-        TypeExpr::Con { module, name, args, .. } if !args.is_empty() => {
+        TypeExpr::Con {
+            module, name, args, ..
+        } if !args.is_empty() => {
             if let Some(m) = module {
                 pretty_module_name(m, buf);
                 buf.push('.');
@@ -174,7 +176,9 @@ fn pretty_type_app(t: &TypeExpr, buf: &mut String) {
 fn pretty_type_atom(t: &TypeExpr, buf: &mut String) {
     match t {
         TypeExpr::Var(s, _) => buf.push_str(s),
-        TypeExpr::Con { module, name, args, .. } => {
+        TypeExpr::Con {
+            module, name, args, ..
+        } => {
             if args.is_empty() {
                 if let Some(m) = module {
                     pretty_module_name(m, buf);
