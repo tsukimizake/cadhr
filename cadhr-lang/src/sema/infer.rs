@@ -362,15 +362,18 @@ fn infer_module_into(
     let mut result: HashMap<String, Scheme> = HashMap::new();
     for decl in &module.decls {
         if let Decl::Value(v) = decl {
-            let (ty, subst) = match infer_value_decl(infer, &env, v, &mut diag) {
+            // signature があれば先に instantiate し、param 型を body 推論に流す。
+            let declared = infer.signatures.get(&v.name).cloned();
+            let expected = declared.as_ref().map(|sc| infer.instantiate(sc));
+            let (ty, subst) = match infer_value_decl(infer, &env, v, expected.as_ref(), &mut diag) {
                 Some(r) => r,
                 None => continue,
             };
             let final_ty = subst.apply(&ty);
 
-            // signature があれば unify する
-            let scheme = if let Some(declared) = infer.signatures.get(&v.name).cloned() {
-                let inst = infer.instantiate(&declared);
+            // signature があれば unify する (param 型は既に流したので戻り型整合の確認も兼ねる)
+            let scheme = if let Some(declared) = declared {
+                let inst = expected.unwrap();
                 match unify(&final_ty, &inst) {
                     Ok(s) => {
                         let unified_ty = s.apply(&final_ty);
@@ -465,13 +468,18 @@ fn infer_value_decl(
     infer: &mut Infer,
     env: &TypeEnv,
     v: &ValueDecl,
+    expected: Option<&Type>,
     diag: &mut Vec<Diagnostic>,
 ) -> Option<(Type, Subst)> {
-    // 各 pattern に対して fresh 型変数を割当て、body の環境に追加して body を推論
+    // signature があれば param 型を body 推論前に確定させる (record の field access 等、
+    // param 型が分かっていないと推論できない式を body 内で許すため)。無ければ fresh。
+    let sig_param_tys = expected
+        .map(|t| split_arrows(t, v.params.len()).0)
+        .unwrap_or_default();
     let mut local_env = env.clone();
     let mut param_tys: Vec<Type> = Vec::new();
-    for p in &v.params {
-        let pt = infer.fresh();
+    for (i, p) in v.params.iter().enumerate() {
+        let pt = sig_param_tys.get(i).cloned().unwrap_or_else(|| infer.fresh());
         param_tys.push(pt.clone());
         bind_pattern(infer, &mut local_env, p, &pt, diag);
     }
@@ -646,7 +654,7 @@ pub fn infer_expr(
             let mut env_acc = env.clone();
             let mut subst_acc = Subst::empty();
             for b in bindings {
-                let (ty, s) = match infer_value_decl(infer, &env_acc, b, diag) {
+                let (ty, s) = match infer_value_decl(infer, &env_acc, b, None, diag) {
                     Some(r) => r,
                     None => continue,
                 };
