@@ -164,7 +164,9 @@ pub fn registry() -> BuiltinEvalRegistry {
                 h: as_f64(&args[1])?,
             }))
         })
-        .add("tetrahedron", 0, |_| Ok(Value::Shape3D(Model3D::Tetrahedron)))
+        .add("tetrahedron", 0, |_| {
+            Ok(Value::Shape3D(Model3D::Tetrahedron))
+        })
         .add("empty_3d", 0, |_| Ok(Value::Shape3D(Model3D::Empty)))
         // -- CSG 3D
         .add("union3d", 2, |args| {
@@ -223,7 +225,9 @@ pub fn registry() -> BuiltinEvalRegistry {
             Ok(point2d_value(as_f64(&args[0])?, as_f64(&args[1])?))
         })
         // -- 数値変換
-        .add("fromInt", 1, |args| Ok(Value::Float(as_int(&args[0])? as f64)))
+        .add("fromInt", 1, |args| {
+            Ok(Value::Float(as_int(&args[0])? as f64))
+        })
         // -- Range の集合演算
         .add("intersect", 2, |args| match (&args[0], &args[1]) {
             (
@@ -241,9 +245,7 @@ pub fn registry() -> BuiltinEvalRegistry {
                 let lo = l1.max(*l2);
                 let hi = h1.min(*h2);
                 if lo > hi {
-                    return Err(format!(
-                        "intersect: 空の range ({lo}..{hi} となりました)"
-                    ));
+                    return Err(format!("intersect: 空の range ({lo}..{hi} となりました)"));
                 }
                 Ok(Value::Range {
                     lo,

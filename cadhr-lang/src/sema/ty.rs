@@ -221,10 +221,7 @@ mod tests {
         let mut g = TyVarGen::new();
         let a = g.fresh();
         // Int -> a -> Shape3D
-        let ty = Type::arrows(
-            vec![Type::con("Int"), Type::Var(a)],
-            Type::con("Shape3D"),
-        );
+        let ty = Type::arrows(vec![Type::con("Int"), Type::Var(a)], Type::con("Shape3D"));
         assert_eq!(format!("{ty}"), "Int -> t0 -> Shape3D");
     }
 

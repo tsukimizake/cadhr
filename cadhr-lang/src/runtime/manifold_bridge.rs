@@ -47,8 +47,10 @@ pub fn evaluate_with_paths(
         Model3D::Cylinder { r, h } => Ok(Manifold::cylinder(*r, *r, *h, DEFAULT_SEGMENTS)),
         Model3D::Tetrahedron => Ok(Manifold::tetrahedron()),
 
-        Model3D::Union(a, b) => Ok(evaluate_with_paths(a, include_paths)?
-            .union(&evaluate_with_paths(b, include_paths)?)),
+        Model3D::Union(a, b) => {
+            Ok(evaluate_with_paths(a, include_paths)?
+                .union(&evaluate_with_paths(b, include_paths)?))
+        }
         Model3D::Diff(a, b) => Ok(evaluate_with_paths(a, include_paths)?
             .difference(&evaluate_with_paths(b, include_paths)?)),
         Model3D::Intersect(a, b) => Ok(evaluate_with_paths(a, include_paths)?
@@ -63,10 +65,12 @@ pub fn evaluate_with_paths(
             let dz = dst.2 - src.2;
             Ok(evaluate_with_paths(shape, include_paths)?.translate(dx, dy, dz))
         }
-        Model3D::Scale { shape, factor } => Ok(evaluate_with_paths(shape, include_paths)?
-            .scale(factor.0, factor.1, factor.2)),
-        Model3D::Rotate { shape, angles } => Ok(evaluate_with_paths(shape, include_paths)?
-            .rotate(angles.0, angles.1, angles.2)),
+        Model3D::Scale { shape, factor } => {
+            Ok(evaluate_with_paths(shape, include_paths)?.scale(factor.0, factor.1, factor.2))
+        }
+        Model3D::Rotate { shape, angles } => {
+            Ok(evaluate_with_paths(shape, include_paths)?.rotate(angles.0, angles.1, angles.2))
+        }
         Model3D::LinearExtrude {
             profile,
             plane,
@@ -222,8 +226,7 @@ fn prep_rings(rings: Vec<Vec<f64>>, plane: Plane3D) -> Vec<Vec<f64>> {
     rings
         .into_iter()
         .map(|ring| {
-            let mut pairs: Vec<(f64, f64)> =
-                ring.chunks_exact(2).map(|c| (c[0], -c[1])).collect();
+            let mut pairs: Vec<(f64, f64)> = ring.chunks_exact(2).map(|c| (c[0], -c[1])).collect();
             ensure_ccw(&mut pairs);
             pairs.into_iter().flat_map(|(x, y)| vec![x, y]).collect()
         })
@@ -306,9 +309,8 @@ fn sweep_polygon(
     plane: Plane3D,
     path: &[(f64, f64, f64)],
 ) -> Result<Manifold, BridgeError> {
-    let rings = to_polygon_rings(profile).ok_or_else(|| {
-        BridgeError::InvalidShape("sweep_extrude: profile が空".to_string())
-    })?;
+    let rings = to_polygon_rings(profile)
+        .ok_or_else(|| BridgeError::InvalidShape("sweep_extrude: profile が空".to_string()))?;
     if rings.is_empty() {
         return Ok(Manifold::empty());
     }

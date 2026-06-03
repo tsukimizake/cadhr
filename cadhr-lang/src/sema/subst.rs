@@ -55,10 +55,9 @@ impl Subst {
             Type::Con(name, args) => {
                 Type::Con(name.clone(), args.iter().map(|a| self.apply(a)).collect())
             }
-            Type::Arrow(from, to) => Type::Arrow(
-                Box::new(self.apply(from)),
-                Box::new(self.apply(to)),
-            ),
+            Type::Arrow(from, to) => {
+                Type::Arrow(Box::new(self.apply(from)), Box::new(self.apply(to)))
+            }
             Type::Record(fields) => Type::Record(
                 fields
                     .iter()
@@ -188,8 +187,7 @@ mod tests {
         let mut g = TyVarGen::new();
         let a = g.fresh();
         // a = a -> Int は循環型
-        let err = unify(&Type::Var(a), &Type::arrow(Type::Var(a), Type::con("Int")))
-            .unwrap_err();
+        let err = unify(&Type::Var(a), &Type::arrow(Type::Var(a), Type::con("Int"))).unwrap_err();
         assert!(matches!(err, UnifyError::InfiniteType { .. }));
     }
 

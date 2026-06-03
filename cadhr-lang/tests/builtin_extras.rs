@@ -82,7 +82,10 @@ fn center3d_moves_bbox_to_origin() {
         max_x = max_x.max(p[0]);
     }
     // 中心は ~0、cube は 10 mm なので bbox は -5..5
-    assert!(min_x < -4.5 && max_x > 4.5, "centered bbox: {min_x}..{max_x}");
+    assert!(
+        min_x < -4.5 && max_x > 4.5,
+        "centered bbox: {min_x}..{max_x}"
+    );
 }
 
 #[test]
@@ -122,7 +125,9 @@ fn control3d_overrides_default_when_inputs_provided() {
     let src = "main = cube 1.0 1.0 1.0 |> translate3d (p3 0.0 0.0 0.0) (control3d \"corner\" (p3 5.0 7.0 9.0))";
     let prog = cadhr_lang::compile(src).expect("compile");
     let mut inputs = cadhr_lang::Inputs::default();
-    inputs.control_overrides.insert("corner".into(), [1.0, 2.0, 3.0]);
+    inputs
+        .control_overrides
+        .insert("corner".into(), [1.0, 2.0, 3.0]);
     let out = cadhr_lang::run_main(&prog, &inputs).expect("run_main");
     assert_eq!(out.control_points[0].1, [1.0, 2.0, 3.0]);
     // メッシュの bbox が override 通り (translate に override 値が伝播している)

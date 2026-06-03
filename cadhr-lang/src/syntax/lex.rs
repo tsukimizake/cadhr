@@ -49,31 +49,31 @@ pub enum Token<'src> {
     Slider,
 
     // 演算子と記号
-    Eq,         // =
-    Arrow,      // ->
-    Colon,      // :
-    DotDot,     // ..
-    Dot,        // .
-    Pipe,       // |
-    PipeFwd,    // |>
-    PipeBwd,    // <|
-    Compose,    // >>
-    ComposeR,   // <<
-    Cons,       // ::
-    EqEq,       // ==
-    NotEq,      // /=
-    Le,         // <=
-    Ge,         // >=
-    Lt,         // <
-    Gt,         // >
-    PlusPlus,   // ++
+    Eq,       // =
+    Arrow,    // ->
+    Colon,    // :
+    DotDot,   // ..
+    Dot,      // .
+    Pipe,     // |
+    PipeFwd,  // |>
+    PipeBwd,  // <|
+    Compose,  // >>
+    ComposeR, // <<
+    Cons,     // ::
+    EqEq,     // ==
+    NotEq,    // /=
+    Le,       // <=
+    Ge,       // >=
+    Lt,       // <
+    Gt,       // >
+    PlusPlus, // ++
     Plus,
     Minus,
     Star,
     Slash,
-    AndAnd,     // &&
-    OrOr,       // ||
-    BackSlash,  // \
+    AndAnd,    // &&
+    OrOr,      // ||
+    BackSlash, // \
 
     // 区切り
     LParen,
@@ -168,7 +168,10 @@ pub fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Spanned<Token<'src>>>, 
     let block_comment = recursive(|block_comment| {
         let inner = choice((
             block_comment,
-            any().and_is(just("-}").not()).and_is(just("{-").not()).ignored(),
+            any()
+                .and_is(just("-}").not())
+                .and_is(just("{-").not())
+                .ignored(),
         ));
         just("{-").then(inner.repeated()).then(just("-}")).ignored()
     });
@@ -291,7 +294,11 @@ pub fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Spanned<Token<'src>>>, 
 
     // 改行 `\n+` を 1 つの Newline トークンに集約。
     let newline_tok = just('\n')
-        .then(just('\n').or(any().filter(|c: &char| c.is_whitespace() && *c != '\n')).repeated())
+        .then(
+            just('\n')
+                .or(any().filter(|c: &char| c.is_whitespace() && *c != '\n'))
+                .repeated(),
+        )
         .ignored()
         .map(|_| Token::Newline);
 
@@ -372,7 +379,10 @@ mod tests {
 
     #[test]
     fn numbers_and_strings() {
-        assert_eq!(lex_strip("3.14 42"), vec![Token::Float(3.14), Token::Int(42)]);
+        assert_eq!(
+            lex_strip("3.14 42"),
+            vec![Token::Float(3.14), Token::Int(42)]
+        );
         assert_eq!(
             lex_strip(r#""hello\n""#),
             vec![Token::Str("hello\n".to_string())]
@@ -384,7 +394,11 @@ mod tests {
         // 行コメントは `\n` を残すので Newline が混じる
         assert_eq!(
             lex_strip("x -- a comment\n y"),
-            vec![Token::LowerIdent("x"), Token::Newline, Token::LowerIdent("y")]
+            vec![
+                Token::LowerIdent("x"),
+                Token::Newline,
+                Token::LowerIdent("y")
+            ]
         );
         // ブロックコメントは内部の `\n` を吸収する (同一行扱い)
         assert_eq!(
@@ -410,6 +424,9 @@ mod tests {
 
     #[test]
     fn underscore_pattern() {
-        assert_eq!(lex_strip("_ x"), vec![Token::Underscore, Token::LowerIdent("x")]);
+        assert_eq!(
+            lex_strip("_ x"),
+            vec![Token::Underscore, Token::LowerIdent("x")]
+        );
     }
 }

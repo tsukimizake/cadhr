@@ -28,7 +28,10 @@ pub enum Value {
         is_int: bool,
     },
     /// ユーザー定義 ADT のコンストラクタ。
-    Ctor { tag: String, args: Vec<Value> },
+    Ctor {
+        tag: String,
+        args: Vec<Value>,
+    },
     /// ユーザー定義関数 (closure)。
     Closure {
         params: Vec<Pattern>,
