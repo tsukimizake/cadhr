@@ -25,16 +25,16 @@ fn try_project(name: &str) {
         Ok(p) => p,
         Err(diags) => {
             for d in &diags {
-                eprintln!("compile err {name}: {}", d.message);
+                eprintln!("compile err {name}: {}", d.message());
             }
             panic!("{name}: compile failed");
         }
     };
     for d in &prog.diagnostics {
-        eprintln!("{name} [{:?}] {}", d.severity, d.message);
+        eprintln!("{name} [{:?}] {}", d.severity(), d.message());
     }
     let out = cadhr_lang::run_main(&prog, &Inputs::default())
-        .unwrap_or_else(|e| panic!("{name}: run_main err: {}", e.message));
+        .unwrap_or_else(|e| panic!("{name}: run_main err: {}", e.message()));
     assert!(!out.models.is_empty(), "{name}: no model produced");
     let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0])
         .unwrap_or_else(|e| panic!("{name}: bridge err: {}", e));
@@ -47,18 +47,34 @@ fn try_project(name: &str) {
 }
 
 #[test]
-fn counter_cable_clip() { try_project("counter_cable_clip"); }
+fn counter_cable_clip() {
+    try_project("counter_cable_clip");
+}
 #[test]
-fn desk_foot_cover() { try_project("desk_foot_cover"); }
+fn desk_foot_cover() {
+    try_project("desk_foot_cover");
+}
 #[test]
-fn bed_cable_clip() { try_project("bed-cable-clip"); }
+fn bed_cable_clip() {
+    try_project("bed-cable-clip");
+}
 #[test]
-fn bed_drink_holder() { try_project("bed_drink_holder"); }
+fn bed_drink_holder() {
+    try_project("bed_drink_holder");
+}
 #[test]
-fn battery_case() { try_project("battery_case"); }
+fn battery_case() {
+    try_project("battery_case");
+}
 #[test]
-fn wabouchou() { try_project("wabouchou"); }
+fn wabouchou() {
+    try_project("wabouchou");
+}
 #[test]
-fn ive_reararck() { try_project("ive_reararck"); }
+fn ive_reararck() {
+    try_project("ive_reararck");
+}
 #[test]
-fn ive_rear_doghouse_mount() { try_project("ive_rear_doghouse_mount"); }
+fn ive_rear_doghouse_mount() {
+    try_project("ive_rear_doghouse_mount");
+}

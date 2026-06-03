@@ -879,10 +879,10 @@ pub fn parse(src: &str) -> Result<Module, Vec<crate::diagnostic::Diagnostic>> {
             return Err(errs
                 .into_iter()
                 .map(|e| {
-                    crate::diagnostic::Diagnostic::error(
-                        DSpan::from(*e.span()),
-                        format!("字句エラー: {e}"),
-                    )
+                    crate::diagnostic::Diagnostic::Lex {
+                        span: DSpan::from(*e.span()),
+                        message: format!("{e}"),
+                    }
                 })
                 .collect());
         }
@@ -894,10 +894,10 @@ pub fn parse(src: &str) -> Result<Module, Vec<crate::diagnostic::Diagnostic>> {
         Err(errs) => Err(errs
             .into_iter()
             .map(|e| {
-                crate::diagnostic::Diagnostic::error(
-                    DSpan::from(*e.span()),
-                    format!("構文エラー: {e}"),
-                )
+                crate::diagnostic::Diagnostic::Syntax {
+                    span: DSpan::from(*e.span()),
+                    message: format!("{e}"),
+                }
             })
             .collect()),
     }

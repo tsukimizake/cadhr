@@ -82,10 +82,9 @@ impl Resolver {
             );
         } else {
             // 既に同名 module が読まれている = 通常はあり得ない。エラー。
-            state.diag.push(Diagnostic::error(
-                Span::empty(),
-                format!("モジュール名衝突: `{main_qname}` が複数定義されています"),
-            ));
+            state.diag.push(Diagnostic::ModuleNameConflict {
+                name: main_qname.clone(),
+            });
         }
 
         if !state.diag.is_empty() {
@@ -99,12 +98,7 @@ impl Resolver {
         let main_index = modules
             .iter()
             .position(|m| m.qualified_name == main_qname)
-            .ok_or_else(|| {
-                vec![Diagnostic::error(
-                    Span::empty(),
-                    "main module が解決結果に含まれない (resolver bug)".to_string(),
-                )]
-            })?;
+            .ok_or_else(|| vec![Diagnostic::MainModuleMissing])?;
         Ok(ResolvedUnit {
             modules,
             main_index,
@@ -129,13 +123,11 @@ impl<'a> State<'a> {
             return;
         }
         if self.stack.iter().any(|s| s == qname) {
-            self.diag.push(Diagnostic::error(
-                import_span,
-                format!(
-                    "モジュール循環: {} → {qname}",
-                    self.stack.join(" → ")
-                ),
-            ));
+            self.diag.push(Diagnostic::ModuleCycle {
+                span: import_span,
+                stack: self.stack.join(" → "),
+                qname: qname.to_string(),
+            });
             return;
         }
         let (src, path) = match self.read_module_source(qname, import_span) {
@@ -154,12 +146,11 @@ impl<'a> State<'a> {
         if let Some(header) = &module.header {
             let declared = join_name(&header.name);
             if declared != qname {
-                self.diag.push(Diagnostic::error(
-                    header.span,
-                    format!(
-                        "モジュール名不一致: import 側は `{qname}` ですが、ファイルは `{declared}` を宣言しています"
-                    ),
-                ));
+                self.diag.push(Diagnostic::ModuleNameMismatch {
+                    span: header.span,
+                    importer: qname.to_string(),
+                    declared: declared.clone(),
+                });
                 // 続行はする (ヘッダ照合ミスは致命じゃない場面もある)
             }
         }
@@ -193,26 +184,26 @@ impl<'a> State<'a> {
                 match std::fs::read_to_string(&candidate) {
                     Ok(s) => return Some((s, candidate)),
                     Err(e) => {
-                        self.diag.push(Diagnostic::error(
+                        self.diag.push(Diagnostic::ModuleLoadFailed {
                             span,
-                            format!("モジュール `{qname}` の読み込みに失敗: {e}"),
-                        ));
+                            qname: qname.to_string(),
+                            error: e.to_string(),
+                        });
                         return None;
                     }
                 }
             }
         }
-        self.diag.push(Diagnostic::error(
+        self.diag.push(Diagnostic::ModuleNotFound {
             span,
-            format!(
-                "モジュール `{qname}` が見つかりません (search_paths: {})",
-                self.search_paths
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ));
+            qname: qname.to_string(),
+            search_paths: self
+                .search_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        });
         None
     }
 }
@@ -250,11 +241,7 @@ mod tests {
     #[test]
     fn loads_single_import() {
         let tmp = tempdir().unwrap();
-        write_module(
-            tmp.path(),
-            "Std",
-            "module Std exposing (..)\n\nx = 42\n",
-        );
+        write_module(tmp.path(), "Std", "module Std exposing (..)\n\nx = 42\n");
         let resolver = Resolver::new(vec![tmp.path().to_path_buf()]);
         let unit = resolver
             .resolve_from_source("import Std\n\nmain = 1")
@@ -276,10 +263,7 @@ mod tests {
         let unit = resolver
             .resolve_from_source("import Std.Gears\n\nmain = 1")
             .unwrap();
-        assert!(unit
-            .modules
-            .iter()
-            .any(|m| m.qualified_name == "Std.Gears"));
+        assert!(unit.modules.iter().any(|m| m.qualified_name == "Std.Gears"));
     }
 
     #[test]
@@ -300,7 +284,7 @@ mod tests {
             .resolve_from_source("import A\n\nmain = 1")
             .unwrap_err();
         assert!(
-            err.iter().any(|d| d.message.contains("循環")),
+            err.iter().any(|d| d.message().contains("循環")),
             "{:?}",
             err
         );
@@ -309,17 +293,14 @@ mod tests {
     #[test]
     fn header_name_mismatch_reported() {
         let tmp = tempdir().unwrap();
-        write_module(
-            tmp.path(),
-            "Foo",
-            "module Bar exposing (..)\n\nx = 1\n",
-        );
+        write_module(tmp.path(), "Foo", "module Bar exposing (..)\n\nx = 1\n");
         let resolver = Resolver::new(vec![tmp.path().to_path_buf()]);
         let err = resolver
             .resolve_from_source("import Foo\n\nmain = 1")
             .unwrap_err();
         assert!(
-            err.iter().any(|d| d.message.contains("モジュール名不一致")),
+            err.iter()
+                .any(|d| d.message().contains("モジュール名不一致")),
             "{:?}",
             err
         );

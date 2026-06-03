@@ -103,7 +103,6 @@ pub struct MainOutput {
 }
 
 /// パース + import 解決 + 型推論 + slider 抽出 + 網羅性検査 をまとめる。
-/// 型推論エラーは Warning に変換し、パース・モジュール解決の致命的エラーだけ Err にする。
 /// `search_paths` は import で参照する `.cadhr` を探すディレクトリ群。
 pub fn compile(src: &str) -> Result<CompiledProgram, Vec<Diagnostic>> {
     compile_with_paths(src, &[])
@@ -119,20 +118,9 @@ pub fn compile_with_paths(
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     let registry = sema::builtin::registry();
     let (_schemes, infer_diag) = sema::infer::infer_unit(&unit, &registry);
-    // 未定義の名前は確実に実行時クラッシュするので fatal として扱い、compile を失敗させる。
-    // それ以外の型推論エラーは型システムが未成熟なため warning に降格して続行する。
-    let mut has_fatal = false;
+    let has_fatal = !infer_diag.is_empty();
     for d in infer_diag {
-        if d.code == Some("undefined-name") {
-            has_fatal = true;
-            diagnostics.push(d);
-        } else if d.severity == Severity::Error {
-            let mut dd = d;
-            dd.severity = Severity::Warning;
-            diagnostics.push(dd);
-        } else {
-            diagnostics.push(d);
-        }
+        diagnostics.push(d);
     }
     if has_fatal {
         return Err(diagnostics);
@@ -186,17 +174,21 @@ pub fn run_main(prog: &CompiledProgram, inputs: &Inputs) -> Result<MainOutput, D
 
     let reg = runtime::builtin::registry();
     let mut ev = runtime::eval::Evaluator::new(&reg);
-    let mut envs = ev
-        .eval_unit(&prog.unit)
-        .map_err(|e| e.into_iter().next().unwrap_or_else(|| Diagnostic::error(Span::empty(), "evaluator が空のエラーを返した")))?;
-    let main_qname = prog.unit.modules[prog.unit.main_index].qualified_name.clone();
-    let env = envs
-        .remove(&main_qname)
-        .ok_or_else(|| Diagnostic::error(Span::empty(), "main モジュールの env が見つかりません"))?;
+    let mut envs = ev.eval_unit(&prog.unit).map_err(|e| {
+        e.into_iter()
+            .next()
+            .unwrap_or_else(|| Diagnostic::runtime(Span::empty(), "evaluator が空のエラーを返した"))
+    })?;
+    let main_qname = prog.unit.modules[prog.unit.main_index]
+        .qualified_name
+        .clone();
+    let env = envs.remove(&main_qname).ok_or_else(|| {
+        Diagnostic::runtime(Span::empty(), "main モジュールの env が見つかりません")
+    })?;
 
     let mut cur = env
         .lookup("main")
-        .ok_or_else(|| Diagnostic::error(Span::empty(), "main 関数が定義されていません"))?;
+        .ok_or_else(|| Diagnostic::runtime(Span::empty(), "main 関数が定義されていません"))?;
 
     for p in &prog.main_signature.params {
         let v = inputs
@@ -268,11 +260,9 @@ fn unpack_main_output(v: Value) -> Result<MainOutput, Diagnostic> {
             }
             Ok(out)
         }
-        other => Err(Diagnostic::error(
+        other => Err(Diagnostic::runtime(
             Span::empty(),
-            format!(
-                "main の戻り値が record / Shape3D / List Shape3D でない: {other}"
-            ),
+            format!("main の戻り値が record / Shape3D / List Shape3D でない: {other}"),
         )),
     }
 }
@@ -286,7 +276,9 @@ mod tests {
         let src = "main length = cube 10.0 10.0 length";
         let prog = compile(src).expect("compile");
         let mut inputs = Inputs::default();
-        inputs.values.insert("length".to_string(), Value::Float(30.0));
+        inputs
+            .values
+            .insert("length".to_string(), Value::Float(30.0));
         let out = run_main(&prog, &inputs).expect("run_main");
         assert_eq!(out.models.len(), 1);
     }
@@ -316,7 +308,7 @@ mod tests {
         assert!(
             prog.diagnostics
                 .iter()
-                .any(|d| d.message.contains("False") && d.severity == Severity::Warning),
+                .any(|d| d.message().contains("False") && d.severity() == Severity::Warning),
             "expected non-exhaustive case warning, got {:?}",
             prog.diagnostics
         );

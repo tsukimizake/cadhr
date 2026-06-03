@@ -11,9 +11,9 @@ fn undefined_variable_is_fatal() {
         main = { models = [], bom = [], controls = [] }\n";
     let err = compile(src).expect_err("未定義変数で compile は失敗するはず");
     assert!(
-        err.iter().any(|d| d.message.contains("List.drop")),
+        err.iter().any(|d| d.message().contains("List.drop")),
         "{:?}",
-        err.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        err.iter().map(|d| d.message()).collect::<Vec<_>>()
     );
 }
 
@@ -24,8 +24,8 @@ fn undefined_constructor_is_fatal() {
         \x20   { models = [], bom = [], controls = [] }\n";
     let err = compile(src).expect_err("未定義コンストラクタで compile は失敗するはず");
     assert!(
-        err.iter().any(|d| d.message.contains("Nope")),
+        err.iter().any(|d| d.message().contains("Nope")),
         "{:?}",
-        err.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        err.iter().map(|d| d.message()).collect::<Vec<_>>()
     );
 }

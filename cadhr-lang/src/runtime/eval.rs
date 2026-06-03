@@ -99,8 +99,7 @@ impl<'r> Evaluator<'r> {
                     let v = make_ctor_value(c);
                     env = env.extend(&c.name, v.clone());
                     if !lm.qualified_name.is_empty() {
-                        env = env
-                            .extend(&qualify_name(&lm.qualified_name, &c.name), v.clone());
+                        env = env.extend(&qualify_name(&lm.qualified_name, &c.name), v.clone());
                     }
                     locals.insert(c.name.clone(), v);
                 }
@@ -111,7 +110,7 @@ impl<'r> Evaluator<'r> {
         for imp in &lm.module.imports {
             let imp_qname = crate::module::join_name(&imp.module);
             let imp_locals = module_locals.get(&imp_qname).cloned().ok_or_else(|| {
-                vec![Diagnostic::error(
+                vec![Diagnostic::runtime(
                     imp.span,
                     format!("import 先 `{imp_qname}` がまだロードされていません (resolver bug?)"),
                 )]
@@ -153,9 +152,7 @@ impl<'r> Evaluator<'r> {
                     if v.params.is_empty() == fns_pass {
                         continue;
                     }
-                    let val = self
-                        .eval_value_decl(v, env.clone())
-                        .map_err(|e| vec![e])?;
+                    let val = self.eval_value_decl(v, env.clone()).map_err(|e| vec![e])?;
                     rec.borrow_mut().insert(v.name.clone(), val.clone());
                     if !lm.qualified_name.is_empty() {
                         rec.borrow_mut()
@@ -243,11 +240,7 @@ impl<'r> Evaluator<'r> {
                 }
             }
         }
-        if diag.is_empty() {
-            Ok(env)
-        } else {
-            Err(diag)
-        }
+        if diag.is_empty() { Ok(env) } else { Err(diag) }
     }
 
     fn eval_value_decl(&self, v: &ValueDecl, env: Rc<Env>) -> Result<Value, Diagnostic> {
@@ -269,13 +262,13 @@ impl<'r> Evaluator<'r> {
             Expr::Var { module, name, span } => {
                 let key = qualify(module.as_ref(), name);
                 env.lookup(&key).ok_or_else(|| {
-                    Diagnostic::error(*span, format!("評価時に未定義の変数 `{key}`"))
+                    Diagnostic::runtime(*span, format!("評価時に未定義の変数 `{key}`"))
                 })
             }
             Expr::Ctor { module, name, span } => {
                 let key = qualify(module.as_ref(), name);
                 env.lookup(&key).ok_or_else(|| {
-                    Diagnostic::error(*span, format!("評価時に未定義のコンストラクタ `{key}`"))
+                    Diagnostic::runtime(*span, format!("評価時に未定義のコンストラクタ `{key}`"))
                 })
             }
             Expr::List(items, _) => {
@@ -292,15 +285,19 @@ impl<'r> Evaluator<'r> {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Value::Record(fs))
             }
-            Expr::RecordUpdate { base, updates, span } => {
+            Expr::RecordUpdate {
+                base,
+                updates,
+                span,
+            } => {
                 let base_v = self.eval_expr(base, env)?;
                 let mut fields = match base_v {
                     Value::Record(fs) => fs,
                     _ => {
-                        return Err(Diagnostic::error(
+                        return Err(Diagnostic::runtime(
                             *span,
                             "record でない値の update はできません".to_string(),
-                        ))
+                        ));
                     }
                 };
                 for u in updates {
@@ -308,7 +305,7 @@ impl<'r> Evaluator<'r> {
                     if let Some(p) = fields.iter_mut().find(|(n, _)| n == &u.name) {
                         p.1 = nv;
                     } else {
-                        return Err(Diagnostic::error(
+                        return Err(Diagnostic::runtime(
                             u.span,
                             format!("update 対象に field `{}` がありません", u.name),
                         ));
@@ -316,7 +313,11 @@ impl<'r> Evaluator<'r> {
                 }
                 Ok(Value::Record(fields))
             }
-            Expr::Field { receiver, name, span } => {
+            Expr::Field {
+                receiver,
+                name,
+                span,
+            } => {
                 let v = self.eval_expr(receiver, env)?;
                 match v {
                     Value::Record(fs) => fs
@@ -324,12 +325,12 @@ impl<'r> Evaluator<'r> {
                         .find(|(n, _)| n == name)
                         .map(|(_, v)| v)
                         .ok_or_else(|| {
-                            Diagnostic::error(
+                            Diagnostic::runtime(
                                 *span,
                                 format!("record に field `{name}` がありません"),
                             )
                         }),
-                    other => Err(Diagnostic::error(
+                    other => Err(Diagnostic::runtime(
                         *span,
                         format!("record でない値 `{other}` から `.{name}` を取れません"),
                     )),
@@ -365,13 +366,17 @@ impl<'r> Evaluator<'r> {
                 match c {
                     Value::Bool(true) => self.eval_expr(then_branch, env),
                     Value::Bool(false) => self.eval_expr(else_branch, env),
-                    _ => Err(Diagnostic::error(
+                    _ => Err(Diagnostic::runtime(
                         *span,
                         "if の条件は Bool である必要があります".to_string(),
                     )),
                 }
             }
-            Expr::Case { scrutinee, arms, span } => {
+            Expr::Case {
+                scrutinee,
+                arms,
+                span,
+            } => {
                 let v = self.eval_expr(scrutinee, env)?;
                 for arm in arms {
                     if let Some(bindings) = match_pattern(&arm.pattern, &v) {
@@ -381,13 +386,16 @@ impl<'r> Evaluator<'r> {
                         return self.eval_expr(&arm.body, &Rc::new(arm_env));
                     }
                 }
-                Err(Diagnostic::error(
+                Err(Diagnostic::runtime(
                     *span,
                     format!("case: マッチするパターンがありません ({v})"),
                 ))
             }
             Expr::BinOp {
-                op, left, right, span,
+                op,
+                left,
+                right,
+                span,
             } => match op {
                 BinOp::ApplyR => {
                     // `a |> f` → f a
@@ -412,7 +420,7 @@ impl<'r> Evaluator<'r> {
                 match v {
                     Value::Int(n) => Ok(Value::Int(-n)),
                     Value::Float(x) => Ok(Value::Float(-x)),
-                    _ => Err(Diagnostic::error(
+                    _ => Err(Diagnostic::runtime(
                         *span,
                         format!("negate: 数値が必要ですが {v} でした"),
                     )),
@@ -427,10 +435,10 @@ impl<'r> Evaluator<'r> {
                     (Value::Int(a), Value::Float(b)) => (*a as f64, *b, false),
                     (Value::Float(a), Value::Int(b)) => (*a, *b as f64, false),
                     _ => {
-                        return Err(Diagnostic::error(
+                        return Err(Diagnostic::runtime(
                             *span,
                             format!("range: 数値の両端が必要ですが {l}..{h} でした"),
-                        ))
+                        ));
                     }
                 };
                 Ok(Value::Range {
@@ -439,7 +447,7 @@ impl<'r> Evaluator<'r> {
                     is_int,
                 })
             }
-            Expr::Error(span) => Err(Diagnostic::error(
+            Expr::Error(span) => Err(Diagnostic::runtime(
                 *span,
                 "パースエラー由来の式は評価できません".to_string(),
             )),
@@ -454,7 +462,7 @@ impl<'r> Evaluator<'r> {
                 if let Some(b) = match_pattern(&params[0], &a) {
                     bindings.extend(b);
                 } else {
-                    return Err(Diagnostic::error(
+                    return Err(Diagnostic::runtime(
                         span,
                         "関数引数のパターンマッチに失敗".to_string(),
                     ));
@@ -477,7 +485,11 @@ impl<'r> Evaluator<'r> {
                     })
                 }
             }
-            Value::Builtin { name, arity, mut args } => {
+            Value::Builtin {
+                name,
+                arity,
+                mut args,
+            } => {
                 args.push(a);
                 if args.len() == arity {
                     // ADT コンストラクタなら Value::Ctor、それ以外なら registry を引く
@@ -488,16 +500,16 @@ impl<'r> Evaluator<'r> {
                         })
                     } else {
                         let b: &BuiltinEval = self.builtins.get(&name).ok_or_else(|| {
-                            Diagnostic::error(span, format!("未登録の builtin `{name}`"))
+                            Diagnostic::runtime(span, format!("未登録の builtin `{name}`"))
                         })?;
                         (b.eval)(&args)
-                            .map_err(|e| Diagnostic::error(span, format!("{name}: {e}")))
+                            .map_err(|e| Diagnostic::runtime(span, format!("{name}: {e}")))
                     }
                 } else {
                     Ok(Value::Builtin { name, arity, args })
                 }
             }
-            other => Err(Diagnostic::error(
+            other => Err(Diagnostic::runtime(
                 span,
                 format!("関数でない値 `{other}` に引数を適用できません"),
             )),
@@ -613,7 +625,7 @@ fn eval_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, Diagno
                 Mul => la * ra,
                 Div => {
                     if ra == 0.0 {
-                        return Err(Diagnostic::error(span, "0 除算".to_string()));
+                        return Err(Diagnostic::runtime(span, "0 除算".to_string()));
                     }
                     la / ra
                 }
@@ -640,18 +652,18 @@ fn eval_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, Diagno
         }
         And => match (&l, &r) {
             (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),
-            _ => Err(Diagnostic::error(span, "&& は Bool を要求".to_string())),
+            _ => Err(Diagnostic::runtime(span, "&& は Bool を要求".to_string())),
         },
         Or => match (&l, &r) {
             (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
-            _ => Err(Diagnostic::error(span, "|| は Bool を要求".to_string())),
+            _ => Err(Diagnostic::runtime(span, "|| は Bool を要求".to_string())),
         },
         Cons => match r {
             Value::List(mut vs) => {
                 vs.insert(0, l);
                 Ok(Value::List(vs))
             }
-            _ => Err(Diagnostic::error(
+            _ => Err(Diagnostic::runtime(
                 span,
                 ":: は List を右辺に要求".to_string(),
             )),
@@ -661,20 +673,20 @@ fn eval_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, Diagno
                 a.extend(b);
                 Ok(Value::List(a))
             }
-            _ => Err(Diagnostic::error(
+            _ => Err(Diagnostic::runtime(
                 span,
                 "++ は List 同士を要求".to_string(),
             )),
         },
-        ApplyR => Err(Diagnostic::error(
+        ApplyR => Err(Diagnostic::runtime(
             span,
             "|> は構文的に App として処理されるべき".to_string(),
         )),
-        ApplyL => Err(Diagnostic::error(
+        ApplyL => Err(Diagnostic::runtime(
             span,
             "<| は構文的に App として処理されるべき".to_string(),
         )),
-        Compose | ComposeR => Err(Diagnostic::error(
+        Compose | ComposeR => Err(Diagnostic::runtime(
             span,
             "<< / >> は当面サポート外".to_string(),
         )),
@@ -686,20 +698,20 @@ fn num_pair(l: &Value, r: &Value, span: Span) -> Result<(f64, f64), Diagnostic> 
         Value::Int(n) => *n as f64,
         Value::Float(x) => *x,
         _ => {
-            return Err(Diagnostic::error(
+            return Err(Diagnostic::runtime(
                 span,
                 format!("数値が必要ですが左辺は {l}"),
-            ))
+            ));
         }
     };
     let rf = match r {
         Value::Int(n) => *n as f64,
         Value::Float(x) => *x,
         _ => {
-            return Err(Diagnostic::error(
+            return Err(Diagnostic::runtime(
                 span,
                 format!("数値が必要ですが右辺は {r}"),
-            ))
+            ));
         }
     };
     Ok((lf, rf))
@@ -712,7 +724,9 @@ fn value_eq(a: &Value, b: &Value) -> bool {
         (Value::String(x), Value::String(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Ctor { tag: t1, args: a1 }, Value::Ctor { tag: t2, args: a2 }) => {
-            t1 == t2 && a1.len() == a2.len() && a1.iter().zip(a2.iter()).all(|(x, y)| value_eq(x, y))
+            t1 == t2
+                && a1.len() == a2.len()
+                && a1.iter().zip(a2.iter()).all(|(x, y)| value_eq(x, y))
         }
         (Value::List(xs), Value::List(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| value_eq(x, y))
@@ -723,9 +737,9 @@ fn value_eq(a: &Value, b: &Value) -> bool {
 
 /// 高レベル API: `main` を呼び出して `Value` を返す (引数を Vec で受ける形)。
 pub fn run_main(env: &Env, args: Vec<Value>) -> Result<Value, Diagnostic> {
-    let main = env
-        .lookup("main")
-        .ok_or_else(|| Diagnostic::error(Span::empty(), "main 関数が定義されていません".to_string()))?;
+    let main = env.lookup("main").ok_or_else(|| {
+        Diagnostic::runtime(Span::empty(), "main 関数が定義されていません".to_string())
+    })?;
     let mut cur = main;
     let evaluator_dummy = BuiltinEvalRegistry::new(); // dummy: apply は builtins を使わない closure case のみ
     let evaluator = Evaluator::new(&evaluator_dummy);
@@ -743,7 +757,7 @@ pub fn run_main(env: &Env, args: Vec<Value>) -> Result<Value, Diagnostic> {
                 if let Some(b) = match_pattern(&params[0], &a) {
                     bindings.extend(b);
                 } else {
-                    return Err(Diagnostic::error(
+                    return Err(Diagnostic::runtime(
                         Span::empty(),
                         "main 引数のパターンマッチ失敗".to_string(),
                     ));
@@ -758,7 +772,7 @@ pub fn run_main(env: &Env, args: Vec<Value>) -> Result<Value, Diagnostic> {
                     };
                     // evaluator 必要 — run_main は使われない簡易ヘルパとして残す
                     let _ = expr;
-                    return Err(Diagnostic::error(
+                    return Err(Diagnostic::runtime(
                         Span::empty(),
                         "run_main は再帰的 eval を呼べないため Evaluator 経由で使ってください"
                             .to_string(),

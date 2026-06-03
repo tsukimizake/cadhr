@@ -29,7 +29,7 @@ fn loki_home_key_from_cadhr_proj() {
     // チェック)。Severity::Warning は許容するが、特に "型" "Type" 系のメッセージは
     // 警告でも目立たせる。
     for d in &prog.diagnostics {
-        eprintln!("[{:?}] {}", d.severity, d.message);
+        eprintln!("[{:?}] {}", d.severity(), d.message());
     }
     let out = run_main(&prog, &Inputs::default()).expect("run_main");
     assert_eq!(out.models.len(), 1);

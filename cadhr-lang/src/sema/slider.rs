@@ -77,26 +77,20 @@ pub fn extract_sliders(module: &Module) -> (Vec<SliderDecl>, Vec<Diagnostic>) {
                     hi,
                     elem_ty: if is_int { ElemTy::Int } else { ElemTy::Float },
                 }),
-                Ok(other) => diag.push(Diagnostic::error(
-                    s.span,
-                    format!(
-                        "slider `{}`: 右辺が Range 型でない値 ({other}) になっています",
-                        s.name
-                    ),
-                )),
+                Ok(other) => diag.push(Diagnostic::SliderNotRange {
+                    span: s.span,
+                    name: s.name.clone(),
+                    got: format!("{other}"),
+                }),
                 Err(e) => {
-                    let mut d = Diagnostic::error(
-                        s.span,
-                        format!(
-                            "slider `{}`: 右辺をコンパイル時に評価できません (main の引数や別 slider に依存している可能性)",
-                            s.name
-                        ),
-                    );
-                    d.related.push(crate::diagnostic::RelatedInfo {
-                        span: e.span,
-                        message: e.message,
+                    diag.push(Diagnostic::SliderNotConst {
+                        span: s.span,
+                        name: s.name.clone(),
+                        related: vec![crate::diagnostic::RelatedInfo {
+                            span: e.span(),
+                            message: e.message(),
+                        }],
                     });
-                    diag.push(d);
                 }
             }
         }

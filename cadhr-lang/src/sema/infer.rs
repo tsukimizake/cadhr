@@ -9,7 +9,7 @@
 use crate::diagnostic::{Diagnostic, Span};
 use crate::sema::builtin::BuiltinRegistry;
 use crate::sema::env::TypeEnv;
-use crate::sema::subst::{unify, Subst, UnifyError};
+use crate::sema::subst::{Subst, UnifyError, unify};
 use crate::sema::ty::{Scheme, TyVar, TyVarGen, Type};
 use crate::syntax::ast::*;
 use std::collections::HashMap;
@@ -87,14 +87,12 @@ impl Infer {
                 // 既知の type alias なら展開する (shallow alias のみ)
                 if let Some(alias) = self.aliases.get(name) {
                     if alias.params.len() != args_ty.len() {
-                        diag.push(Diagnostic::error(
-                            span_of_type_expr(t),
-                            format!(
-                                "型エイリアス `{name}` は {} 個の引数を取りますが {} 個でした",
-                                alias.params.len(),
-                                args_ty.len()
-                            ),
-                        ));
+                        diag.push(Diagnostic::TypeAliasArity {
+                            span: span_of_type_expr(t),
+                            name: name.clone(),
+                            expected: alias.params.len(),
+                            got: args_ty.len(),
+                        });
                         return Type::con("<error>");
                     }
                     // alias の params を仮 var に対応させて展開
@@ -113,14 +111,14 @@ impl Infer {
                         return Type::Record(vec![
                             ("x".to_string(), Type::con("Float")),
                             ("y".to_string(), Type::con("Float")),
-                        ])
+                        ]);
                     }
                     "Point3D" => {
                         return Type::Record(vec![
                             ("x".to_string(), Type::con("Float")),
                             ("y".to_string(), Type::con("Float")),
                             ("z".to_string(), Type::con("Float")),
-                        ])
+                        ]);
                     }
                     _ => {}
                 }
@@ -171,7 +169,9 @@ fn substitute_named(
         }
         Type::Con(n, args) => Type::Con(
             n.clone(),
-            args.iter().map(|a| substitute_named(a, subst_map, var_map)).collect(),
+            args.iter()
+                .map(|a| substitute_named(a, subst_map, var_map))
+                .collect(),
         ),
         Type::Arrow(f, t) => Type::Arrow(
             Box::new(substitute_named(f, subst_map, var_map)),
@@ -240,10 +240,10 @@ fn infer_one(
     for imp in &lm.module.imports {
         let imp_qname = crate::module::join_name(&imp.module);
         let Some(imp_schemes) = module_locals.get(&imp_qname) else {
-            diag.push(Diagnostic::error(
-                imp.span,
-                format!("import 先 `{imp_qname}` の型情報がまだロードされていません"),
-            ));
+            diag.push(Diagnostic::ImportTypeNotLoaded {
+                span: imp.span,
+                qname: imp_qname.clone(),
+            });
             continue;
         };
         let prefix = imp.alias.clone().unwrap_or_else(|| imp_qname.clone());
@@ -450,7 +450,9 @@ fn remap_named_vars(
         }
         Type::Con(n, args) => Type::Con(
             n.clone(),
-            args.iter().map(|a| remap_named_vars(a, var_map, name_to_fresh)).collect(),
+            args.iter()
+                .map(|a| remap_named_vars(a, var_map, name_to_fresh))
+                .collect(),
         ),
         Type::Arrow(f, t) => Type::Arrow(
             Box::new(remap_named_vars(f, var_map, name_to_fresh)),
@@ -465,21 +467,29 @@ fn remap_named_vars(
 }
 
 fn unify_diag(err: UnifyError, span: Span, name: &str) -> Diagnostic {
-    let message = match err {
-        UnifyError::Mismatch { left, right } => format!(
-            "{name}: 型 `{left}` と `{right}` が一致しません"
-        ),
-        UnifyError::InfiniteType { var: _, ty } => {
-            format!("{name}: 循環型 `{ty}` を作ろうとしています")
-        }
+    let context = name.to_string();
+    match err {
+        UnifyError::Mismatch { left, right } => Diagnostic::TypeMismatch {
+            span,
+            context,
+            left: format!("{left}"),
+            right: format!("{right}"),
+        },
+        UnifyError::InfiniteType { var: _, ty } => Diagnostic::InfiniteType {
+            span,
+            context,
+            ty: format!("{ty}"),
+        },
         UnifyError::RecordFieldMismatch {
             left_fields,
             right_fields,
-        } => format!(
-            "{name}: レコードのフィールドが一致しません ({left_fields:?} vs {right_fields:?})"
-        ),
-    };
-    Diagnostic::error(span, message)
+        } => Diagnostic::RecordFieldMismatch {
+            span,
+            context,
+            left_fields,
+            right_fields,
+        },
+    }
 }
 
 fn infer_value_decl(
@@ -497,7 +507,10 @@ fn infer_value_decl(
     let mut local_env = env.clone();
     let mut param_tys: Vec<Type> = Vec::new();
     for (i, p) in v.params.iter().enumerate() {
-        let pt = sig_param_tys.get(i).cloned().unwrap_or_else(|| infer.fresh());
+        let pt = sig_param_tys
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| infer.fresh());
         param_tys.push(pt.clone());
         bind_pattern(infer, &mut local_env, p, &pt, diag);
     }
@@ -524,15 +537,17 @@ fn bind_pattern(
         }
         Pattern::Wildcard(_) => {}
         Pattern::Lit(_, _) => {} // リテラルは束縛しない
-        Pattern::Ctor { name, args, span, .. } => {
+        Pattern::Ctor {
+            name, args, span, ..
+        } => {
             // コンストラクタの型を instantiate して、引数型と patterns を再帰束縛
             let sc = match infer.ctor_types.get(name).cloned() {
                 Some(s) => s,
                 None => {
-                    diag.push(Diagnostic::error(
-                        *span,
-                        format!("コンストラクタ `{name}` は未定義"),
-                    ));
+                    diag.push(Diagnostic::CtorUndefinedInPattern {
+                        span: *span,
+                        name: name.clone(),
+                    });
                     return;
                 }
             };
@@ -616,9 +631,10 @@ pub fn infer_expr(
             match env.lookup(&key) {
                 Some(sc) => Some((infer.instantiate(sc), Subst::empty())),
                 None => {
-                    let mut d = Diagnostic::error(*span, format!("未定義の変数 `{key}`"));
-                    d.code = Some("undefined-name");
-                    diag.push(d);
+                    diag.push(Diagnostic::UndefinedVar {
+                        span: *span,
+                        name: key,
+                    });
                     None
                 }
             }
@@ -628,10 +644,10 @@ pub fn infer_expr(
             match env.lookup(&key) {
                 Some(sc) => Some((infer.instantiate(sc), Subst::empty())),
                 None => {
-                    let mut d =
-                        Diagnostic::error(*span, format!("未定義のコンストラクタ `{key}`"));
-                    d.code = Some("undefined-name");
-                    diag.push(d);
+                    diag.push(Diagnostic::UndefinedCtor {
+                        span: *span,
+                        name: key,
+                    });
                     None
                 }
             }
@@ -717,7 +733,10 @@ pub fn infer_expr(
             Some((s.apply(&t_ty), s))
         }
         Expr::BinOp {
-            op, left, right, span,
+            op,
+            left,
+            right,
+            span,
         } => {
             let (op_args, op_ret) = binop_type(*op, infer);
             let (l_ty, s1) = infer_expr(infer, env, left, diag)?;
@@ -806,10 +825,10 @@ pub fn infer_expr(
                 Type::Record(fs) => match fs.iter().find(|(n, _)| n == name) {
                     Some((_, t)) => Some((t.clone(), s)),
                     None => {
-                        diag.push(Diagnostic::error(
-                            *span,
-                            format!("レコードにフィールド `{name}` がありません"),
-                        ));
+                        diag.push(Diagnostic::RecordNoField {
+                            span: *span,
+                            field: name.clone(),
+                        });
                         None
                     }
                 },
@@ -818,26 +837,30 @@ pub fn infer_expr(
                     match fields.iter().find(|(n, _)| n == name) {
                         Some((_, t)) => Some((t.clone(), s)),
                         None => {
-                            diag.push(Diagnostic::error(
-                                *span,
-                                format!(
-                                    "`{alias_name}` にフィールド `{name}` がありません"
-                                ),
-                            ));
+                            diag.push(Diagnostic::AliasNoField {
+                                span: *span,
+                                alias: alias_name.clone(),
+                                field: name.clone(),
+                            });
                             None
                         }
                     }
                 }
                 _ => {
-                    diag.push(Diagnostic::error(
-                        *span,
-                        format!("レコードでないものから `.{name}` を取れません: {r_ty}"),
-                    ));
+                    diag.push(Diagnostic::NotARecord {
+                        span: *span,
+                        field: name.clone(),
+                        ty: format!("{r_ty}"),
+                    });
                     None
                 }
             }
         }
-        Expr::RecordUpdate { base, updates, span } => {
+        Expr::RecordUpdate {
+            base,
+            updates,
+            span,
+        } => {
             let (b_ty, s) = infer_expr(infer, env, base, diag)?;
             let subst = s;
             // updates の各 field の型は base record の同名 field と一致する必要
@@ -851,7 +874,7 @@ pub fn infer_expr(
             Some((infer.fresh(), Subst::empty()))
         }
         Expr::Error(span) => {
-            diag.push(Diagnostic::error(*span, "パースエラーがあります"));
+            diag.push(Diagnostic::ParseErrorExpr { span: *span });
             None
         }
     }
@@ -869,18 +892,12 @@ fn lit_type(l: &Lit) -> Type {
 fn binop_type(op: BinOp, infer: &mut Infer) -> ((Type, Type), Type) {
     use BinOp::*;
     match op {
-        Add | Sub | Mul | Div => (
-            (Type::con("Float"), Type::con("Float")),
-            Type::con("Float"),
-        ),
+        Add | Sub | Mul | Div => ((Type::con("Float"), Type::con("Float")), Type::con("Float")),
         Eq | NotEq => {
             let v = infer.fresh();
             ((v.clone(), v.clone()), Type::con("Bool"))
         }
-        Lt | Le | Gt | Ge => (
-            (Type::con("Float"), Type::con("Float")),
-            Type::con("Bool"),
-        ),
+        Lt | Le | Gt | Ge => ((Type::con("Float"), Type::con("Float")), Type::con("Bool")),
         And | Or => ((Type::con("Bool"), Type::con("Bool")), Type::con("Bool")),
         Cons => {
             let v = infer.fresh();

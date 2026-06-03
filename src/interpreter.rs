@@ -44,7 +44,7 @@ pub fn run_compile_job(params: CompileJobParams) -> CompileJobResult {
     let result = match compile_with_paths(&params.source, &params.search_paths) {
         Ok(prog) => {
             let signature = prog.main_signature.clone();
-            let diagnostics = prog.diagnostics.iter().map(|d| d.message.clone()).collect();
+            let diagnostics = prog.diagnostics.iter().map(|d| d.message()).collect();
             CompileJobResult::Success {
                 program: prog,
                 signature,
@@ -55,10 +55,10 @@ pub fn run_compile_job(params: CompileJobParams) -> CompileJobResult {
             let first = errs.first();
             CompileJobResult::Error {
                 message: first
-                    .map(|d| d.message.clone())
+                    .map(|d| d.message())
                     .unwrap_or_else(|| "compile failed".into()),
-                span: first.map(|d| d.span),
-                diagnostics: errs.iter().map(|d| d.message.clone()).collect(),
+                span: first.map(|d| d.span()),
+                diagnostics: errs.iter().map(|d| d.message()).collect(),
             }
         }
     };
@@ -132,8 +132,8 @@ pub fn run_eval_job(params: EvalJobParams) -> EvalJobResult {
         Ok(o) => o,
         Err(d) => {
             let r = EvalJobResult::Error {
-                message: d.message,
-                span: Some(d.span),
+                message: d.message(),
+                span: Some(d.span()),
             };
             log_eval_result("eval", &r);
             return r;
@@ -171,8 +171,8 @@ pub fn run_collision_job(params: EvalJobParams) -> EvalJobResult {
         Ok(o) => o,
         Err(d) => {
             let r = EvalJobResult::Error {
-                message: d.message,
-                span: Some(d.span),
+                message: d.message(),
+                span: Some(d.span()),
             };
             log_eval_result("collision", &r);
             return r;

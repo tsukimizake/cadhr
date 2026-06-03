@@ -55,7 +55,11 @@ impl AdtEnv {
 
 fn walk_expr(e: &Expr, env: &AdtEnv, diag: &mut Vec<Diagnostic>) {
     match e {
-        Expr::Case { scrutinee, arms, span } => {
+        Expr::Case {
+            scrutinee,
+            arms,
+            span,
+        } => {
             walk_expr(scrutinee, env, diag);
             for a in arms {
                 if let Some(g) = &a.guard {
@@ -195,11 +199,7 @@ fn missing_for(patterns: &[&Pattern], env: &AdtEnv, hint: &TypeHint) -> Option<S
             }
         }
         TypeHint::Adt(name) => {
-            let ctors = env
-                .type_to_ctors
-                .get(name)
-                .cloned()
-                .unwrap_or_default();
+            let ctors = env.type_to_ctors.get(name).cloned().unwrap_or_default();
             let mut missing_ctors: Vec<String> = Vec::new();
             let mut missing_inner: Vec<String> = Vec::new();
             for ctor in &ctors {
@@ -218,10 +218,7 @@ fn missing_for(patterns: &[&Pattern], env: &AdtEnv, hint: &TypeHint) -> Option<S
                 let arg_types = env.ctor_arg_types.get(ctor).cloned().unwrap_or_default();
                 let n_args = arg_types.len();
                 for i in 0..n_args {
-                    let col: Vec<&Pattern> = groups
-                        .iter()
-                        .filter_map(|g| g.get(i))
-                        .collect();
+                    let col: Vec<&Pattern> = groups.iter().filter_map(|g| g.get(i)).collect();
                     let sub_hint = type_hint_from(&arg_types[i], env);
                     if let Some(m) = missing_for(&col, env, &sub_hint) {
                         missing_inner.push(format!("{ctor} 引数 {} に {m}", i + 1));
@@ -230,7 +227,11 @@ fn missing_for(patterns: &[&Pattern], env: &AdtEnv, hint: &TypeHint) -> Option<S
             }
             let mut parts = Vec::new();
             if !missing_ctors.is_empty() {
-                parts.push(format!("{} の ctor {{ {} }}", name, missing_ctors.join(", ")));
+                parts.push(format!(
+                    "{} の ctor {{ {} }}",
+                    name,
+                    missing_ctors.join(", ")
+                ));
             }
             parts.extend(missing_inner);
             if parts.is_empty() {
@@ -326,26 +327,17 @@ fn check_case(arms: &[CaseArm], case_span: Span, env: &AdtEnv, diag: &mut Vec<Di
     let usable_arms: Vec<&CaseArm> = arms.iter().filter(|a| a.guard.is_none()).collect();
     if usable_arms.is_empty() {
         // 全 arm に guard がある → 必ず非網羅。
-        diag.push(
-            Diagnostic::warning(
-                case_span,
-                "case が非網羅です: 全ての arm に guard があり catch-all が無い".to_string(),
-            )
-            .with_code("E0501"),
-        );
+        diag.push(Diagnostic::NonExhaustiveAllGuarded { span: case_span });
         return;
     }
 
     let hint = infer_hint_from_arms(&usable_arms, env);
     let pats: Vec<&Pattern> = usable_arms.iter().map(|a| &a.pattern).collect();
     if let Some(missing) = missing_for(&pats, env, &hint) {
-        diag.push(
-            Diagnostic::warning(
-                case_span,
-                format!("case が非網羅です: {missing} が漏れています"),
-            )
-            .with_code("E0501"),
-        );
+        diag.push(Diagnostic::NonExhaustiveMissing {
+            span: case_span,
+            missing: format!("{missing}"),
+        });
     }
 }
 
@@ -369,9 +361,7 @@ fn infer_hint_from_arms(arms: &[&CaseArm], env: &AdtEnv) -> TypeHint {
 fn merge_hint(a: TypeHint, b: TypeHint) -> TypeHint {
     match (a, b) {
         (TypeHint::Other, x) | (x, TypeHint::Other) => x,
-        (TypeHint::List(ae), TypeHint::List(be)) => {
-            TypeHint::List(Box::new(merge_hint(*ae, *be)))
-        }
+        (TypeHint::List(ae), TypeHint::List(be)) => TypeHint::List(Box::new(merge_hint(*ae, *be))),
         (x, _) => x,
     }
 }
@@ -424,8 +414,8 @@ mod tests {
         let src = "f x = case x of | True -> 1";
         let d = run(src);
         assert_eq!(d.len(), 1);
-        assert_eq!(d[0].severity, Severity::Warning);
-        assert!(d[0].message.contains("False"));
+        assert_eq!(d[0].severity(), Severity::Warning);
+        assert!(d[0].message().contains("False"));
     }
 
     #[test]
@@ -440,7 +430,7 @@ mod tests {
                    f s = case s of | Cube _ _ _ -> 1 | Sphere _ -> 2";
         let d = run(src);
         assert_eq!(d.len(), 1);
-        assert!(d[0].message.contains("Empty"));
+        assert!(d[0].message().contains("Empty"));
     }
 
     #[test]
@@ -455,7 +445,7 @@ mod tests {
         let src = "f xs = case xs of | x :: _ -> x";
         let d = run(src);
         assert_eq!(d.len(), 1);
-        assert!(d[0].message.contains("[]"));
+        assert!(d[0].message().contains("[]"));
     }
 
     #[test]
@@ -463,7 +453,7 @@ mod tests {
         let src = "f xs = case xs of | [] -> 0";
         let d = run(src);
         assert_eq!(d.len(), 1);
-        assert!(d[0].message.contains("::"));
+        assert!(d[0].message().contains("::"));
     }
 
     #[test]
@@ -477,7 +467,7 @@ mod tests {
         let src = "f x = case x of | 0 -> 0 | 1 -> 1";
         let d = run(src);
         assert_eq!(d.len(), 1);
-        assert!(d[0].message.contains("`_ ->`"));
+        assert!(d[0].message().contains("`_ ->`"));
     }
 
     #[test]
@@ -492,9 +482,9 @@ mod tests {
         assert_eq!(d.len(), 1, "got {d:?}");
         // Maybe の Nothing が「MkPair の 2 番目の引数」位置で漏れているはず
         assert!(
-            d[0].message.contains("Nothing") || d[0].message.contains("引数 2"),
+            d[0].message().contains("Nothing") || d[0].message().contains("引数 2"),
             "{}",
-            d[0].message
+            d[0].message()
         );
     }
 
@@ -514,7 +504,7 @@ mod tests {
                    f w = case w of | MkWrap True -> 1";
         let d = run(src);
         assert_eq!(d.len(), 1, "{d:?}");
-        assert!(d[0].message.contains("False"), "{}", d[0].message);
+        assert!(d[0].message().contains("False"), "{}", d[0].message());
     }
 
     #[test]
@@ -522,7 +512,7 @@ mod tests {
         let src = "f xs = case xs of | [] -> 0 | True :: _ -> 1";
         let d = run(src);
         assert_eq!(d.len(), 1, "{d:?}");
-        assert!(d[0].message.contains("False"), "{}", d[0].message);
+        assert!(d[0].message().contains("False"), "{}", d[0].message());
     }
 
     #[test]

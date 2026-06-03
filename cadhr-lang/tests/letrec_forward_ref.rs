@@ -17,7 +17,11 @@ fn main_forward_refs_recursive_function() {
         \x20       | [] -> 0\n\
         \x20       | x :: rest -> if n == 0 then x else get (n - 1) rest\n";
     let prog = compile(src).expect("compile");
-    assert!(prog.diagnostics.is_empty(), "診断は無いはず: {:?}", prog.diagnostics);
+    assert!(
+        prog.diagnostics.is_empty(),
+        "診断は無いはず: {:?}",
+        prog.diagnostics
+    );
     let out = run_main(&prog, &Inputs::default()).expect("run_main");
     assert_eq!(out.models.len(), 1);
 }
