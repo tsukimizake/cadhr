@@ -8,8 +8,9 @@
 use crate::diagnostic::{Diagnostic, Span};
 use crate::module::{LoadedModule, ResolvedUnit};
 use crate::runtime::builtin::{BuiltinEval, BuiltinEvalRegistry};
-use crate::runtime::value::{ClosureBody, Env, Value};
+use crate::runtime::value::{ClosureBody, Env, RecFrame, Value};
 use crate::syntax::ast::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -140,21 +141,32 @@ impl<'r> Evaluator<'r> {
             }
         }
 
-        // 4. local value decl を順次評価
-        for d in &lm.module.decls {
-            if let Decl::Value(v) = d {
-                let val = self
-                    .eval_value_decl(v, Rc::new(env.clone()))
-                    .map_err(|e| vec![e])?;
-                env = env.extend(&v.name, val.clone());
-                if !lm.qualified_name.is_empty() {
-                    env = env.extend(&qualify_name(&lm.qualified_name, &v.name), val.clone());
+        // 4. local value decl を共有再帰フレームに評価して back-patch する。
+        // closure はこの rec フレームを共有するので、自己再帰・前方参照・相互再帰すべて見える。
+        // 2 パス: 先に関数 (closure, 遅延) を全て束縛してから、引数なしの eager な値を評価する。
+        // これで eager な値 (例: main) が後方定義の関数を前方参照できる。
+        let rec: RecFrame = Rc::new(RefCell::new(HashMap::new()));
+        let env = Rc::new(env.push_rec(rec.clone()));
+        for fns_pass in [true, false] {
+            for d in &lm.module.decls {
+                if let Decl::Value(v) = d {
+                    if v.params.is_empty() == fns_pass {
+                        continue;
+                    }
+                    let val = self
+                        .eval_value_decl(v, env.clone())
+                        .map_err(|e| vec![e])?;
+                    rec.borrow_mut().insert(v.name.clone(), val.clone());
+                    if !lm.qualified_name.is_empty() {
+                        rec.borrow_mut()
+                            .insert(qualify_name(&lm.qualified_name, &v.name), val.clone());
+                    }
+                    locals.insert(v.name.clone(), val);
                 }
-                locals.insert(v.name.clone(), val);
             }
         }
 
-        module_envs.insert(lm.qualified_name.clone(), Rc::new(env));
+        module_envs.insert(lm.qualified_name.clone(), env);
         Ok(locals)
     }
 
@@ -211,20 +223,28 @@ impl<'r> Evaluator<'r> {
             }
         }
 
-        // 値定義を順番に評価
+        // 値定義を共有再帰フレームに評価して back-patch (eval_one_module と同じ仕組み)。
+        // 2 パス: 関数 (closure) を先に束縛してから eager な値を評価し前方参照を許す。
+        let rec: RecFrame = Rc::new(RefCell::new(HashMap::new()));
+        let env = Rc::new(env.push_rec(rec.clone()));
         let mut diag = Vec::new();
-        for d in &m.decls {
-            if let Decl::Value(v) = d {
-                match self.eval_value_decl(v, Rc::new(env.clone())) {
-                    Ok(value) => {
-                        env = env.extend(&v.name, value);
+        for fns_pass in [true, false] {
+            for d in &m.decls {
+                if let Decl::Value(v) = d {
+                    if v.params.is_empty() == fns_pass {
+                        continue;
                     }
-                    Err(e) => diag.push(e),
+                    match self.eval_value_decl(v, env.clone()) {
+                        Ok(value) => {
+                            rec.borrow_mut().insert(v.name.clone(), value);
+                        }
+                        Err(e) => diag.push(e),
+                    }
                 }
             }
         }
         if diag.is_empty() {
-            Ok(Rc::new(env))
+            Ok(env)
         } else {
             Err(diag)
         }
@@ -248,13 +268,13 @@ impl<'r> Evaluator<'r> {
             Expr::Lit(l, _) => Ok(lit_to_value(l)),
             Expr::Var { module, name, span } => {
                 let key = qualify(module.as_ref(), name);
-                env.lookup(&key).cloned().ok_or_else(|| {
+                env.lookup(&key).ok_or_else(|| {
                     Diagnostic::error(*span, format!("評価時に未定義の変数 `{key}`"))
                 })
             }
             Expr::Ctor { module, name, span } => {
                 let key = qualify(module.as_ref(), name);
-                env.lookup(&key).cloned().ok_or_else(|| {
+                env.lookup(&key).ok_or_else(|| {
                     Diagnostic::error(*span, format!("評価時に未定義のコンストラクタ `{key}`"))
                 })
             }
@@ -326,12 +346,14 @@ impl<'r> Evaluator<'r> {
                 env: env.clone(),
             }),
             Expr::Let { bindings, body, .. } => {
-                let mut env_acc = env.clone();
+                // 共有再帰フレームで let-rec を実現 (相互再帰・前方参照可)。
+                let rec: RecFrame = Rc::new(RefCell::new(HashMap::new()));
+                let let_env = Rc::new(env.push_rec(rec.clone()));
                 for b in bindings {
-                    let v = self.eval_value_decl(b, env_acc.clone())?;
-                    env_acc = Rc::new(env_acc.extend(&b.name, v));
+                    let v = self.eval_value_decl(b, let_env.clone())?;
+                    rec.borrow_mut().insert(b.name.clone(), v);
                 }
-                self.eval_expr(body, &env_acc)
+                self.eval_expr(body, &let_env)
             }
             Expr::If {
                 cond,
@@ -703,7 +725,6 @@ fn value_eq(a: &Value, b: &Value) -> bool {
 pub fn run_main(env: &Env, args: Vec<Value>) -> Result<Value, Diagnostic> {
     let main = env
         .lookup("main")
-        .cloned()
         .ok_or_else(|| Diagnostic::error(Span::empty(), "main 関数が定義されていません".to_string()))?;
     let mut cur = main;
     let evaluator_dummy = BuiltinEvalRegistry::new(); // dummy: apply は builtins を使わない closure case のみ
@@ -772,7 +793,7 @@ mod tests {
         }
     }
 
-    fn val_of<'a>(env: &'a Env, name: &str) -> &'a Value {
+    fn val_of(env: &Env, name: &str) -> Value {
         env.lookup(name).expect("name not found")
     }
 
@@ -822,7 +843,7 @@ mod tests {
     fn eval_cube_builtin() {
         let (env, diag) = eval_src("s = cube 1.0 2.0 3.0");
         assert!(diag.is_empty(), "diag: {diag:?}");
-        match val_of(&env, "s") {
+        match &val_of(&env, "s") {
             Value::Shape3D(crate::runtime::value::Model3D::Cube { x, y, z }) => {
                 assert_eq!(*x, 1.0);
                 assert_eq!(*y, 2.0);
@@ -844,7 +865,7 @@ mod tests {
     fn eval_range_literal() {
         let (env, diag) = eval_src("r = 6.0 .. 80.0");
         assert!(diag.is_empty());
-        match val_of(&env, "r") {
+        match &val_of(&env, "r") {
             Value::Range { lo, hi, .. } => {
                 assert_eq!(*lo, 6.0);
                 assert_eq!(*hi, 80.0);
@@ -857,7 +878,7 @@ mod tests {
     fn eval_intersect_range() {
         let (env, diag) = eval_src("r = intersect (1.0 .. 100.0) (5.0 .. 50.0)");
         assert!(diag.is_empty(), "diag: {diag:?}");
-        match val_of(&env, "r") {
+        match &val_of(&env, "r") {
             Value::Range { lo, hi, .. } => {
                 assert_eq!(*lo, 5.0);
                 assert_eq!(*hi, 50.0);
@@ -872,7 +893,7 @@ mod tests {
                    s = Sphere 5.0";
         let (env, diag) = eval_src(src);
         assert!(diag.is_empty(), "diag: {diag:?}");
-        match val_of(&env, "s") {
+        match &val_of(&env, "s") {
             Value::Ctor { tag, args } => {
                 assert_eq!(tag, "Sphere");
                 assert_eq!(args.len(), 1);

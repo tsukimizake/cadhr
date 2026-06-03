@@ -7,6 +7,7 @@
 //!   (manifold-rs への evaluate は GUI 側で行う)
 
 use crate::syntax::ast::Pattern;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
@@ -53,21 +54,50 @@ pub enum ClosureBody {
     Expr(Rc<crate::syntax::ast::Expr>),
 }
 
-/// 評価環境 (識別子 → 値)。`Rc` で共有可能、`HashMap` で immutable update。
+/// 共有再帰フレーム。`let` / モジュールトップレベルの相互再帰グループ用。
+/// closure 生成後に back-patch するため `RefCell` で内部可変。
+pub type RecFrame = Rc<RefCell<HashMap<String, Value>>>;
+
+/// 評価環境のフレーム。lexical は値で固定、rec は共有・後埋め。
+#[derive(Clone, Debug)]
+enum Frame {
+    /// lambda 引数 / case 束縛など、生成時に確定する不変フレーム。
+    Lexical(HashMap<String, Value>),
+    /// 相互再帰グループ。closure が呼ばれる時点で中身が埋まっていればよい。
+    Rec(RecFrame),
+}
+
+/// 評価環境。フレームの連鎖 (内側 → 外側) で表現し、`lookup` は内側優先で辿る。
+/// lexical / rec の種別に依らずネスト順で shadowing する。
 #[derive(Clone, Debug, Default)]
 pub struct Env {
-    bindings: HashMap<String, Value>,
+    node: Option<Rc<EnvNode>>,
+}
+
+#[derive(Debug)]
+struct EnvNode {
+    frame: Frame,
+    parent: Option<Rc<EnvNode>>,
 }
 
 impl Env {
     pub fn new() -> Self {
-        Self::default()
+        Self { node: None }
+    }
+
+    fn push(&self, frame: Frame) -> Self {
+        Env {
+            node: Some(Rc::new(EnvNode {
+                frame,
+                parent: self.node.clone(),
+            })),
+        }
     }
 
     pub fn extend(&self, name: &str, value: Value) -> Self {
-        let mut new = self.clone();
-        new.bindings.insert(name.to_string(), value);
-        new
+        let mut m = HashMap::with_capacity(1);
+        m.insert(name.to_string(), value);
+        self.push(Frame::Lexical(m))
     }
 
     pub fn extend_many<I, S>(&self, iter: I) -> Self
@@ -75,15 +105,38 @@ impl Env {
         I: IntoIterator<Item = (S, Value)>,
         S: Into<String>,
     {
-        let mut new = self.clone();
-        for (n, v) in iter {
-            new.bindings.insert(n.into(), v);
+        let m: HashMap<String, Value> = iter.into_iter().map(|(n, v)| (n.into(), v)).collect();
+        if m.is_empty() {
+            return self.clone();
         }
-        new
+        self.push(Frame::Lexical(m))
     }
 
-    pub fn lookup(&self, name: &str) -> Option<&Value> {
-        self.bindings.get(name)
+    /// 共有再帰フレームを 1 つ積む。呼び出し側は同じ `RecFrame` を握り、
+    /// closure 生成後に `borrow_mut().insert(..)` で束縛を埋める。
+    pub fn push_rec(&self, rec: RecFrame) -> Self {
+        self.push(Frame::Rec(rec))
+    }
+
+    /// 内側フレームから外側へ辿り、最初に見つかった束縛を所有値で返す。
+    pub fn lookup(&self, name: &str) -> Option<Value> {
+        let mut cur = self.node.as_ref().map(Rc::clone);
+        while let Some(n) = cur {
+            match &n.frame {
+                Frame::Lexical(m) => {
+                    if let Some(v) = m.get(name) {
+                        return Some(v.clone());
+                    }
+                }
+                Frame::Rec(r) => {
+                    if let Some(v) = r.borrow().get(name) {
+                        return Some(v.clone());
+                    }
+                }
+            }
+            cur = n.parent.as_ref().map(Rc::clone);
+        }
+        None
     }
 }
 

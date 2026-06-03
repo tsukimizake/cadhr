@@ -187,7 +187,6 @@ pub fn run_main(prog: &CompiledProgram, inputs: &Inputs) -> Result<MainOutput, D
 
     let mut cur = env
         .lookup("main")
-        .cloned()
         .ok_or_else(|| Diagnostic::error(Span::empty(), "main 関数が定義されていません"))?;
 
     for p in &prog.main_signature.params {

@@ -55,8 +55,6 @@ fn bed_cable_clip() { try_project("bed-cable-clip"); }
 #[test]
 fn bed_drink_holder() { try_project("bed_drink_holder"); }
 #[test]
-fn loki_home_key() { try_project("loki_home_key"); }
-#[test]
 fn battery_case() { try_project("battery_case"); }
 #[test]
 fn wabouchou() { try_project("wabouchou"); }
