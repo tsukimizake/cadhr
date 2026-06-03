@@ -119,14 +119,23 @@ pub fn compile_with_paths(
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     let registry = sema::builtin::registry();
     let (_schemes, infer_diag) = sema::infer::infer_unit(&unit, &registry);
+    // 未定義の名前は確実に実行時クラッシュするので fatal として扱い、compile を失敗させる。
+    // それ以外の型推論エラーは型システムが未成熟なため warning に降格して続行する。
+    let mut has_fatal = false;
     for d in infer_diag {
-        if d.severity == Severity::Error {
+        if d.code == Some("undefined-name") {
+            has_fatal = true;
+            diagnostics.push(d);
+        } else if d.severity == Severity::Error {
             let mut dd = d;
             dd.severity = Severity::Warning;
             diagnostics.push(dd);
         } else {
             diagnostics.push(d);
         }
+    }
+    if has_fatal {
+        return Err(diagnostics);
     }
 
     let main_module = &unit.modules[unit.main_index].module;

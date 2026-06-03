@@ -616,7 +616,9 @@ pub fn infer_expr(
             match env.lookup(&key) {
                 Some(sc) => Some((infer.instantiate(sc), Subst::empty())),
                 None => {
-                    diag.push(Diagnostic::error(*span, format!("未定義の変数 `{key}`")));
+                    let mut d = Diagnostic::error(*span, format!("未定義の変数 `{key}`"));
+                    d.code = Some("undefined-name");
+                    diag.push(d);
                     None
                 }
             }
@@ -626,10 +628,10 @@ pub fn infer_expr(
             match env.lookup(&key) {
                 Some(sc) => Some((infer.instantiate(sc), Subst::empty())),
                 None => {
-                    diag.push(Diagnostic::error(
-                        *span,
-                        format!("未定義のコンストラクタ `{key}`"),
-                    ));
+                    let mut d =
+                        Diagnostic::error(*span, format!("未定義のコンストラクタ `{key}`"));
+                    d.code = Some("undefined-name");
+                    diag.push(d);
                     None
                 }
             }
