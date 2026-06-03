@@ -73,8 +73,21 @@ pub fn registry() -> BuiltinRegistry {
     let shape3d = || Type::con("Shape3D");
     let shape2d = || Type::con("Shape2D");
     let placed2d = || Type::con("PlacedShape2D");
-    let point3d = || Type::con("Point3D");
-    let point2d = || Type::con("Point2D");
+    // Point2D / Point3D は構造的 record 型 (Elm の `type alias Point2D = { x, y }` 相当)。
+    // 型注釈の `Point2D` / `Point3D` も infer 側で同じ record 型に解決される。
+    let point3d = || {
+        Type::Record(vec![
+            ("x".to_string(), Type::con("Float")),
+            ("y".to_string(), Type::con("Float")),
+            ("z".to_string(), Type::con("Float")),
+        ])
+    };
+    let point2d = || {
+        Type::Record(vec![
+            ("x".to_string(), Type::con("Float")),
+            ("y".to_string(), Type::con("Float")),
+        ])
+    };
     let plane = || Type::con("Plane");
     let string = || Type::con("String");
     let range_of = |t: Type| Type::app("Range", vec![t]);
@@ -131,7 +144,7 @@ pub fn registry() -> BuiltinRegistry {
         "2 つの 3D 形状の凸包",
     ));
 
-    // -- Transform 3D (Shape3D を最後の引数にしてパイプフレンドリーに)
+    // -- Transform 3D
     let r = r.add(mono(
         "translate3d",
         vec![point3d(), point3d(), shape3d()],
@@ -170,14 +183,13 @@ pub fn registry() -> BuiltinRegistry {
         "貼り付け 2D 形状を平面法線方向に押し出し",
     ));
 
-    // -- 2D ポリゴン + 平面別 extrude (Elm-like 簡略 API)
+    // -- 2D ポリゴン + 平面別 extrude (簡略 API)
     let r = r.add(mono(
         "polygon",
         vec![Type::app("List", vec![point2d()])],
         shape2d(),
         "Point2D の閉路リストから 2D ポリゴンを作る",
     ));
-    // pipe フレンドリーに Shape2D を末尾引数にする: `polygon [..] |> extrude_xy 15.0`
     let r = r.add(mono(
         "extrude_xy",
         vec![float(), shape2d()],
@@ -308,15 +320,15 @@ pub fn registry() -> BuiltinRegistry {
     let r = r.add(mono("p2", vec![float(), float()], point2d(), "2D 点"));
 
     // -- I/O
-    let r = r.add(mono("stl", vec![string()], shape3d(), "STL ファイル読み込み"));
+    let r = r.add(mono(
+        "stl",
+        vec![string()],
+        shape3d(),
+        "STL ファイル読み込み",
+    ));
 
     // -- 数値変換
-    let r = r.add(mono(
-        "fromInt",
-        vec![int()],
-        float(),
-        "Int を Float に変換",
-    ));
+    let r = r.add(mono("fromInt", vec![int()], float(), "Int を Float に変換"));
 
     r
 }

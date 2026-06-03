@@ -106,6 +106,24 @@ impl Infer {
                     let raw = self.ty_of_type_expr(&alias.body, &mut alias_var_map, diag);
                     return substitute_named(&raw, &subst_map, &alias_var_map);
                 }
+                // Point2D / Point3D は組み込みの構造的 record 型に解決する
+                // (sema::builtin の point2d / point3d と同一形)。
+                match name.as_str() {
+                    "Point2D" => {
+                        return Type::Record(vec![
+                            ("x".to_string(), Type::con("Float")),
+                            ("y".to_string(), Type::con("Float")),
+                        ])
+                    }
+                    "Point3D" => {
+                        return Type::Record(vec![
+                            ("x".to_string(), Type::con("Float")),
+                            ("y".to_string(), Type::con("Float")),
+                            ("z".to_string(), Type::con("Float")),
+                        ])
+                    }
+                    _ => {}
+                }
                 Type::Con(name.clone(), args_ty)
             }
             TypeExpr::Arrow { from, to, .. } => Type::arrow(

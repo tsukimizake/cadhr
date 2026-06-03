@@ -89,20 +89,44 @@ fn as_shape3d(v: &Value) -> Result<Model3D, String> {
     }
 }
 
+/// Point2D / Point3D は record 値 (`{ x, y }` / `{ x, y, z }`) として表現する。
+fn point2d_value(x: f64, y: f64) -> Value {
+    Value::Record(vec![
+        ("x".to_string(), Value::Float(x)),
+        ("y".to_string(), Value::Float(y)),
+    ])
+}
+
+fn point3d_value(x: f64, y: f64, z: f64) -> Value {
+    Value::Record(vec![
+        ("x".to_string(), Value::Float(x)),
+        ("y".to_string(), Value::Float(y)),
+        ("z".to_string(), Value::Float(z)),
+    ])
+}
+
+fn record_float(fields: &[(String, Value)], name: &str) -> Result<f64, String> {
+    fields
+        .iter()
+        .find(|(n, _)| n == name)
+        .ok_or_else(|| format!("record に field `{name}` がありません"))
+        .and_then(|(_, v)| as_f64(v))
+}
+
 fn as_point3d(v: &Value) -> Result<(f64, f64, f64), String> {
     match v {
-        Value::Opaque(tag, args) if tag == "Point3D" && args.len() == 3 => {
-            Ok((as_f64(&args[0])?, as_f64(&args[1])?, as_f64(&args[2])?))
-        }
+        Value::Record(fs) => Ok((
+            record_float(fs, "x")?,
+            record_float(fs, "y")?,
+            record_float(fs, "z")?,
+        )),
         _ => Err(format!("Point3D が期待されましたが {v} でした")),
     }
 }
 
 fn as_point2d(v: &Value) -> Result<(f64, f64), String> {
     match v {
-        Value::Opaque(tag, args) if tag == "Point2D" && args.len() == 2 => {
-            Ok((as_f64(&args[0])?, as_f64(&args[1])?))
-        }
+        Value::Record(fs) => Ok((record_float(fs, "x")?, record_float(fs, "y")?)),
         _ => Err(format!("Point2D が期待されましたが {v} でした")),
     }
 }
@@ -189,23 +213,14 @@ pub fn registry() -> BuiltinEvalRegistry {
         })
         // -- Points
         .add("p3", 3, |args| {
-            Ok(Value::Opaque(
-                "Point3D".to_string(),
-                vec![
-                    Value::Float(as_f64(&args[0])?),
-                    Value::Float(as_f64(&args[1])?),
-                    Value::Float(as_f64(&args[2])?),
-                ],
+            Ok(point3d_value(
+                as_f64(&args[0])?,
+                as_f64(&args[1])?,
+                as_f64(&args[2])?,
             ))
         })
         .add("p2", 2, |args| {
-            Ok(Value::Opaque(
-                "Point2D".to_string(),
-                vec![
-                    Value::Float(as_f64(&args[0])?),
-                    Value::Float(as_f64(&args[1])?),
-                ],
-            ))
+            Ok(point2d_value(as_f64(&args[0])?, as_f64(&args[1])?))
         })
         // -- 数値変換
         .add("fromInt", 1, |args| Ok(Value::Float(as_int(&args[0])? as f64)))
@@ -397,14 +412,7 @@ pub fn registry() -> BuiltinEvalRegistry {
                     .unwrap_or([default.0, default.1, default.2])
             });
             RECORDED_CONTROLS.with(|r| r.borrow_mut().push((name, current)));
-            Ok(Value::Opaque(
-                "Point3D".to_string(),
-                vec![
-                    Value::Float(current[0]),
-                    Value::Float(current[1]),
-                    Value::Float(current[2]),
-                ],
-            ))
+            Ok(point3d_value(current[0], current[1], current[2]))
         })
         .add("control2d", 2, |args| {
             let name = as_string(&args[0])?;
@@ -417,10 +425,7 @@ pub fn registry() -> BuiltinEvalRegistry {
             });
             // 2D は z を 0 として記録する (GUI 側で扱いを分岐)。
             RECORDED_CONTROLS.with(|r| r.borrow_mut().push((name, current)));
-            Ok(Value::Opaque(
-                "Point2D".to_string(),
-                vec![Value::Float(current[0]), Value::Float(current[1])],
-            ))
+            Ok(point2d_value(current[0], current[1]))
         })
         // -- Bezier サンプリング
         .add("bezier_quad", 4, |args| {
@@ -436,10 +441,7 @@ pub fn registry() -> BuiltinEvalRegistry {
                 let mt = 1.0 - t;
                 let x = mt * mt * p0.0 + 2.0 * mt * t * c.0 + t * t * p1.0;
                 let y = mt * mt * p0.1 + 2.0 * mt * t * c.1 + t * t * p1.1;
-                pts.push(Value::Opaque(
-                    "Point2D".to_string(),
-                    vec![Value::Float(x), Value::Float(y)],
-                ));
+                pts.push(point2d_value(x, y));
             }
             Ok(Value::List(pts))
         })
@@ -459,10 +461,7 @@ pub fn registry() -> BuiltinEvalRegistry {
                 let b3 = t * t * t;
                 let x = b0 * p0.0 + b1 * c1.0 + b2 * c2.0 + b3 * p1.0;
                 let y = b0 * p0.1 + b1 * c1.1 + b2 * c2.1 + b3 * p1.1;
-                pts.push(Value::Opaque(
-                    "Point2D".to_string(),
-                    vec![Value::Float(x), Value::Float(y)],
-                ));
+                pts.push(point2d_value(x, y));
             }
             Ok(Value::List(pts))
         })
