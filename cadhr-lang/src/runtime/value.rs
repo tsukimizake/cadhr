@@ -45,7 +45,7 @@ pub enum Value {
     Shape3D(Model3D),
     /// 2D 幾何形状 (extrude / revolve の入力)。
     Shape2D(Model2D),
-    /// 名前付きの不透明値 (control point ハンドルなど)。
+    /// 名前付きの不透明値 (place の PlacedShape2D)。
     Opaque(String, Vec<Value>),
 }
 
