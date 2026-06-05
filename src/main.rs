@@ -1,10 +1,3 @@
-//! cadhr GUI (iced)。Elm-like cadhr-lang をリアルタイム評価して 3D プレビュー。
-//!
-//! 編集と再評価のコストを分離する設計:
-//! - エディタが変わったら **compile** (重い: parse + 型推論 + slider 抽出) を走らせ、
-//!   `CompiledProgram` を Model に保持。
-//! - slider を動かしたら **eval** だけ (軽い: run_main + manifold_bridge) を走らせる。
-
 mod debug;
 mod export;
 mod highlight;
@@ -22,11 +15,16 @@ use interpreter::{CompileJobParams, CompileJobResult, EvalJobResult};
 use ui::parts;
 use ui::preview::{Preview, PreviewMsg};
 
-const DEFAULT_EDITOR_TEXT: &str = "main length =\n    cube 10.0 10.0 length\n\nslider length = 6.0 .. 80.0\n";
+const DEFAULT_EDITOR_TEXT: &str =
+    "main length =\n    cube 10.0 10.0 length\n\nslider length = 6.0 .. 80.0\n";
 
 trait DialogHandler {
     fn open_session(&self) -> Task<Msg>;
-    fn save_session_as(&self, editor_text: String, previews: Vec<session::SessionPreview>) -> Task<Msg>;
+    fn save_session_as(
+        &self,
+        editor_text: String,
+        previews: Vec<session::SessionPreview>,
+    ) -> Task<Msg>;
 }
 
 struct RfdDialogs;
@@ -143,13 +141,7 @@ fn init() -> (Model, Task<Msg>) {
                     .iter()
                     .map(Preview::from_session)
                     .collect();
-                model.next_preview_id = model
-                    .previews
-                    .iter()
-                    .map(|p| p.id)
-                    .max()
-                    .unwrap_or(0)
-                    + 1;
+                model.next_preview_id = model.previews.iter().map(|p| p.id).max().unwrap_or(0) + 1;
             }
         }
     }
@@ -209,7 +201,11 @@ fn spawn_eval_for(model: &Model, preview_id: u64) -> Task<Msg> {
 }
 
 fn spawn_eval_all(model: &Model) -> Task<Msg> {
-    let tasks: Vec<Task<Msg>> = model.previews.iter().map(|p| spawn_eval_for(model, p.id)).collect();
+    let tasks: Vec<Task<Msg>> = model
+        .previews
+        .iter()
+        .map(|p| spawn_eval_for(model, p.id))
+        .collect();
     Task::batch(tasks)
 }
 
@@ -316,6 +312,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                 }
                 Task::none()
             }
+            PreviewMsg::SceneIgnored => Task::none(),
             PreviewMsg::ToggleViewCenter => {
                 if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
                     p.view_at_object_center = !p.view_at_object_center;
@@ -337,16 +334,13 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                 };
                 if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
                     // 既存値がなければ control_points から default を引いて初期化
-                    let entry = p
-                        .control_overrides
-                        .entry(name.clone())
-                        .or_insert_with(|| {
-                            p.control_points
-                                .iter()
-                                .find(|(n, _)| n == &name)
-                                .map(|(_, pos)| *pos)
-                                .unwrap_or([0.0, 0.0, 0.0])
-                        });
+                    let entry = p.control_overrides.entry(name.clone()).or_insert_with(|| {
+                        p.control_points
+                            .iter()
+                            .find(|(n, _)| n == &name)
+                            .map(|(_, pos)| *pos)
+                            .unwrap_or([0.0, 0.0, 0.0])
+                    });
                     if axis < 3 {
                         entry[axis] = v;
                     }
@@ -363,7 +357,8 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             let mut p = Preview::new(id);
             for param in &model.signature.params {
                 if let Some(r) = &param.range {
-                    p.slider_values.insert(param.name.clone(), (r.lo + r.hi) / 2.0);
+                    p.slider_values
+                        .insert(param.name.clone(), (r.lo + r.hi) / 2.0);
                 }
             }
             model.previews.push(p);
@@ -376,7 +371,8 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             let mut p = Preview::new_collision(id);
             for param in &model.signature.params {
                 if let Some(r) = &param.range {
-                    p.slider_values.insert(param.name.clone(), (r.lo + r.hi) / 2.0);
+                    p.slider_values
+                        .insert(param.name.clone(), (r.lo + r.hi) / 2.0);
                 }
             }
             model.previews.push(p);
@@ -413,13 +409,8 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                         .iter()
                         .map(Preview::from_session)
                         .collect();
-                    model.next_preview_id = model
-                        .previews
-                        .iter()
-                        .map(|p| p.id)
-                        .max()
-                        .unwrap_or(0)
-                        + 1;
+                    model.next_preview_id =
+                        model.previews.iter().map(|p| p.id).max().unwrap_or(0) + 1;
                 }
                 session::save_last_session_path(&path);
                 return spawn_compile_job(model);
@@ -432,9 +423,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                 let text = model.editor.text();
                 let previews = collect_session_previews(model);
                 Task::perform(
-                    async move {
-                        session::save_session(&path, &text, &previews).map(|()| path)
-                    },
+                    async move { session::save_session(&path, &text, &previews).map(|()| path) },
                     Msg::SessionSaved,
                 )
             } else {
@@ -464,10 +453,11 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
         Msg::ToggleAutoReload => {
             model.auto_reload = !model.auto_reload;
             if model.auto_reload {
-                model.last_modified = model
-                    .current_file_path
-                    .as_ref()
-                    .and_then(|p| std::fs::metadata(p.join("db.cadhr")).and_then(|m| m.modified()).ok());
+                model.last_modified = model.current_file_path.as_ref().and_then(|p| {
+                    std::fs::metadata(p.join("db.cadhr"))
+                        .and_then(|m| m.modified())
+                        .ok()
+                });
             }
             Task::none()
         }
@@ -539,32 +529,35 @@ fn view(model: &Model) -> Element<'_, Msg> {
 
     // 最初の preview のスライダーを「主スライダー」として main パネルに出す。
     // 他の preview は同じ値を共有 (per-preview override は将来課題)。
-    let sliders_view: Element<'_, Msg> = if model.signature.params.is_empty() || model.previews.is_empty() {
-        column![].into()
-    } else {
-        let main_pid = model.previews[0].id;
-        let mut col = column![text("Main sliders:").size(13)].spacing(4).padding(4);
-        for p in &model.signature.params {
-            let r = match &p.range {
-                Some(r) => r,
-                None => continue,
-            };
-            let cur = model.previews[0]
-                .slider_values
-                .get(&p.name)
-                .copied()
-                .unwrap_or((r.lo + r.hi) / 2.0) as f32;
-            let lo = r.lo as f32;
-            let hi = r.hi as f32;
-            let name = p.name.clone();
-            let label = text(format!("{}: {:.2}", p.name, cur));
-            let widget = slider(lo..=hi, cur, move |v| {
-                Msg::SliderChanged(main_pid, name.clone(), v)
-            });
-            col = col.push(row![label, widget].spacing(8));
-        }
-        col.into()
-    };
+    let sliders_view: Element<'_, Msg> =
+        if model.signature.params.is_empty() || model.previews.is_empty() {
+            column![].into()
+        } else {
+            let main_pid = model.previews[0].id;
+            let mut col = column![text("Main sliders:").size(13)]
+                .spacing(4)
+                .padding(4);
+            for p in &model.signature.params {
+                let r = match &p.range {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let cur = model.previews[0]
+                    .slider_values
+                    .get(&p.name)
+                    .copied()
+                    .unwrap_or((r.lo + r.hi) / 2.0) as f32;
+                let lo = r.lo as f32;
+                let hi = r.hi as f32;
+                let name = p.name.clone();
+                let label = text(format!("{}: {:.2}", p.name, cur));
+                let widget = slider(lo..=hi, cur, move |v| {
+                    Msg::SliderChanged(main_pid, name.clone(), v)
+                });
+                col = col.push(row![label, widget].spacing(8));
+            }
+            col.into()
+        };
 
     let previews_view: Element<'_, Msg> =
         ui::preview::list_view(&model.previews).map(|(id, pm)| Msg::Preview(id, pm));
@@ -595,9 +588,13 @@ fn view(model: &Model) -> Element<'_, Msg> {
     };
 
     container(
-        column![toolbar, row![left_panel, right_panel].spacing(4).height(Fill), error_bar,]
-            .spacing(4)
-            .padding(4),
+        column![
+            toolbar,
+            row![left_panel, right_panel].spacing(4).height(Fill),
+            error_bar,
+        ]
+        .spacing(4)
+        .padding(4),
     )
     .into()
 }

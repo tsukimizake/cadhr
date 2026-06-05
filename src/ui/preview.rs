@@ -15,7 +15,6 @@ use crate::preview::Scene;
 use crate::session::SessionPreview;
 use crate::ui::parts;
 
-/// プレビュー 1 枚分の状態。
 pub struct Preview {
     pub id: u64,
     pub scene: Scene,
@@ -123,6 +122,8 @@ impl Preview {
 
 #[derive(Debug, Clone)]
 pub enum PreviewMsg {
+    /// Scene が出す SceneMessage（カメラ操作）を preview レイヤーで握りつぶすための no-op。
+    SceneIgnored,
     ToggleViewCenter,
     Minimize,
     Close,
@@ -141,11 +142,14 @@ pub fn view<'a>(p: &'a Preview, index: usize, total: usize) -> Element<'a, Previ
     let header = row![
         parts::dark_button("↑").on_press(PreviewMsg::MoveUp),
         parts::dark_button("↓").on_press(PreviewMsg::MoveDown),
-        parts::dark_button(if p.minimized { "▶" } else { "▼" })
-            .on_press(PreviewMsg::Minimize),
+        parts::dark_button(if p.minimized { "▶" } else { "▼" }).on_press(PreviewMsg::Minimize),
         text(label),
-        parts::dark_button(if p.view_at_object_center { "center" } else { "origin" })
-            .on_press(PreviewMsg::ToggleViewCenter),
+        parts::dark_button(if p.view_at_object_center {
+            "center"
+        } else {
+            "origin"
+        })
+        .on_press(PreviewMsg::ToggleViewCenter),
         parts::dark_button("×").on_press(PreviewMsg::Close),
     ]
     .spacing(2);
@@ -154,12 +158,12 @@ pub fn view<'a>(p: &'a Preview, index: usize, total: usize) -> Element<'a, Previ
         return container(header).padding(4).into();
     }
 
-    let widget: Element<'a, crate::preview::SceneMessage> =
-        shader(&p.scene).width(Fill).height(Length::Fixed(220.0)).into();
-    // Scene が出す SceneMessage::Clicked はカメラ操作専用なので preview 自体は publish しない。
-    let preview_widget: Element<'a, PreviewMsg> = widget.map(|_| PreviewMsg::ToggleViewCenter);
-    // ↑ 厳密には `ToggleViewCenter` は誤接続。実用上 Clicked は出ないので無害だが、
-    //   将来 control point ドラッグを実装するときに本物のメッセージに差し替える。
+    let widget: Element<'a, crate::preview::SceneMessage> = shader(&p.scene)
+        .width(Fill)
+        .height(Length::Fixed(220.0))
+        .into();
+    // control point ドラッグを実装するときに差し替える）。
+    let preview_widget: Element<'a, PreviewMsg> = widget.map(|_| PreviewMsg::SceneIgnored);
 
     let mut col = column![header, preview_widget].spacing(4);
 
@@ -173,9 +177,13 @@ pub fn view<'a>(p: &'a Preview, index: usize, total: usize) -> Element<'a, Previ
     if !p.control_points.is_empty() {
         let mut c_col = column![text("Control Points:").size(13)].spacing(2);
         for (i, (name, pos)) in p.control_points.iter().enumerate() {
-            let selected_label = if Some(i) == p.selected_cp { "●" } else { "○" };
-            let select_btn = parts::dark_button(selected_label)
-                .on_press(PreviewMsg::SelectControlPoint(i));
+            let selected_label = if Some(i) == p.selected_cp {
+                "●"
+            } else {
+                "○"
+            };
+            let select_btn =
+                parts::dark_button(selected_label).on_press(PreviewMsg::SelectControlPoint(i));
             let label = text(format!("  {name}"));
             let x_input = numeric_input(name.clone(), 0, pos[0]);
             let y_input = numeric_input(name.clone(), 1, pos[1]);
@@ -185,9 +193,7 @@ pub fn view<'a>(p: &'a Preview, index: usize, total: usize) -> Element<'a, Previ
         col = col.push(c_col);
     }
     if let Some((msg, _)) = &p.error {
-        col = col.push(
-            text(format!("error: {msg}")).color(iced::Color::from_rgb(1.0, 0.4, 0.4)),
-        );
+        col = col.push(text(format!("error: {msg}")).color(iced::Color::from_rgb(1.0, 0.4, 0.4)));
     }
     container(col).padding(4).into()
 }
