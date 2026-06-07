@@ -214,6 +214,29 @@ impl Scene {
             edge_color: DEFAULT_EDGE_COLOR,
         }
     }
+
+    /// 軸ジゾモ用の uniform。メインカメラの「回転だけ」を再利用し、
+    /// 平行投影で常に同じ画面サイズで描画する (zoom/モデル位置の影響を受けない)。
+    /// 描画先は固定サイズの正方形サブビューポートのため aspect は 1.0 固定。
+    fn build_gizmo_uniforms(&self, cam: &CameraState) -> Uniforms {
+        let rx = cam.rotate_x as f32;
+        let ry = cam.rotate_y as f32;
+        // 軸ベクトル長 1.0 がジゾモ枠の約 2/3 を占めるように [-1.5, 1.5] に張る
+        let dist = 5.0_f32;
+        let x = dist * ry.sin() * rx.cos();
+        let y = dist * ry.cos() * rx.cos();
+        let z = dist * rx.sin();
+        let eye = Vec3::new(x, y, z);
+        let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Z);
+        let proj = Mat4::orthographic_rh(-1.5, 1.5, -1.5, 1.5, 0.1, 10.0);
+
+        Uniforms {
+            view_proj: (proj * view).to_cols_array_2d(),
+            color: [0.0; 4],
+            light_dir: [0.0; 4],
+            edge_color: [0.0; 4],
+        }
+    }
 }
 
 /// Generate ray from UV coordinates (0..1) through the camera.
@@ -475,6 +498,7 @@ impl shader::Program<SceneMessage> for Scene {
         Primitive {
             id: self.id,
             uniforms: self.build_uniforms(state, bounds),
+            gizmo_uniforms: self.build_gizmo_uniforms(state),
             mesh: self.mesh.clone(),
             mesh_version: self.mesh_version,
         }
@@ -500,6 +524,7 @@ impl shader::Program<SceneMessage> for Scene {
 pub struct Primitive {
     id: u64,
     uniforms: Uniforms,
+    gizmo_uniforms: Uniforms,
     mesh: Arc<MeshData>,
     mesh_version: u64,
 }
@@ -528,6 +553,7 @@ impl shader::Primitive for Primitive {
             viewport,
             self.id,
             &self.uniforms,
+            &self.gizmo_uniforms,
             &self.mesh,
             self.mesh_version,
         );

@@ -42,13 +42,25 @@ struct PerInstance {
     edge_index_buffer: Option<wgpu::Buffer>,
     edge_index_count: u32,
     uploaded_version: u64,
+    /// 軸ジゾモ用の uniform。view_proj は「カメラ回転のみ」反映したものを毎フレーム書き込む。
+    gizmo_uniform_buffer: wgpu::Buffer,
+    gizmo_bind_group: wgpu::BindGroup,
 }
+
+/// 左下に重ねる軸ジゾモのピクセルサイズ (物理ピクセル)
+const GIZMO_SIZE_PX: u32 = 80;
+/// ビューポート端からの余白 (物理ピクセル)
+const GIZMO_MARGIN_PX: u32 = 8;
 
 pub struct Pipeline {
     pipeline: wgpu::RenderPipeline,
     edge_pipeline: wgpu::RenderPipeline,
+    gizmo_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     instances: HashMap<u64, PerInstance>,
+    gizmo_vertex_buffer: wgpu::Buffer,
+    gizmo_index_buffer: wgpu::Buffer,
+    gizmo_index_count: u32,
     depth_view: Option<wgpu::TextureView>,
     depth_size: (u32, u32),
 }
@@ -131,6 +143,55 @@ impl Pipeline {
             cache: None,
         });
 
+        let gizmo_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("cadhr_gizmo_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader_module,
+                entry_point: Some("vs_gizmo"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader_module,
+                entry_point: Some("fs_gizmo"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            // 独立した小さいサブビューポートに描画するためデプスは付けない
+            // (背面の軸も常に見せたい / メイン描画のデプスと混ざらないようにする)
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let (gizmo_vertices, gizmo_indices) = build_gizmo_geometry();
+        let gizmo_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gizmo_vbuf"),
+            contents: bytemuck::cast_slice(&gizmo_vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let gizmo_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gizmo_ibuf"),
+            contents: bytemuck::cast_slice(&gizmo_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let gizmo_index_count = gizmo_indices.len() as u32;
+
         let edge_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("cadhr_edge_pipeline"),
             layout: Some(&layout),
@@ -174,8 +235,12 @@ impl Pipeline {
         Self {
             pipeline,
             edge_pipeline,
+            gizmo_pipeline,
             bind_group_layout: bgl,
             instances: HashMap::new(),
+            gizmo_vertex_buffer,
+            gizmo_index_buffer,
+            gizmo_index_count,
             depth_view: None,
             depth_size: (0, 0),
         }
@@ -188,6 +253,7 @@ impl Pipeline {
         viewport: &Viewport,
         id: u64,
         uniforms: &Uniforms,
+        gizmo_uniforms: &Uniforms,
         mesh: &Arc<MeshData>,
         mesh_version: u64,
     ) {
@@ -228,6 +294,20 @@ impl Pipeline {
                     resource: uniform_buffer.as_entire_binding(),
                 }],
             });
+            let gizmo_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gizmo_uniforms"),
+                size: std::mem::size_of::<Uniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let gizmo_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gizmo_bg"),
+                layout: bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: gizmo_uniform_buffer.as_entire_binding(),
+                }],
+            });
             PerInstance {
                 uniform_buffer,
                 bind_group,
@@ -237,10 +317,17 @@ impl Pipeline {
                 edge_index_buffer: None,
                 edge_index_count: 0,
                 uploaded_version: 0,
+                gizmo_uniform_buffer,
+                gizmo_bind_group,
             }
         });
 
         queue.write_buffer(&inst.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+        queue.write_buffer(
+            &inst.gizmo_uniform_buffer,
+            0,
+            bytemuck::bytes_of(gizmo_uniforms),
+        );
 
         if mesh_version != 0 && mesh_version != inst.uploaded_version {
             // 空メッシュ (shape が 0 件) のときは buffer を作らずクリアする。
@@ -351,9 +438,83 @@ impl Pipeline {
                 pass.draw_indexed(0..inst.edge_index_count, 0, 0..1);
             }
         }
+
+        // 軸ジゾモは独立した render pass で左下角に重ねる。
+        // メイン描画のデプスバッファと干渉させないため depth attachment なし。
+        drop(pass);
+        self.render_gizmo(encoder, target, clip_bounds, inst);
+    }
+
+    fn render_gizmo(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        clip_bounds: &Rectangle<u32>,
+        inst: &PerInstance,
+    ) {
+        // ビューポートが gizmo を置くには狭すぎる場合はスキップ
+        let needed = GIZMO_SIZE_PX + GIZMO_MARGIN_PX * 2;
+        if clip_bounds.width < needed || clip_bounds.height < needed {
+            return;
+        }
+        let gx = clip_bounds.x + GIZMO_MARGIN_PX;
+        let gy = clip_bounds.y + clip_bounds.height - GIZMO_SIZE_PX - GIZMO_MARGIN_PX;
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("cadhr_gizmo_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_viewport(
+            gx as f32,
+            gy as f32,
+            GIZMO_SIZE_PX as f32,
+            GIZMO_SIZE_PX as f32,
+            0.0,
+            1.0,
+        );
+        pass.set_scissor_rect(gx, gy, GIZMO_SIZE_PX, GIZMO_SIZE_PX);
+        pass.set_pipeline(&self.gizmo_pipeline);
+        pass.set_bind_group(0, &inst.gizmo_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.gizmo_vertex_buffer.slice(..));
+        pass.set_index_buffer(
+            self.gizmo_index_buffer.slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
+        pass.draw_indexed(0..self.gizmo_index_count, 0, 0..1);
     }
 
     pub fn remove_instance(&mut self, id: u64) {
         self.instances.remove(&id);
     }
+}
+
+/// 軸ジゾモのライン頂点とインデックスを作る。
+/// X=赤 / Y=緑 / Z=青 (RGB=XYZ の業界慣習)。
+/// 各軸は原点から +unit へ伸ばすことで「線の向いている方が正方向」を示す。
+fn build_gizmo_geometry() -> (Vec<Vertex>, Vec<u32>) {
+    const X_COLOR: [f32; 4] = [1.0, 0.25, 0.25, 1.0];
+    const Y_COLOR: [f32; 4] = [0.25, 1.0, 0.25, 1.0];
+    const Z_COLOR: [f32; 4] = [0.35, 0.55, 1.0, 1.0];
+
+    let vertices = vec![
+        Vertex { position: [0.0, 0.0, 0.0], normal: [0.0; 3], color: X_COLOR },
+        Vertex { position: [1.0, 0.0, 0.0], normal: [0.0; 3], color: X_COLOR },
+        Vertex { position: [0.0, 0.0, 0.0], normal: [0.0; 3], color: Y_COLOR },
+        Vertex { position: [0.0, 1.0, 0.0], normal: [0.0; 3], color: Y_COLOR },
+        Vertex { position: [0.0, 0.0, 0.0], normal: [0.0; 3], color: Z_COLOR },
+        Vertex { position: [0.0, 0.0, 1.0], normal: [0.0; 3], color: Z_COLOR },
+    ];
+    let indices = vec![0, 1, 2, 3, 4, 5];
+    (vertices, indices)
 }
