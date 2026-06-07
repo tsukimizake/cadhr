@@ -10,8 +10,9 @@ use crate::module::{LoadedModule, ResolvedUnit};
 use crate::runtime::builtin::{BuiltinEval, BuiltinEvalRegistry};
 use crate::runtime::value::{ClosureBody, Env, RecFrame, Value};
 use crate::syntax::ast::*;
+use crate::syntax::free_vars::{free_var_names_in, pattern_bound_names_into};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 pub struct Evaluator<'r> {
@@ -142,25 +143,46 @@ impl<'r> Evaluator<'r> {
 
         // 4. local value decl を共有再帰フレームに評価して back-patch する。
         // closure はこの rec フレームを共有するので、自己再帰・前方参照・相互再帰すべて見える。
-        // 2 パス: 先に関数 (closure, 遅延) を全て束縛してから、引数なしの eager な値を評価する。
-        // これで eager な値 (例: main) が後方定義の関数を前方参照できる。
+        // 2 パス: 先に関数 (closure, 遅延) を全て束縛してから、eager な値を依存順に評価する。
+        // eager 同士の前方参照は free-var 解析で依存グラフを作り topo sort する。
         let rec: RecFrame = Rc::new(RefCell::new(HashMap::new()));
         let env = Rc::new(env.push_rec(rec.clone()));
-        for fns_pass in [true, false] {
-            for d in &lm.module.decls {
-                if let Decl::Value(v) = d {
-                    if v.params.is_empty() == fns_pass {
-                        continue;
-                    }
-                    let val = self.eval_value_decl(v, env.clone()).map_err(|e| vec![e])?;
-                    rec.borrow_mut().insert(v.name.clone(), val.clone());
-                    if !lm.qualified_name.is_empty() {
-                        rec.borrow_mut()
-                            .insert(qualify_name(&lm.qualified_name, &v.name), val.clone());
-                    }
-                    locals.insert(v.name.clone(), val);
+
+        // pass 1: 関数 (closure) を先に束縛
+        for d in &lm.module.decls {
+            if let Decl::Value(v) = d {
+                if v.params.is_empty() {
+                    continue;
                 }
+                let val = self.eval_value_decl(v, env.clone()).map_err(|e| vec![e])?;
+                rec.borrow_mut().insert(v.name.clone(), val.clone());
+                if !lm.qualified_name.is_empty() {
+                    rec.borrow_mut()
+                        .insert(qualify_name(&lm.qualified_name, &v.name), val.clone());
+                }
+                locals.insert(v.name.clone(), val);
             }
+        }
+
+        // pass 2: eager な値を依存順に評価
+        let eager: Vec<&ValueDecl> = lm
+            .module
+            .decls
+            .iter()
+            .filter_map(|d| match d {
+                Decl::Value(v) if v.params.is_empty() => Some(v),
+                _ => None,
+            })
+            .collect();
+        let ordered = topo_sort_eager(&eager).map_err(|e| vec![e])?;
+        for v in ordered {
+            let val = self.eval_value_decl(v, env.clone()).map_err(|e| vec![e])?;
+            rec.borrow_mut().insert(v.name.clone(), val.clone());
+            if !lm.qualified_name.is_empty() {
+                rec.borrow_mut()
+                    .insert(qualify_name(&lm.qualified_name, &v.name), val.clone());
+            }
+            locals.insert(v.name.clone(), val);
         }
 
         module_envs.insert(lm.qualified_name.clone(), env);
@@ -221,16 +243,38 @@ impl<'r> Evaluator<'r> {
         }
 
         // 値定義を共有再帰フレームに評価して back-patch (eval_one_module と同じ仕組み)。
-        // 2 パス: 関数 (closure) を先に束縛してから eager な値を評価し前方参照を許す。
+        // 関数 (closure) を先に束縛してから eager な値を依存順に評価し前方参照を許す。
         let rec: RecFrame = Rc::new(RefCell::new(HashMap::new()));
         let env = Rc::new(env.push_rec(rec.clone()));
         let mut diag = Vec::new();
-        for fns_pass in [true, false] {
-            for d in &m.decls {
-                if let Decl::Value(v) = d {
-                    if v.params.is_empty() == fns_pass {
-                        continue;
+
+        // pass 1: 関数
+        for d in &m.decls {
+            if let Decl::Value(v) = d {
+                if v.params.is_empty() {
+                    continue;
+                }
+                match self.eval_value_decl(v, env.clone()) {
+                    Ok(value) => {
+                        rec.borrow_mut().insert(v.name.clone(), value);
                     }
+                    Err(e) => diag.push(e),
+                }
+            }
+        }
+
+        // pass 2: eager な値を依存順に
+        let eager: Vec<&ValueDecl> = m
+            .decls
+            .iter()
+            .filter_map(|d| match d {
+                Decl::Value(v) if v.params.is_empty() => Some(v),
+                _ => None,
+            })
+            .collect();
+        match topo_sort_eager(&eager) {
+            Ok(ordered) => {
+                for v in ordered {
                     match self.eval_value_decl(v, env.clone()) {
                         Ok(value) => {
                             rec.borrow_mut().insert(v.name.clone(), value);
@@ -239,6 +283,7 @@ impl<'r> Evaluator<'r> {
                     }
                 }
             }
+            Err(e) => diag.push(e),
         }
         if diag.is_empty() { Ok(env) } else { Err(diag) }
     }
@@ -348,12 +393,29 @@ impl<'r> Evaluator<'r> {
             }),
             Expr::Let { bindings, body, .. } => {
                 // 共有再帰フレームで let-rec を実現 (相互再帰・前方参照可)。
+                // top-level と同じく「関数を先 → eager を依存順」で評価して
+                // let 内の定義順非依存を保証する。
                 let rec: RecFrame = Rc::new(RefCell::new(HashMap::new()));
                 let let_env = Rc::new(env.push_rec(rec.clone()));
+
+                // pass 1: 関数 (closure) を先に束縛
                 for b in bindings {
+                    if b.params.is_empty() {
+                        continue;
+                    }
                     let v = self.eval_value_decl(b, let_env.clone())?;
                     rec.borrow_mut().insert(b.name.clone(), v);
                 }
+
+                // pass 2: eager を依存順に
+                let eager: Vec<&ValueDecl> =
+                    bindings.iter().filter(|b| b.params.is_empty()).collect();
+                let ordered = topo_sort_eager(&eager)?;
+                for b in ordered {
+                    let v = self.eval_value_decl(b, let_env.clone())?;
+                    rec.borrow_mut().insert(b.name.clone(), v);
+                }
+
                 self.eval_expr(body, &let_env)
             }
             Expr::If {
@@ -715,6 +777,85 @@ fn num_pair(l: &Value, r: &Value, span: Span) -> Result<(f64, f64), Diagnostic> 
         }
     };
     Ok((lf, rf))
+}
+
+/// eager な値定義 (`params.is_empty()`) を free-var 依存に基づいて topo sort する。
+/// `decls` に含まれる名前のうち、ある decl の body が直接参照しているものを依存と見なす。
+/// 同じ名前内グループに循環があれば fatal な runtime diagnostic を返す。
+fn topo_sort_eager<'a>(decls: &[&'a ValueDecl]) -> Result<Vec<&'a ValueDecl>, Diagnostic> {
+    let names: HashSet<String> = decls.iter().map(|v| v.name.clone()).collect();
+    // 名前の重複は普通起きないが、起きた場合は最後の定義を採用 (decl 順を保つ)。
+    let mut by_name: HashMap<String, &'a ValueDecl> = HashMap::new();
+    for v in decls {
+        by_name.insert(v.name.clone(), *v);
+    }
+
+    // 各 decl の free var (= 同グループ内で前方/後方に存在する名前) を計算
+    let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+    for v in decls {
+        let mut bound: HashSet<String> = HashSet::new();
+        for p in &v.params {
+            pattern_bound_names_into(p, &mut bound);
+        }
+        let mut out: HashSet<String> = HashSet::new();
+        free_var_names_in(&v.body, &mut bound, &mut out);
+        let ds: Vec<String> = out
+            .into_iter()
+            .filter(|n| n != &v.name && names.contains(n))
+            .collect();
+        deps.insert(v.name.clone(), ds);
+    }
+
+    // DFS で topo sort。color: 0=未訪問, 1=訪問中, 2=完了
+    let mut color: HashMap<String, u8> = HashMap::new();
+    let mut order: Vec<&'a ValueDecl> = Vec::new();
+
+    fn visit<'a>(
+        name: &str,
+        by_name: &HashMap<String, &'a ValueDecl>,
+        deps: &HashMap<String, Vec<String>>,
+        color: &mut HashMap<String, u8>,
+        stack: &mut Vec<String>,
+        order: &mut Vec<&'a ValueDecl>,
+    ) -> Result<(), Diagnostic> {
+        match color.get(name).copied().unwrap_or(0) {
+            2 => return Ok(()),
+            1 => {
+                let cycle_start = stack.iter().position(|n| n == name).unwrap_or(0);
+                let mut cyc: Vec<String> = stack[cycle_start..].to_vec();
+                cyc.push(name.to_string());
+                let span = by_name.get(name).map(|d| d.span).unwrap_or(Span::empty());
+                return Err(Diagnostic::runtime(
+                    span,
+                    format!(
+                        "eager な値定義の循環参照: {} (関数を介さない循環は評価できません)",
+                        cyc.join(" -> ")
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        color.insert(name.to_string(), 1);
+        stack.push(name.to_string());
+        if let Some(ds) = deps.get(name) {
+            for d in ds {
+                visit(d, by_name, deps, color, stack, order)?;
+            }
+        }
+        stack.pop();
+        color.insert(name.to_string(), 2);
+        if let Some(v) = by_name.get(name) {
+            order.push(*v);
+        }
+        Ok(())
+    }
+
+    let mut stack: Vec<String> = Vec::new();
+    // 元の decl 順で訪問することで、独立な decl の評価順を入力順に保つ。
+    for v in decls {
+        visit(&v.name, &by_name, &deps, &mut color, &mut stack, &mut order)?;
+    }
+    Ok(order)
 }
 
 fn value_eq(a: &Value, b: &Value) -> bool {

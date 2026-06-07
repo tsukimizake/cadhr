@@ -12,7 +12,8 @@ use crate::sema::env::TypeEnv;
 use crate::sema::subst::{Subst, UnifyError, unify};
 use crate::sema::ty::{Scheme, TyVar, TyVarGen, Type};
 use crate::syntax::ast::*;
-use std::collections::HashMap;
+use crate::syntax::free_vars::value_decl_free_names;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default)]
 pub struct Infer {
@@ -376,47 +377,211 @@ fn infer_module_into(
         env = env.extend(name, sc.clone());
     }
 
-    // 4. 各 value decl を推論
+    // 4. value decl の依存解析 → SCC → 葉から順に推論
+    // これにより signature が無い decl でも前方参照・相互再帰が動き、
+    // SCC 内では monotype 共有 → 終了後に generalize するので let-poly が効く。
+    let value_decls: Vec<&ValueDecl> = module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Value(v) => Some(v),
+            _ => None,
+        })
+        .collect();
+    let decl_names: HashSet<String> = value_decls.iter().map(|v| v.name.clone()).collect();
+
+    // 依存グラフ: name -> body が参照する同モジュール内 value decl 名
+    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    for v in &value_decls {
+        let used = value_decl_free_names(v);
+        let mut deps: Vec<String> = used.into_iter().filter(|n| decl_names.contains(n)).collect();
+        deps.sort(); // 決定的な順序
+        graph.insert(v.name.clone(), deps);
+    }
+
+    let sccs = tarjan_scc(&value_decls, &graph);
+
     let mut result: HashMap<String, Scheme> = HashMap::new();
-    for decl in &module.decls {
-        if let Decl::Value(v) = decl {
-            // signature があれば先に instantiate し、param 型を body 推論に流す。
-            let declared = infer.signatures.get(&v.name).cloned();
-            let expected = declared.as_ref().map(|sc| infer.instantiate(sc));
-            let (ty, subst) = match infer_value_decl(infer, &env, v, expected.as_ref(), &mut diag) {
-                Some(r) => r,
-                None => continue,
-            };
-            let final_ty = subst.apply(&ty);
-
-            // signature があれば unify する (param 型は既に流したので戻り型整合の確認も兼ねる)
-            let scheme = if let Some(declared) = declared {
-                let inst = expected.unwrap();
-                match unify(&final_ty, &inst) {
-                    Ok(s) => {
-                        let unified_ty = s.apply(&final_ty);
-                        // declared scheme に合わせる (vars は declared 由来)
-                        Scheme {
-                            vars: declared.vars.clone(),
-                            ty: unified_ty,
-                        }
-                    }
-                    Err(e) => {
-                        diag.push(unify_diag(e, v.span, &v.name));
-                        Scheme::mono(final_ty)
-                    }
-                }
-            } else {
-                infer.generalize(&env, &final_ty)
-            };
-
-            env = env.extend(&v.name, scheme.clone());
-            result.insert(v.name.clone(), scheme);
-        }
+    for scc in sccs {
+        infer_value_scc(infer, &mut env, &scc, &graph, &mut diag, &mut result);
     }
 
     *env_in = env;
     (result, diag)
+}
+
+/// 1 つの SCC を一括で推論する。SCC 内は相互参照可能なので、各メンバを fresh
+/// monotype var (sig 無し) または instantiate された sig 型 (sig 有り) で
+/// 一時 env に bind し、全 body を推論してから unify で整合させる。
+/// 終了後に sig 無しメンバを (SCC 進入前の env に対して) generalize する。
+fn infer_value_scc(
+    infer: &mut Infer,
+    env: &mut TypeEnv,
+    scc: &[&ValueDecl],
+    graph: &HashMap<String, Vec<String>>,
+    diag: &mut Vec<Diagnostic>,
+    result: &mut HashMap<String, Scheme>,
+) {
+    // generalize 時の参照環境は SCC 進入前のもの (SCC メンバ自身を含まない)
+    let env_before = env.clone();
+
+    // 各メンバについて: sig 有なら expected = instantiate(sig)、sig 無なら fresh var。
+    // どちらも SCC 内の相互参照に使える monotype として local_env に入れる。
+    let mut local_env = env.clone();
+    let mut member_expected: HashMap<String, Type> = HashMap::new();
+    for m in scc {
+        let expected = if let Some(sc) = infer.signatures.get(&m.name).cloned() {
+            let inst = infer.instantiate(&sc);
+            // sig 有りは scheme として bind 済みなので、SCC 内では再 instantiate
+            // した monotype を別途持っておけば十分 (env 側は polymorphic のまま)。
+            inst
+        } else {
+            let fresh = infer.fresh();
+            local_env = local_env.extend(&m.name, Scheme::mono(fresh.clone()));
+            fresh
+        };
+        member_expected.insert(m.name.clone(), expected);
+    }
+
+    // 各 body を推論し、累積 subst を作る。
+    let mut subst = Subst::empty();
+    for m in scc {
+        let expected = subst.apply(member_expected.get(&m.name).unwrap());
+        let expected_arg = if infer.signatures.contains_key(&m.name) {
+            Some(expected.clone())
+        } else {
+            None
+        };
+        // local_env に subst を反映 (sig 無しメンバの fresh var を更新)
+        let env_for_body = apply_subst_to_env(&local_env, &subst);
+        let (ty, s) = match infer_value_decl(
+            infer,
+            &env_for_body,
+            m,
+            expected_arg.as_ref(),
+            diag,
+        ) {
+            Some(r) => r,
+            None => continue,
+        };
+        let composed = subst.compose(&s);
+        let inferred = composed.apply(&ty);
+        let expected_now = composed.apply(&expected);
+        match unify(&inferred, &expected_now) {
+            Ok(s2) => {
+                subst = composed.compose(&s2);
+            }
+            Err(e) => {
+                diag.push(unify_diag(e, m.span, &m.name));
+                subst = composed;
+            }
+        }
+    }
+
+    // finalize: sig 有 → declared scheme、sig 無 → 解決済み型を env_before で generalize
+    for m in scc {
+        let resolved = subst.apply(member_expected.get(&m.name).unwrap());
+        let scheme = if let Some(declared) = infer.signatures.get(&m.name).cloned() {
+            Scheme {
+                vars: declared.vars.clone(),
+                ty: resolved,
+            }
+        } else {
+            infer.generalize(&env_before, &resolved)
+        };
+        *env = env.extend(&m.name, scheme.clone());
+        result.insert(m.name.clone(), scheme);
+    }
+
+    let _ = graph; // 将来 SCC 内自己再帰判定に使うかも
+}
+
+/// 環境内の各 scheme に置換を適用した新しい環境を返す。
+/// scheme の bound vars に subst が触ることは無い前提 (普通は monotype しか subst しない)。
+fn apply_subst_to_env(env: &TypeEnv, subst: &Subst) -> TypeEnv {
+    let mut new = TypeEnv::new();
+    for (name, sc) in env.iter() {
+        let new_sc = Scheme {
+            vars: sc.vars.clone(),
+            ty: subst.apply(&sc.ty),
+        };
+        new = new.extend(name, new_sc);
+    }
+    new
+}
+
+/// Tarjan's SCC algorithm。返値はSCCのリスト (各 SCC 内のメンバ順は不定)、
+/// **逆 topological 順** (依存グラフの葉から根の順) で返るので、そのまま
+/// for-each すれば依存先が先に処理される。
+fn tarjan_scc<'a>(
+    decls: &[&'a ValueDecl],
+    graph: &HashMap<String, Vec<String>>,
+) -> Vec<Vec<&'a ValueDecl>> {
+    let mut by_name: HashMap<String, &'a ValueDecl> = HashMap::new();
+    for v in decls {
+        by_name.insert(v.name.clone(), *v);
+    }
+    let mut st = TarjanState::default();
+    for v in decls {
+        if !st.index.contains_key(&v.name) {
+            tarjan_visit(&v.name, graph, &by_name, &mut st);
+        }
+    }
+    st.sccs
+}
+
+#[derive(Default)]
+struct TarjanState<'a> {
+    counter: usize,
+    index: HashMap<String, usize>,
+    lowlink: HashMap<String, usize>,
+    on_stack: HashSet<String>,
+    stack: Vec<String>,
+    sccs: Vec<Vec<&'a ValueDecl>>,
+}
+
+fn tarjan_visit<'a>(
+    v: &str,
+    graph: &HashMap<String, Vec<String>>,
+    by_name: &HashMap<String, &'a ValueDecl>,
+    st: &mut TarjanState<'a>,
+) {
+    let v_owned = v.to_string();
+    st.index.insert(v_owned.clone(), st.counter);
+    st.lowlink.insert(v_owned.clone(), st.counter);
+    st.counter += 1;
+    st.stack.push(v_owned.clone());
+    st.on_stack.insert(v_owned.clone());
+
+    if let Some(deps) = graph.get(v) {
+        for w in deps {
+            if !st.index.contains_key(w) {
+                tarjan_visit(w, graph, by_name, st);
+                let lw = st.lowlink[w];
+                let lv = st.lowlink[&v_owned];
+                st.lowlink.insert(v_owned.clone(), lv.min(lw));
+            } else if st.on_stack.contains(w) {
+                let iw = st.index[w];
+                let lv = st.lowlink[&v_owned];
+                st.lowlink.insert(v_owned.clone(), lv.min(iw));
+            }
+        }
+    }
+
+    if st.lowlink[&v_owned] == st.index[&v_owned] {
+        let mut scc: Vec<&'a ValueDecl> = Vec::new();
+        loop {
+            let w = st.stack.pop().expect("tarjan stack underflow");
+            st.on_stack.remove(&w);
+            if let Some(decl) = by_name.get(&w) {
+                scc.push(*decl);
+            }
+            if w == v_owned {
+                break;
+            }
+        }
+        st.sccs.push(scc);
+    }
 }
 
 /// 1 つのモジュール全体の型推論。後方互換 API (builtins だけ環境に入れて呼ぶ)。
