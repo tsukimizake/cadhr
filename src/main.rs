@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use cadhr_lang::{CompiledProgram, MainSignature, Span};
 use iced::widget::{
-    column, container, pane_grid, row, scrollable, slider, text, text_editor, toggler,
+    column, container, pane_grid, pick_list, row, scrollable, slider, text, text_editor, toggler,
 };
 use iced::{Element, Fill, Length, Subscription, Task};
 use interpreter::{CompileJobParams, CompileJobResult, EvalJobResult};
@@ -21,6 +21,25 @@ use ui::preview::{Preview, PreviewMsg};
 enum PaneKind {
     Editor,
     Preview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddKind {
+    Preview,
+    Collision,
+}
+
+impl AddKind {
+    const ALL: [AddKind; 2] = [AddKind::Preview, AddKind::Collision];
+}
+
+impl std::fmt::Display for AddKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddKind::Preview => write!(f, "Preview"),
+            AddKind::Collision => write!(f, "Collision Check"),
+        }
+    }
 }
 
 const DEFAULT_EDITOR_TEXT: &str =
@@ -546,8 +565,11 @@ fn view(model: &Model) -> Element<'_, Msg> {
         parts::dark_button("Open").on_press(Msg::OpenSession),
         parts::dark_button("Save").on_press(Msg::SaveSession),
         parts::dark_button("Save As").on_press(Msg::SaveSessionAs),
-        parts::dark_button("+Preview").on_press(Msg::AddPreview),
-        parts::dark_button("+Collision").on_press(Msg::AddCollisionCheck),
+        pick_list(&AddKind::ALL[..], None::<AddKind>, |kind| match kind {
+            AddKind::Preview => Msg::AddPreview,
+            AddKind::Collision => Msg::AddCollisionCheck,
+        })
+        .placeholder("+ Add Workspace"),
         parts::dark_button("Update").on_press(Msg::UpdatePreviews),
         parts::dark_button(if model.panes.maximized().is_some() {
             "Show Editor"
@@ -611,8 +633,8 @@ fn view(model: &Model) -> Element<'_, Msg> {
                         col.into()
                     };
 
-                let previews_view: Element<'_, Msg> = ui::preview::list_view(&model.previews)
-                    .map(|(id, pm)| Msg::Preview(id, pm));
+                let previews_view: Element<'_, Msg> =
+                    ui::preview::list_view(&model.previews).map(|(id, pm)| Msg::Preview(id, pm));
 
                 pane_grid::Content::new(column![sliders_view, previews_view].spacing(4))
             }
