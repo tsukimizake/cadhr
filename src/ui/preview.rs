@@ -12,6 +12,7 @@ use iced::{Element, Fill, Length};
 
 use crate::interpreter::{EvalJobParams, EvalJobResult};
 use crate::preview::Scene;
+use crate::preview::pipeline::Vertex;
 use crate::session::SessionPreview;
 use crate::ui::parts;
 
@@ -30,6 +31,9 @@ pub struct Preview {
     pub control_overrides: HashMap<String, [f64; 3]>,
     /// 選択中の control point index (UI 用)。
     pub selected_cp: Option<usize>,
+    /// 直近の eval で得た mesh。3MF export 用 (Scene の mesh は control point の sphere が混入する)。
+    pub last_vertices: Vec<Vertex>,
+    pub last_indices: Vec<u32>,
 }
 
 impl Preview {
@@ -46,6 +50,8 @@ impl Preview {
             control_points: Vec::new(),
             control_overrides: HashMap::new(),
             selected_cp: None,
+            last_vertices: Vec::new(),
+            last_indices: Vec::new(),
         }
     }
 
@@ -91,6 +97,8 @@ impl Preview {
                 control_points,
             } => {
                 self.control_points = control_points;
+                self.last_vertices = vertices.clone();
+                self.last_indices = indices.clone();
                 self.scene.set_mesh_with_control_points(
                     vertices,
                     indices,
@@ -131,6 +139,7 @@ pub enum PreviewMsg {
     MoveDown,
     SelectControlPoint(usize),
     ControlPointEdited(String, usize, String),
+    Export3MF,
 }
 
 pub fn view<'a>(p: &'a Preview, index: usize, total: usize) -> Element<'a, PreviewMsg> {
@@ -139,7 +148,7 @@ pub fn view<'a>(p: &'a Preview, index: usize, total: usize) -> Element<'a, Previ
     } else {
         format!("#{} ({}/{})", p.id, index + 1, total)
     };
-    let header = row![
+    let mut header = row![
         parts::dark_button("↑").on_press(PreviewMsg::MoveUp),
         parts::dark_button("↓").on_press(PreviewMsg::MoveDown),
         parts::dark_button(if p.minimized { "▶" } else { "▼" }).on_press(PreviewMsg::Minimize),
@@ -150,9 +159,13 @@ pub fn view<'a>(p: &'a Preview, index: usize, total: usize) -> Element<'a, Previ
             "origin"
         })
         .on_press(PreviewMsg::ToggleViewCenter),
-        parts::dark_button("×").on_press(PreviewMsg::Close),
     ]
     .spacing(2);
+    // collision preview は表示専用なので 3MF export は出さない
+    if !p.is_collision && !p.last_vertices.is_empty() {
+        header = header.push(parts::dark_button("Export 3MF").on_press(PreviewMsg::Export3MF));
+    }
+    let header = header.push(parts::dark_button("×").on_press(PreviewMsg::Close));
 
     if p.minimized {
         return container(header).padding(4).into();

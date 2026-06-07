@@ -52,6 +52,7 @@ trait DialogHandler {
         editor_text: String,
         previews: Vec<session::SessionPreview>,
     ) -> Task<Msg>;
+    fn export_3mf(&self, suggested_name: String, data: Vec<u8>) -> Task<Msg>;
 }
 
 struct RfdDialogs;
@@ -89,6 +90,25 @@ impl DialogHandler for RfdDialogs {
                 }
             },
             Msg::SessionSaved,
+        )
+    }
+
+    fn export_3mf(&self, suggested_name: String, data: Vec<u8>) -> Task<Msg> {
+        Task::perform(
+            async move {
+                let handle = rfd::AsyncFileDialog::new()
+                    .set_title("Export 3MF")
+                    .add_filter("3MF", &["3mf"])
+                    .set_file_name(&suggested_name)
+                    .save_file()
+                    .await;
+                match handle {
+                    Some(h) => std::fs::write(h.path(), data)
+                        .map_err(|e| format!("Failed to write 3MF: {e}")),
+                    None => Ok(()),
+                }
+            },
+            Msg::ExportFinished,
         )
     }
 }
@@ -143,6 +163,8 @@ enum Msg {
 
     PaneResized(pane_grid::ResizeEvent),
     ToggleEditor,
+
+    ExportFinished(Result<(), String>),
 }
 
 fn init() -> (Model, Task<Msg>) {
@@ -163,7 +185,7 @@ fn init() -> (Model, Task<Msg>) {
         error_span: None,
         diagnostics: Vec::new(),
         current_file_path: None,
-        auto_reload: false,
+        auto_reload: true,
         last_modified: None,
         unsaved: false,
         dialogs: Box::new(RfdDialogs),
@@ -186,6 +208,16 @@ fn init() -> (Model, Task<Msg>) {
     }
     let task = spawn_compile_job(&model);
     (model, task)
+}
+
+fn base_name(model: &Model) -> String {
+    model
+        .current_file_path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("untitled")
+        .to_string()
 }
 
 fn search_paths(model: &Model) -> Vec<PathBuf> {
@@ -388,6 +420,18 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                 }
                 Task::none()
             }
+            PreviewMsg::Export3MF => {
+                let Some(p) = model.previews.iter().find(|p| p.id == pid) else {
+                    return Task::none();
+                };
+                let Some(data) = export::vertices_to_threemf(&p.last_vertices, &p.last_indices)
+                else {
+                    model.error_message = "Nothing to export".to_string();
+                    return Task::none();
+                };
+                let suggested = format!("{}_{pid}.3mf", base_name(model));
+                model.dialogs.export_3mf(suggested, data)
+            }
         },
 
         Msg::AddPreview => {
@@ -502,6 +546,12 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
         }
         Msg::PaneResized(event) => {
             model.panes.resize(event.split, event.ratio);
+            Task::none()
+        }
+        Msg::ExportFinished(result) => {
+            if let Err(e) = result {
+                model.error_message = e;
+            }
             Task::none()
         }
         Msg::ToggleEditor => {

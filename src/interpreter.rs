@@ -121,6 +121,7 @@ pub fn run_eval_job(params: EvalJobParams) -> EvalJobResult {
     log_eval_request("eval", &params);
     let mut inputs = Inputs::default();
     inputs.control_overrides = params.control_overrides.clone();
+    inputs.search_paths = params.search_paths.clone();
     for p in &params.program.main_signature.params {
         let v = params.slider_values.get(&p.name).copied();
         inputs
@@ -160,6 +161,7 @@ pub fn run_collision_job(params: EvalJobParams) -> EvalJobResult {
 
     log_eval_request("collision", &params);
     let mut inputs = Inputs::default();
+    inputs.search_paths = params.search_paths.clone();
     for p in &params.program.main_signature.params {
         let v = params.slider_values.get(&p.name).copied();
         inputs

@@ -209,6 +209,14 @@ pub fn registry() -> BuiltinRegistry {
         "Shape2D を XZ 平面上で Y 方向に Float だけ押し出す (`s |> extrude_xz h`)",
     ));
 
+    // -- Transform 2D
+    let r = r.add(mono(
+        "translate2d",
+        vec![point2d(), point2d(), shape2d()],
+        shape2d(),
+        "Shape2D の点 src を点 dst に運ぶ (`s |> translate2d src dst`)",
+    ));
+
     // -- 2D CSG
     let r = r.add(mono(
         "union2d",
@@ -266,18 +274,20 @@ pub fn registry() -> BuiltinRegistry {
         "XY 平面上の Shape2D を Point3D 列 path に沿って sweep",
     ));
 
-    // center3d / center2d: BBox 中心を指定点に持ってくる
+    // center3d / center2d: Shape の AABB 中心 (Point) を返す。
+    // 移動したいときは translate3d / translate2d と組み合わせる:
+    //   `s |> translate3d (center3d s) p`
     let r = r.add(mono(
         "center3d",
-        vec![point3d(), shape3d()],
-        shape3d(),
-        "Shape3D の AABB 中心を Point3D に合わせて translate (`s |> center3d p`)",
+        vec![shape3d()],
+        point3d(),
+        "Shape3D の AABB 中心 Point3D を返す",
     ));
     let r = r.add(mono(
         "center2d",
-        vec![point2d(), shape2d()],
-        shape2d(),
-        "Shape2D の AABB 中心を Point2D に合わせて translate (`s |> center2d p`)",
+        vec![shape2d()],
+        point2d(),
+        "Shape2D の AABB 中心 Point2D を返す",
     ));
 
     // control point: GUI ドラッグ用。戻り値はそのまま Point に解決 (override 無し時)。

@@ -85,10 +85,12 @@ pub struct MainParam {
 
 /// `run_main()` への入力。`main` 引数の名前 → 値 を渡す。
 /// `control_overrides` は GUI ドラッグで上書きされた control point の現在値。
+/// `search_paths` は `center3d` などが内部で manifold 評価する際の STL 検索パス。
 #[derive(Clone, Debug, Default)]
 pub struct Inputs {
     pub values: HashMap<String, Value>,
     pub control_overrides: HashMap<String, [f64; 3]>,
+    pub search_paths: Vec<std::path::PathBuf>,
 }
 
 /// `run_main()` の出力。`main` の戻り値が record なら各 field を取り出す。
@@ -171,6 +173,8 @@ fn build_main_signature(module: &syntax::ast::Module, sliders: &[SliderDecl]) ->
 pub fn run_main(prog: &CompiledProgram, inputs: &Inputs) -> Result<MainOutput, Diagnostic> {
     // GUI からの control point override を thread-local にセット (eval 中 builtin が見る)。
     runtime::builtin::set_control_overrides(inputs.control_overrides.clone());
+    // center3d などが Manifold 評価する際に STL 検索パスを引けるようセット。
+    runtime::builtin::set_include_paths(inputs.search_paths.clone());
 
     let reg = runtime::builtin::registry();
     let mut ev = runtime::eval::Evaluator::new(&reg);

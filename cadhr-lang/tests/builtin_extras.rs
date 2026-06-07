@@ -72,7 +72,11 @@ fn bezier_quad_returns_points() {
 
 #[test]
 fn center3d_moves_bbox_to_origin() {
-    let src = "main = cube 10.0 10.0 10.0 |> translate3d (p3 0.0 0.0 0.0) (p3 50.0 0.0 0.0) |> center3d (p3 0.0 0.0 0.0)";
+    // center3d は Point3D を返すので translate3d と組み合わせて中心移動を表現する。
+    let src = "main =
+    let c = cube 10.0 10.0 10.0 |> translate3d (p3 0.0 0.0 0.0) (p3 50.0 0.0 0.0) in
+    c |> translate3d (center3d c) (p3 0.0 0.0 0.0)
+";
     let out = compile_run(src);
     let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
     let mut min_x = f32::INFINITY;
@@ -85,6 +89,34 @@ fn center3d_moves_bbox_to_origin() {
     assert!(
         min_x < -4.5 && max_x > 4.5,
         "centered bbox: {min_x}..{max_x}"
+    );
+}
+
+#[test]
+fn center2d_with_translate2d_centers_polygon() {
+    // 10x10 の正方形を (50,50) 平行移動した後、center2d + translate2d で原点に戻す。
+    // 結果を XY で extrude して bbox を見ると -5..5 になるはず。
+    let src = "main =
+    let sq = polygon [p2 0.0 0.0, p2 10.0 0.0, p2 10.0 10.0, p2 0.0 10.0]
+        |> translate2d (p2 0.0 0.0) (p2 50.0 50.0)
+    in
+    sq |> translate2d (center2d sq) (p2 0.0 0.0) |> extrude_xy 1.0
+";
+    let out = compile_run(src);
+    let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for p in &mesh.positions {
+        min_x = min_x.min(p[0]);
+        max_x = max_x.max(p[0]);
+        min_y = min_y.min(p[1]);
+        max_y = max_y.max(p[1]);
+    }
+    assert!(
+        min_x < -4.5 && max_x > 4.5 && min_y < -4.5 && max_y > 4.5,
+        "centered bbox: x={min_x}..{max_x}, y={min_y}..{max_y}"
     );
 }
 

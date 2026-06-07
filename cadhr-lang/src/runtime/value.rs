@@ -206,11 +206,6 @@ pub enum Model3D {
         plane: Plane3D,
         path: Vec<(f64, f64, f64)>,
     },
-    /// BBox 中心を `target` に持ってくる。bridge 内で AABB を計測してから translate する。
-    Center3D {
-        shape: Box<Model3D>,
-        target: (f64, f64, f64),
-    },
     Empty,
 }
 
@@ -223,10 +218,11 @@ pub enum Model2D {
     Union2D(Box<Model2D>, Box<Model2D>),
     Diff2D(Box<Model2D>, Box<Model2D>),
     Intersect2D(Box<Model2D>, Box<Model2D>),
-    /// BBox 中心移動。`target` (cx, cy) に bbox 中心を持ってくる。
-    Center2D {
+    /// 2D 平行移動。`shape` の点 `src` を `dst` に運ぶ。
+    Translate2D {
         shape: Box<Model2D>,
-        target: (f64, f64),
+        src: (f64, f64),
+        dst: (f64, f64),
     },
     Empty2D,
 }

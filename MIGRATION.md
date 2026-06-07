@@ -34,7 +34,6 @@
 - **`revolve`**: 2D profile を回転軸まわりに回して 3D 化
 - **`complex_extrude`**: ねじり (twist) + 縮尺 (scaleXY) 付き extrude
 - **`sweep_extrude`**: 任意 path に沿った押し出し
-- **`center2d` / `center3d`**: BBox 中心を変数に束縛するヘルパ
 - **`control2d` / `control3d`**: GUI ドラッグ用 control point (Phase 4 のスライダーは
   値だが点ではない)
 - **`stl`**: STL ファイル読み込み (signature だけ登録、評価は未実装)

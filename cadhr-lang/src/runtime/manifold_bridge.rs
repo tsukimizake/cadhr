@@ -98,38 +98,54 @@ pub fn evaluate_with_paths(
             plane,
             path,
         } => sweep_polygon(profile, *plane, path),
-        Model3D::Center3D { shape, target } => {
-            let m = evaluate_with_paths(shape, include_paths)?;
-            let mesh = m.to_mesh();
-            let verts = mesh.vertices();
-            let stride = mesh.num_props() as usize;
-            if stride == 0 || verts.is_empty() {
-                return Ok(m);
-            }
-            let mut lo = [f64::INFINITY; 3];
-            let mut hi = [f64::NEG_INFINITY; 3];
-            for chunk in verts.chunks(stride) {
-                for i in 0..3 {
-                    let v = chunk[i] as f64;
-                    if v < lo[i] {
-                        lo[i] = v;
-                    }
-                    if v > hi[i] {
-                        hi[i] = v;
-                    }
-                }
-            }
-            let cx = (lo[0] + hi[0]) / 2.0;
-            let cy = (lo[1] + hi[1]) / 2.0;
-            let cz = (lo[2] + hi[2]) / 2.0;
-            Ok(m.translate(target.0 - cx, target.1 - cy, target.2 - cz))
-        }
     }
 }
 
 /// `include_paths = &[]` で呼ぶラッパ。STL を使わない場合はこれで十分。
 pub fn evaluate(model: &Model3D) -> Result<Manifold, BridgeError> {
     evaluate_with_paths(model, &[])
+}
+
+/// Shape3D の AABB 中心を計算。`center3d` builtin の本体。
+pub fn bbox_center_3d(
+    model: &Model3D,
+    include_paths: &[PathBuf],
+) -> Result<(f64, f64, f64), BridgeError> {
+    let m = evaluate_with_paths(model, include_paths)?;
+    let mesh = m.to_mesh();
+    let verts = mesh.vertices();
+    let stride = mesh.num_props() as usize;
+    if stride == 0 || verts.is_empty() {
+        return Err(BridgeError::InvalidShape(
+            "bbox_center_3d: 空の Shape3D".to_string(),
+        ));
+    }
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for chunk in verts.chunks(stride) {
+        for i in 0..3 {
+            let v = chunk[i] as f64;
+            if v < lo[i] {
+                lo[i] = v;
+            }
+            if v > hi[i] {
+                hi[i] = v;
+            }
+        }
+    }
+    Ok((
+        (lo[0] + hi[0]) / 2.0,
+        (lo[1] + hi[1]) / 2.0,
+        (lo[2] + hi[2]) / 2.0,
+    ))
+}
+
+/// Shape2D の AABB 中心を計算。`center2d` builtin の本体。
+pub fn bbox_center_2d(model: &Model2D) -> Result<(f64, f64), BridgeError> {
+    let rings = to_polygon_rings(model)
+        .ok_or_else(|| BridgeError::InvalidShape("bbox_center_2d: 空の Shape2D".to_string()))?;
+    bbox_2d(&rings)
+        .ok_or_else(|| BridgeError::InvalidShape("bbox_center_2d: bbox が計算できない".to_string()))
 }
 
 /// `Model2D` を平坦な polygon ring 列に変換する。CSG ノードは extrude → 3D boolean →
@@ -161,11 +177,10 @@ fn to_polygon_rings(profile: &Model2D) -> Option<Vec<Vec<f64>>> {
             (Some(ra), Some(rb)) => Some(boolean_2d(&ra, &rb, |x, y| x.intersection(y))),
             _ => None,
         },
-        Model2D::Center2D { shape, target } => {
+        Model2D::Translate2D { shape, src, dst } => {
             let rings = to_polygon_rings(shape)?;
-            let (cx, cy) = bbox_2d(&rings)?;
-            let dx = target.0 - cx;
-            let dy = target.1 - cy;
+            let dx = dst.0 - src.0;
+            let dy = dst.1 - src.1;
             let shifted: Vec<Vec<f64>> = rings
                 .into_iter()
                 .map(|ring| {

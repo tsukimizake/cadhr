@@ -7,6 +7,7 @@
 use crate::runtime::value::{Model2D, Model3D, Plane3D, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 thread_local! {
     /// GUI が control point をドラッグした場合の override マップ。`run_main` 直前に
@@ -16,6 +17,9 @@ thread_local! {
     /// eval 中に呼ばれた control point の (name, current_value) を記録する。
     /// `run_main` が完了したあと `take_recorded_controls` で取り出す。
     pub static RECORDED_CONTROLS: RefCell<Vec<(String, [f64; 3])>> = RefCell::new(Vec::new());
+    /// `center3d` などの builtin が内部で manifold 評価する際に使う STL 検索パス。
+    /// `run_main` 直前に `set_include_paths` で更新する。
+    pub static INCLUDE_PATHS: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
 }
 
 /// `run_main` が eval 前に呼んで thread-local の override map を更新する。
@@ -29,6 +33,11 @@ pub fn set_control_overrides(overrides: HashMap<String, [f64; 3]>) {
 /// `run_main` が eval 後に呼んで recorded control points を取り出す。
 pub fn take_recorded_controls() -> Vec<(String, [f64; 3])> {
     RECORDED_CONTROLS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+/// `run_main` 直前に呼んで STL 検索パスを更新する。
+pub fn set_include_paths(paths: Vec<PathBuf>) {
+    INCLUDE_PATHS.with(|p| *p.borrow_mut() = paths);
 }
 
 fn as_string(v: &Value) -> Result<String, String> {
@@ -385,19 +394,28 @@ pub fn registry() -> BuiltinEvalRegistry {
                 path,
             }))
         })
-        // -- center3d / center2d
-        .add("center3d", 2, |args| {
-            let t = as_point3d(&args[0])?;
-            Ok(Value::Shape3D(Model3D::Center3D {
-                shape: Box::new(as_shape3d(&args[1])?),
-                target: t,
-            }))
+        // -- center3d / center2d: Shape の AABB 中心 Point を返す。
+        //    Manifold を実評価するため STL 検索パスが必要 (`INCLUDE_PATHS`)。
+        .add("center3d", 1, |args| {
+            let model = as_shape3d(&args[0])?;
+            let paths = INCLUDE_PATHS.with(|p| p.borrow().clone());
+            let (cx, cy, cz) =
+                crate::runtime::manifold_bridge::bbox_center_3d(&model, &paths)
+                    .map_err(|e| format!("center3d: {e}"))?;
+            Ok(point3d_value(cx, cy, cz))
         })
-        .add("center2d", 2, |args| {
-            let t = as_point2d(&args[0])?;
-            Ok(Value::Shape2D(Model2D::Center2D {
-                shape: Box::new(as_shape2d(&args[1])?),
-                target: t,
+        .add("center2d", 1, |args| {
+            let model = as_shape2d(&args[0])?;
+            let (cx, cy) = crate::runtime::manifold_bridge::bbox_center_2d(&model)
+                .map_err(|e| format!("center2d: {e}"))?;
+            Ok(point2d_value(cx, cy))
+        })
+        // -- 2D translate: src 点を dst 点に運ぶ。
+        .add("translate2d", 3, |args| {
+            Ok(Value::Shape2D(Model2D::Translate2D {
+                src: as_point2d(&args[0])?,
+                dst: as_point2d(&args[1])?,
+                shape: Box::new(as_shape2d(&args[2])?),
             }))
         })
         // -- control points: 第 1 引数を name (String) として保持しつつ第 2 引数の Point
