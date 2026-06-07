@@ -9,11 +9,19 @@ mod ui;
 use std::path::PathBuf;
 
 use cadhr_lang::{CompiledProgram, MainSignature, Span};
-use iced::widget::{column, container, row, scrollable, slider, text, text_editor, toggler};
+use iced::widget::{
+    column, container, pane_grid, row, scrollable, slider, text, text_editor, toggler,
+};
 use iced::{Element, Fill, Length, Subscription, Task};
 use interpreter::{CompileJobParams, CompileJobResult, EvalJobResult};
 use ui::parts;
 use ui::preview::{Preview, PreviewMsg};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneKind {
+    Editor,
+    Preview,
+}
 
 const DEFAULT_EDITOR_TEXT: &str =
     "main length =\n    cube 10.0 10.0 length\n\nslider length = 6.0 .. 80.0\n";
@@ -88,6 +96,7 @@ struct Model {
     last_modified: Option<std::time::SystemTime>,
     unsaved: bool,
     dialogs: Box<dyn DialogHandler>,
+    panes: pane_grid::State<PaneKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,9 +121,19 @@ enum Msg {
 
     ToggleAutoReload,
     CheckFileChanged,
+
+    PaneResized(pane_grid::ResizeEvent),
+    ToggleEditor,
 }
 
 fn init() -> (Model, Task<Msg>) {
+    let (mut panes, editor_pane) = pane_grid::State::new(PaneKind::Editor);
+    let (_, split) = panes
+        .split(pane_grid::Axis::Vertical, editor_pane, PaneKind::Preview)
+        .expect("failed to create initial pane split");
+    // 既存の FillPortion(3) : FillPortion(2) と同じ 0.6 比率
+    panes.resize(split, 0.6);
+
     let mut model = Model {
         editor: text_editor::Content::with_text(DEFAULT_EDITOR_TEXT),
         previews: vec![Preview::new(0)],
@@ -129,6 +148,7 @@ fn init() -> (Model, Task<Msg>) {
         last_modified: None,
         unsaved: false,
         dialogs: Box::new(RfdDialogs),
+        panes,
     };
 
     if let Some(path) = session::restore_last_session_path() {
@@ -461,6 +481,26 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             }
             Task::none()
         }
+        Msg::PaneResized(event) => {
+            model.panes.resize(event.split, event.ratio);
+            Task::none()
+        }
+        Msg::ToggleEditor => {
+            if model.panes.maximized().is_some() {
+                model.panes.restore();
+            } else {
+                // エディタを隠したいので Preview ペインを最大化する
+                let preview_pane = model
+                    .panes
+                    .iter()
+                    .find(|(_, k)| **k == PaneKind::Preview)
+                    .map(|(p, _)| *p);
+                if let Some(p) = preview_pane {
+                    model.panes.maximize(p);
+                }
+            }
+            Task::none()
+        }
         Msg::CheckFileChanged => {
             if !model.auto_reload {
                 return Task::none();
@@ -509,6 +549,12 @@ fn view(model: &Model) -> Element<'_, Msg> {
         parts::dark_button("+Preview").on_press(Msg::AddPreview),
         parts::dark_button("+Collision").on_press(Msg::AddCollisionCheck),
         parts::dark_button("Update").on_press(Msg::UpdatePreviews),
+        parts::dark_button(if model.panes.maximized().is_some() {
+            "Show Editor"
+        } else {
+            "Hide Editor"
+        })
+        .on_press(Msg::ToggleEditor),
         toggler(model.auto_reload)
             .label("Auto Reload")
             .on_toggle(|_| Msg::ToggleAutoReload),
@@ -517,56 +563,63 @@ fn view(model: &Model) -> Element<'_, Msg> {
     .spacing(4)
     .padding(4);
 
-    let hl_settings = highlight::Settings {
-        error_span: model.error_span.map(|s| (s.start, s.end)),
-        has_error: !model.error_message.is_empty(),
-    };
-    let editor = text_editor(&model.editor)
-        .on_action(Msg::EditorAction)
-        .key_binding(parts::emacs_key_binding)
-        .highlight_with::<highlight::SpanHighlighter>(hl_settings, highlight::format)
-        .height(Fill);
-
-    // 最初の preview のスライダーを「主スライダー」として main パネルに出す。
-    // 他の preview は同じ値を共有 (per-preview override は将来課題)。
-    let sliders_view: Element<'_, Msg> =
-        if model.signature.params.is_empty() || model.previews.is_empty() {
-            column![].into()
-        } else {
-            let main_pid = model.previews[0].id;
-            let mut col = column![text("Main sliders:").size(13)]
-                .spacing(4)
-                .padding(4);
-            for p in &model.signature.params {
-                let r = match &p.range {
-                    Some(r) => r,
-                    None => continue,
+    let panes_view = pane_grid::PaneGrid::new(&model.panes, |_pane, kind, _is_maximized| {
+        match kind {
+            PaneKind::Editor => {
+                let hl_settings = highlight::Settings {
+                    error_span: model.error_span.map(|s| (s.start, s.end)),
+                    has_error: !model.error_message.is_empty(),
                 };
-                let cur = model.previews[0]
-                    .slider_values
-                    .get(&p.name)
-                    .copied()
-                    .unwrap_or((r.lo + r.hi) / 2.0) as f32;
-                let lo = r.lo as f32;
-                let hi = r.hi as f32;
-                let name = p.name.clone();
-                let label = text(format!("{}: {:.2}", p.name, cur));
-                let widget = slider(lo..=hi, cur, move |v| {
-                    Msg::SliderChanged(main_pid, name.clone(), v)
-                });
-                col = col.push(row![label, widget].spacing(8));
+                let editor = text_editor(&model.editor)
+                    .on_action(Msg::EditorAction)
+                    .key_binding(parts::emacs_key_binding)
+                    .highlight_with::<highlight::SpanHighlighter>(hl_settings, highlight::format)
+                    .height(Fill);
+                pane_grid::Content::new(editor)
             }
-            col.into()
-        };
+            PaneKind::Preview => {
+                // 最初の preview のスライダーを「主スライダー」として main パネルに出す。
+                // 他の preview は同じ値を共有 (per-preview override は将来課題)。
+                let sliders_view: Element<'_, Msg> =
+                    if model.signature.params.is_empty() || model.previews.is_empty() {
+                        column![].into()
+                    } else {
+                        let main_pid = model.previews[0].id;
+                        let mut col = column![text("Main sliders:").size(13)]
+                            .spacing(4)
+                            .padding(4);
+                        for p in &model.signature.params {
+                            let r = match &p.range {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            let cur = model.previews[0]
+                                .slider_values
+                                .get(&p.name)
+                                .copied()
+                                .unwrap_or((r.lo + r.hi) / 2.0)
+                                as f32;
+                            let lo = r.lo as f32;
+                            let hi = r.hi as f32;
+                            let name = p.name.clone();
+                            let label = text(format!("{}: {:.2}", p.name, cur));
+                            let widget = slider(lo..=hi, cur, move |v| {
+                                Msg::SliderChanged(main_pid, name.clone(), v)
+                            });
+                            col = col.push(row![label, widget].spacing(8));
+                        }
+                        col.into()
+                    };
 
-    let previews_view: Element<'_, Msg> =
-        ui::preview::list_view(&model.previews).map(|(id, pm)| Msg::Preview(id, pm));
+                let previews_view: Element<'_, Msg> = ui::preview::list_view(&model.previews)
+                    .map(|(id, pm)| Msg::Preview(id, pm));
 
-    let right_panel = column![sliders_view, previews_view]
-        .spacing(4)
-        .width(Length::FillPortion(2));
-
-    let left_panel = column![editor].width(Length::FillPortion(3));
+                pane_grid::Content::new(column![sliders_view, previews_view].spacing(4))
+            }
+        }
+    })
+    .spacing(4)
+    .on_resize(8, Msg::PaneResized);
 
     let error_bar: Element<'_, Msg> = if model.error_message.is_empty() {
         if model.diagnostics.is_empty() {
@@ -588,13 +641,9 @@ fn view(model: &Model) -> Element<'_, Msg> {
     };
 
     container(
-        column![
-            toolbar,
-            row![left_panel, right_panel].spacing(4).height(Fill),
-            error_bar,
-        ]
-        .spacing(4)
-        .padding(4),
+        column![toolbar, panes_view, error_bar]
+            .spacing(4)
+            .padding(4),
     )
     .into()
 }
