@@ -62,6 +62,7 @@ pub fn registry() -> BuiltinRegistry {
             name,
             scheme: Scheme {
                 vars,
+                constraints: Vec::new(),
                 ty: Type::arrows(args, ret),
             },
             doc,

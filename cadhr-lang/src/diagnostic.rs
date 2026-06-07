@@ -172,6 +172,20 @@ pub enum Diagnostic {
         left_fields: Vec<String>,
         right_fields: Vec<String>,
     },
+    /// 型クラスのインスタンスが存在しない (例: `Num String`)。
+    NoInstance {
+        span: Span,
+        context: String,
+        class_name: String,
+        ty: String,
+    },
+    /// 型クラス制約が残ったまま型変数を default で解決できなかった。
+    /// (現状はあらゆる class に default を持たせているので発生は稀。)
+    AmbiguousConstraint {
+        span: Span,
+        context: String,
+        class_name: String,
+    },
 
     // ---- slider ----
     SliderNotRange {
@@ -232,6 +246,8 @@ impl Diagnostic {
             | TypeMismatch { span, .. }
             | InfiniteType { span, .. }
             | RecordFieldMismatch { span, .. }
+            | NoInstance { span, .. }
+            | AmbiguousConstraint { span, .. }
             | SliderNotRange { span, .. }
             | SliderNotConst { span, .. }
             | NonExhaustiveAllGuarded { span }
@@ -318,6 +334,21 @@ impl Diagnostic {
                 ..
             } => format!(
                 "{context}: レコードのフィールドが一致しません ({left_fields:?} vs {right_fields:?})"
+            ),
+            NoInstance {
+                context,
+                class_name,
+                ty,
+                ..
+            } => format!(
+                "{context}: 型 `{ty}` は `{class_name}` のインスタンスではありません"
+            ),
+            AmbiguousConstraint {
+                context,
+                class_name,
+                ..
+            } => format!(
+                "{context}: 型クラス `{class_name}` 制約が解決できません (型を明示してください)"
             ),
             SliderNotRange { name, got, .. } => {
                 format!("slider `{name}`: 右辺が Range 型でない値 ({got}) になっています")

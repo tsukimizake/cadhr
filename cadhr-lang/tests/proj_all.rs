@@ -78,3 +78,7 @@ fn ive_reararck() {
 fn ive_rear_doghouse_mount() {
     try_project("ive_rear_doghouse_mount");
 }
+#[test]
+fn loki_home_key() {
+    try_project("loki_home_key");
+}

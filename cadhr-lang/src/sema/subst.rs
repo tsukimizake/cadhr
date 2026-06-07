@@ -6,6 +6,7 @@
 //! 単一化失敗は `UnifyError` として返す。span 付きの診断は呼び出し側 (infer.rs)
 //! が `Diagnostic` に変換する。
 
+use crate::sema::class::Constraint;
 use crate::sema::ty::{TyVar, Type};
 use std::collections::HashMap;
 
@@ -29,6 +30,10 @@ impl Subst {
 
     pub fn insert(&mut self, v: TyVar, t: Type) {
         self.map.insert(v, t);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 
     /// 別の置換を合成する。`s2 ∘ self`: 先に self、次に s2 を適用するのと等価。
@@ -64,6 +69,14 @@ impl Subst {
                     .map(|(n, t)| (n.clone(), self.apply(t)))
                     .collect(),
             ),
+        }
+    }
+
+    /// 制約 (`Class ty`) に置換を適用する。
+    pub fn apply_constraint(&self, c: &Constraint) -> Constraint {
+        Constraint {
+            class_name: c.class_name.clone(),
+            ty: self.apply(&c.ty),
         }
     }
 }

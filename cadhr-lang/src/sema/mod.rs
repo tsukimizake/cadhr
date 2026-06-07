@@ -7,6 +7,7 @@
 //! - `infer`: Algorithm W ベースの型推論
 
 pub mod builtin;
+pub mod class;
 pub mod env;
 pub mod exhaustive;
 pub mod infer;

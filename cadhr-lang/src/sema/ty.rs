@@ -127,11 +127,14 @@ fn fmt_ty(t: &Type, f: &mut fmt::Formatter<'_>, prec: u8) -> fmt::Result {
     }
 }
 
-/// 多相型。`forall vars. ty` を表す。ユーザーシグネチャと let-poly の
-/// generalization で生成される。
+/// 多相型。`forall vars. constraints => ty` を表す。ユーザーシグネチャと
+/// let-poly の generalization で生成される。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scheme {
     pub vars: Vec<TyVar>,
+    /// `Num a => a -> a -> a` のような型クラス制約。
+    /// 各エントリは `(class_name, ty)` で、ty は通常 `Var(v)` (v ∈ vars)。
+    pub constraints: Vec<crate::sema::class::Constraint>,
     pub ty: Type,
 }
 
@@ -140,6 +143,19 @@ impl Scheme {
     pub fn mono(ty: Type) -> Self {
         Self {
             vars: Vec::new(),
+            constraints: Vec::new(),
+            ty,
+        }
+    }
+
+    pub fn with_constraints(
+        vars: Vec<TyVar>,
+        constraints: Vec<crate::sema::class::Constraint>,
+        ty: Type,
+    ) -> Self {
+        Self {
+            vars,
+            constraints,
             ty,
         }
     }
@@ -147,11 +163,20 @@ impl Scheme {
     /// 自由変数 (= 全称量化されていない型変数)。
     pub fn free_vars(&self) -> HashSet<TyVar> {
         let bound: HashSet<TyVar> = self.vars.iter().copied().collect();
-        self.ty
+        let mut acc: HashSet<TyVar> = self
+            .ty
             .free_vars()
             .into_iter()
             .filter(|v| !bound.contains(v))
-            .collect()
+            .collect();
+        for c in &self.constraints {
+            for v in c.ty.free_vars() {
+                if !bound.contains(&v) {
+                    acc.insert(v);
+                }
+            }
+        }
+        acc
     }
 }
 
@@ -163,6 +188,16 @@ impl fmt::Display for Scheme {
                 write!(f, " t{}", v.0)?;
             }
             f.write_str(". ")?;
+        }
+        if !self.constraints.is_empty() {
+            f.write_str("(")?;
+            for (i, c) in self.constraints.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{} {}", c.class_name, c.ty)?;
+            }
+            f.write_str(") => ")?;
         }
         write!(f, "{}", self.ty)
     }
@@ -209,6 +244,7 @@ mod tests {
         let b = g.fresh();
         let scheme = Scheme {
             vars: vec![a],
+            constraints: Vec::new(),
             ty: Type::arrow(Type::Var(a), Type::Var(b)),
         };
         let fv = scheme.free_vars();
