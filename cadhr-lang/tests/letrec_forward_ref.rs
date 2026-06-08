@@ -1,7 +1,7 @@
 //! トップレベルの前方参照と再帰。eager な `main` が後方定義の関数を参照でき、
 //! 再帰関数 `get` が評価できることを確認する。
 
-use cadhr_lang::{Diagnostic, Inputs, compile, run_main};
+use cadhr_lang::{Diagnostic, Inputs, compile, run_binding};
 
 #[test]
 fn main_forward_refs_recursive_function() {
@@ -22,7 +22,7 @@ fn main_forward_refs_recursive_function() {
         "診断は無いはず: {:?}",
         prog.diagnostics
     );
-    let out = run_main(&prog, &Inputs::default()).expect("run_main");
+    let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
     assert_eq!(out.models.len(), 1);
 }
 
@@ -54,7 +54,7 @@ fn main_forward_refs_eager_top_level_value() {
         "診断は無いはず: {:?}",
         prog.diagnostics
     );
-    let out = run_main(&prog, &Inputs::default()).expect("run_main");
+    let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
     // cube 1 個 + map で 3 個 = 4 個
     assert_eq!(out.models.len(), 4);
 }
@@ -66,7 +66,7 @@ fn main_forward_refs_eager_top_level_value() {
 fn eager_cycle_is_runtime_error() {
     let src = "a = b\nb = a\nmain = { models = [], bom = [], controls = [] }\n";
     let prog = compile(src).expect("compile");
-    let err: Result<_, Diagnostic> = run_main(&prog, &Inputs::default());
+    let err: Result<_, Diagnostic> = run_binding(&prog, "main", &Inputs::default());
     let err = err.expect_err("eager 循環は runtime エラーになるはず");
     assert!(
         err.message().contains("循環") || err.message().contains("cycle"),
@@ -89,7 +89,7 @@ fn signature_less_forward_reference_is_typecheckable() {
         "診断は無いはず: {:?}",
         prog.diagnostics
     );
-    let out = run_main(&prog, &Inputs::default()).expect("run_main");
+    let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
     assert_eq!(out.models.len(), 1);
 }
 
@@ -118,7 +118,7 @@ fn signature_less_mutual_recursion_is_typecheckable() {
         "診断は無いはず: {:?}",
         prog.diagnostics
     );
-    let out = run_main(&prog, &Inputs::default()).expect("run_main");
+    let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
     assert_eq!(out.models.len(), 1);
 }
 
@@ -140,6 +140,6 @@ fn signature_less_polymorphic_helper_is_generalized() {
         "診断は無いはず: {:?}",
         prog.diagnostics
     );
-    let out = run_main(&prog, &Inputs::default()).expect("run_main");
+    let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
     assert_eq!(out.models.len(), 1);
 }

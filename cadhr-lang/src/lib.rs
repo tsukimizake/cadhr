@@ -2,12 +2,17 @@
 //!
 //! GUI から使う高レベル API は本 module 直下に置く:
 //!   - [`compile`] / [`CompiledProgram`]
-//!   - [`run_main`] / [`MainOutput`] / [`Inputs`]
-//!   - [`SliderDecl`] (`main` 引数に紐付く GUI スライダー仕様)
+//!   - [`run_binding`] / [`MainOutput`] / [`Inputs`]
+//!   - [`BindingSignature`] / [`BindingParam`] (任意 top-level binding に対する GUI 用引数情報)
+//!   - [`SliderDecl`] (引数に紐付く GUI スライダー仕様)
 //!   - [`Diagnostic`] / [`Span`]
 //!
 //! `manifold` feature を有効にした場合は `runtime::manifold_bridge` 経由で
 //! `Model3D` を実際の 3D メッシュにできる。
+//!
+//! `main` を特別扱いしない: `run_binding(prog, "main", inputs)` が旧 `run_main` の役割
+//! を果たし、それ以外の top-level binding (Shape3D / List Shape3D / `{ models, .. }` を
+//! 返すもの) も同じ API で評価できる。
 
 pub mod diagnostic;
 pub mod module;
@@ -19,7 +24,9 @@ pub use diagnostic::{Diagnostic, RelatedInfo, Severity, Span};
 pub use module::{LoadedModule, ResolvedUnit, Resolver};
 pub use runtime::value::{Model3D, Value};
 pub use sema::slider::{ElemTy, SliderDecl};
+pub use sema::ty::Scheme;
 
+use sema::ty::Type;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -27,12 +34,15 @@ use std::path::PathBuf;
 /// GUI 用、`diagnostics` は型推論や網羅性検査などの warning。
 ///
 /// `Clone` を実装しているので、GUI 側はコンパイル結果を Model に保持して
-/// slider 操作のたびに `run_main` だけ呼び直すパターンが取れる。
+/// slider 操作のたびに `run_binding` だけ呼び直すパターンが取れる。
+///
+/// `schemes` は型推論結果 (qname → 局所名 → Scheme)。GUI が任意の binding
+/// 名に対する引数情報を引くために使う。
 pub struct CompiledProgram {
     pub unit: ResolvedUnit,
     pub sliders: Vec<SliderDecl>,
     pub diagnostics: Vec<Diagnostic>,
-    pub main_signature: MainSignature,
+    pub schemes: HashMap<String, HashMap<String, Scheme>>,
 }
 
 impl Clone for CompiledProgram {
@@ -53,7 +63,7 @@ impl Clone for CompiledProgram {
             },
             sliders: self.sliders.clone(),
             diagnostics: self.diagnostics.clone(),
-            main_signature: self.main_signature.clone(),
+            schemes: self.schemes.clone(),
         }
     }
 }
@@ -64,26 +74,25 @@ impl std::fmt::Debug for CompiledProgram {
             .field("modules", &self.unit.modules.len())
             .field("sliders", &self.sliders.len())
             .field("diagnostics", &self.diagnostics.len())
-            .field("main_signature", &self.main_signature)
             .finish()
     }
 }
 
-/// `main` の引数情報。GUI は param 順に slider を表示する。
-#[derive(Clone, Debug, Default)]
-pub struct MainSignature {
-    pub params: Vec<MainParam>,
+/// 任意 top-level binding の引数情報。GUI は param 順に slider / 数値入力を表示する。
+#[derive(Clone, Debug)]
+pub struct BindingSignature {
+    pub name: String,
+    pub params: Vec<BindingParam>,
 }
 
-/// `main` の 1 引数。`slider` decl と紐付いていれば `range` がセットされる。
+/// binding の 1 引数。同名の `slider` decl があれば `range` がセットされる。
 #[derive(Clone, Debug)]
-pub struct MainParam {
+pub struct BindingParam {
     pub name: String,
-    /// `slider name = lo..hi` で指定された範囲。GUI で値を作るとき使う。
     pub range: Option<SliderDecl>,
 }
 
-/// `run_main()` への入力。`main` 引数の名前 → 値 を渡す。
+/// `run_binding()` への入力。binding 引数の名前 → 値 を渡す。
 /// `control_overrides` は GUI ドラッグで上書きされた control point の現在値。
 /// `search_paths` は `center3d` などが内部で manifold 評価する際の STL 検索パス。
 #[derive(Clone, Debug, Default)]
@@ -93,7 +102,7 @@ pub struct Inputs {
     pub search_paths: Vec<std::path::PathBuf>,
 }
 
-/// `run_main()` の出力。`main` の戻り値が record なら各 field を取り出す。
+/// `run_binding()` の出力。binding の戻り値が record なら各 field を取り出す。
 /// `control_points` は eval 中に `control3d` / `control2d` builtin が呼ばれた際に
 /// 記録された (name, current_position) のリスト。
 #[derive(Clone, Debug, Default)]
@@ -119,7 +128,7 @@ pub fn compile_with_paths(
 
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     let registry = sema::builtin::registry();
-    let (_schemes, infer_diag) = sema::infer::infer_unit(&unit, &registry);
+    let (schemes, infer_diag) = sema::infer::infer_unit(&unit, &registry);
     let has_fatal = !infer_diag.is_empty();
     for d in infer_diag {
         diagnostics.push(d);
@@ -136,41 +145,122 @@ pub fn compile_with_paths(
         diagnostics.extend(sema::exhaustive::check_module(&lm.module));
     }
 
-    let main_signature = build_main_signature(main_module, &sliders);
-
     Ok(CompiledProgram {
         unit,
         sliders,
         diagnostics,
-        main_signature,
+        schemes,
     })
 }
 
-fn build_main_signature(module: &syntax::ast::Module, sliders: &[SliderDecl]) -> MainSignature {
-    use syntax::ast::{Decl, Pattern};
-    let mut params = Vec::new();
-    for d in &module.decls {
-        if let Decl::Value(v) = d {
-            if v.name == "main" {
-                for p in &v.params {
-                    let name = match p {
-                        Pattern::Var(n, _) => n.clone(),
-                        _ => continue,
-                    };
-                    let range = sliders.iter().find(|s| s.name == name).cloned();
-                    params.push(MainParam { name, range });
+impl CompiledProgram {
+    /// GUI の combo_box 候補生成用。main module の top-level `Decl::Value` のうち、
+    /// 戻り型 (引数を剥がした後) がレンダリング可能なものを宣言順で返す。
+    /// レンダリング可能 = `Shape3D` / `List Shape3D` / `{ models : List Shape3D, .. }`
+    /// を含む record / それらに unify される型変数。
+    pub fn previewable_bindings(&self) -> Vec<BindingSignature> {
+        let main_lm = &self.unit.modules[self.unit.main_index];
+        let main_qname = main_lm.qualified_name.clone();
+        let module_schemes = match self.schemes.get(&main_qname) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for d in &main_lm.module.decls {
+            let v = match d {
+                syntax::ast::Decl::Value(v) => v,
+                _ => continue,
+            };
+            let scheme = match module_schemes.get(&v.name) {
+                Some(s) => s,
+                None => continue,
+            };
+            // 引数を剥がした戻り型を取る (Pattern::Var 以外を含む場合はスキップ)。
+            let mut ret = &scheme.ty;
+            let mut ok = true;
+            for p in &v.params {
+                if !matches!(p, syntax::ast::Pattern::Var(_, _)) {
+                    ok = false;
+                    break;
                 }
-                break;
+                if let Type::Arrow(_, to) = ret {
+                    ret = to.as_ref();
+                } else {
+                    // 引数より型が「足りない」: 推論できなかった等
+                    ok = false;
+                    break;
+                }
             }
+            if !ok || !is_renderable_return(ret) {
+                continue;
+            }
+            let params = collect_params(v, &self.sliders);
+            out.push(BindingSignature {
+                name: v.name.clone(),
+                params,
+            });
         }
+        out
     }
-    MainSignature { params }
+
+    /// 名前を指定して binding の引数 signature を引く。`previewable_bindings`
+    /// フィルタ内外を問わず、`Pattern::Var` のみで構成されていれば signature を返す。
+    /// 引数の型は GUI からは Float/Int として扱う (slider decl があれば range を付与)。
+    pub fn binding_signature(&self, name: &str) -> Option<BindingSignature> {
+        let main_lm = &self.unit.modules[self.unit.main_index];
+        for d in &main_lm.module.decls {
+            let v = match d {
+                syntax::ast::Decl::Value(v) => v,
+                _ => continue,
+            };
+            if v.name != name {
+                continue;
+            }
+            if !v.params.iter().all(|p| matches!(p, syntax::ast::Pattern::Var(_, _))) {
+                return None;
+            }
+            return Some(BindingSignature {
+                name: v.name.clone(),
+                params: collect_params(v, &self.sliders),
+            });
+        }
+        None
+    }
 }
 
-/// `main` 関数を実行する。`inputs` に main 引数名 → 値 のマップを渡す。
-/// 各引数について、`inputs` に値があればそれを使い、無ければ slider の中央値、
-/// それも無ければ `Value::Float(0.0)` を渡す。
-pub fn run_main(prog: &CompiledProgram, inputs: &Inputs) -> Result<MainOutput, Diagnostic> {
+fn collect_params(v: &syntax::ast::ValueDecl, sliders: &[SliderDecl]) -> Vec<BindingParam> {
+    v.params
+        .iter()
+        .filter_map(|p| match p {
+            syntax::ast::Pattern::Var(n, _) => Some(n.clone()),
+            _ => None,
+        })
+        .map(|name| {
+            let range = sliders.iter().find(|s| s.name == name).cloned();
+            BindingParam { name, range }
+        })
+        .collect()
+}
+
+fn is_renderable_return(ty: &Type) -> bool {
+    match ty {
+        Type::Con(name, args) if name == "Shape3D" && args.is_empty() => true,
+        Type::Con(name, args) if name == "List" && args.len() == 1 => {
+            matches!(&args[0], Type::Con(n, a) if n == "Shape3D" && a.is_empty())
+        }
+        Type::Record(fields) => fields.iter().any(|(n, _)| n == "models"),
+        _ => false,
+    }
+}
+
+/// 任意の top-level binding を実行する。`binding` に `"main"` を渡せば旧 `run_main`
+/// 相当。`inputs.values` から binding の各引数値を取り、不足分は slider 中央値 /
+/// `Value::Float(0.0)` で補完する。
+pub fn run_binding(
+    prog: &CompiledProgram,
+    binding: &str,
+    inputs: &Inputs,
+) -> Result<MainOutput, Diagnostic> {
     // GUI からの control point override を thread-local にセット (eval 中 builtin が見る)。
     runtime::builtin::set_control_overrides(inputs.control_overrides.clone());
     // center3d などが Manifold 評価する際に STL 検索パスを引けるようセット。
@@ -190,17 +280,23 @@ pub fn run_main(prog: &CompiledProgram, inputs: &Inputs) -> Result<MainOutput, D
         Diagnostic::runtime(Span::empty(), "main モジュールの env が見つかりません")
     })?;
 
-    let mut cur = env
-        .lookup("main")
-        .ok_or_else(|| Diagnostic::runtime(Span::empty(), "main 関数が定義されていません"))?;
+    let mut cur = env.lookup(binding).ok_or_else(|| {
+        Diagnostic::runtime(
+            Span::empty(),
+            format!("binding `{binding}` が定義されていません"),
+        )
+    })?;
 
-    for p in &prog.main_signature.params {
-        let v = inputs
-            .values
-            .get(&p.name)
-            .cloned()
-            .unwrap_or_else(|| default_for_param(p));
-        cur = ev.apply(cur, v, Span::empty())?;
+    let sig = prog.binding_signature(binding);
+    if let Some(sig) = sig {
+        for p in &sig.params {
+            let v = inputs
+                .values
+                .get(&p.name)
+                .cloned()
+                .unwrap_or_else(|| default_for_param(p));
+            cur = ev.apply(cur, v, Span::empty())?;
+        }
     }
 
     let mut out = unpack_main_output(cur)?;
@@ -209,7 +305,7 @@ pub fn run_main(prog: &CompiledProgram, inputs: &Inputs) -> Result<MainOutput, D
     Ok(out)
 }
 
-fn default_for_param(p: &MainParam) -> Value {
+fn default_for_param(p: &BindingParam) -> Value {
     if let Some(r) = &p.range {
         let mid = (r.lo + r.hi) / 2.0;
         match r.elem_ty {
@@ -266,7 +362,7 @@ fn unpack_main_output(v: Value) -> Result<MainOutput, Diagnostic> {
         }
         other => Err(Diagnostic::runtime(
             Span::empty(),
-            format!("main の戻り値が record / Shape3D / List Shape3D でない: {other}"),
+            format!("binding の戻り値が record / Shape3D / List Shape3D でない: {other}"),
         )),
     }
 }
@@ -283,7 +379,7 @@ mod tests {
         inputs
             .values
             .insert("length".to_string(), Value::Float(30.0));
-        let out = run_main(&prog, &inputs).expect("run_main");
+        let out = run_binding(&prog, "main", &inputs).expect("run_binding");
         assert_eq!(out.models.len(), 1);
     }
 
@@ -291,9 +387,10 @@ mod tests {
     fn slider_default_used() {
         let src = "main n = cube 1.0 1.0 1.0\nslider n = 6.0 .. 80.0";
         let prog = compile(src).expect("compile");
-        assert_eq!(prog.main_signature.params.len(), 1);
-        assert!(prog.main_signature.params[0].range.is_some());
-        let out = run_main(&prog, &Inputs::default()).expect("run_main");
+        let sig = prog.binding_signature("main").expect("main signature");
+        assert_eq!(sig.params.len(), 1);
+        assert!(sig.params[0].range.is_some());
+        let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
         assert_eq!(out.models.len(), 1);
     }
 
@@ -301,7 +398,7 @@ mod tests {
     fn main_output_record() {
         let src = "main = { models = [cube 1.0 1.0 1.0], bom = [], controls = [] }";
         let prog = compile(src).expect("compile");
-        let out = run_main(&prog, &Inputs::default()).expect("run_main");
+        let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
         assert_eq!(out.models.len(), 1);
     }
 
@@ -330,7 +427,7 @@ mod tests {
         write_lib(&tmp, "module Lib exposing (..)\n\nside = 5.0\n");
         let src = "import Lib exposing (side)\n\nmain = cube side side side";
         let prog = compile_with_paths(src, &[tmp.path().to_path_buf()]).expect("compile");
-        let out = run_main(&prog, &Inputs::default()).expect("run_main");
+        let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
         assert_eq!(out.models.len(), 1);
     }
 
@@ -340,7 +437,7 @@ mod tests {
         write_lib(&tmp, "module Lib exposing (..)\n\nside = 5.0\n");
         let src = "import Lib\n\nmain = cube Lib.side Lib.side Lib.side";
         let prog = compile_with_paths(src, &[tmp.path().to_path_buf()]).expect("compile");
-        let out = run_main(&prog, &Inputs::default()).expect("run_main");
+        let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
         assert_eq!(out.models.len(), 1);
     }
 
@@ -349,7 +446,7 @@ mod tests {
         let std_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("std");
         let src = "import Std exposing (Output)\n\nmain = { models = [], bom = [], controls = [] }";
         let prog = compile_with_paths(src, &[std_path]).expect("compile");
-        let out = run_main(&prog, &Inputs::default()).expect("run_main");
+        let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
         assert_eq!(out.models.len(), 0);
     }
 
@@ -359,7 +456,71 @@ mod tests {
         write_lib(&tmp, "module Lib exposing (..)\n\nside = 5.0\n");
         let src = "import Lib as L\n\nmain = cube L.side L.side L.side";
         let prog = compile_with_paths(src, &[tmp.path().to_path_buf()]).expect("compile");
-        let out = run_main(&prog, &Inputs::default()).expect("run_main");
+        let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
         assert_eq!(out.models.len(), 1);
+    }
+
+    #[test]
+    fn previewable_bindings_lists_shape3d_decls() {
+        let src = "\
+plate = cube 20.0 20.0 1.0
+hex_head r = cylinder r 5.0
+helper x = x + 1.0
+main = plate
+";
+        let prog = compile(src).expect("compile");
+        let bindings = prog.previewable_bindings();
+        let names: Vec<&str> = bindings.iter().map(|b| b.name.as_str()).collect();
+        assert!(names.contains(&"plate"), "plate should be previewable; got {names:?}");
+        assert!(names.contains(&"hex_head"), "hex_head should be previewable; got {names:?}");
+        assert!(names.contains(&"main"), "main should be previewable; got {names:?}");
+        assert!(!names.contains(&"helper"), "helper (Float -> Float) should not be previewable; got {names:?}");
+    }
+
+    #[test]
+    fn run_binding_to_named_decl() {
+        let src = "\
+plate = cube 20.0 20.0 1.0
+main = plate
+";
+        let prog = compile(src).expect("compile");
+        let out = run_binding(&prog, "plate", &Inputs::default()).expect("run_binding");
+        assert_eq!(out.models.len(), 1);
+    }
+
+    #[test]
+    fn run_binding_with_args() {
+        let src = "\
+hex_head r = cylinder r 5.0
+main = hex_head 4.0
+";
+        let prog = compile(src).expect("compile");
+        let mut inputs = Inputs::default();
+        inputs.values.insert("r".to_string(), Value::Float(3.0));
+        let out = run_binding(&prog, "hex_head", &inputs).expect("run_binding");
+        assert_eq!(out.models.len(), 1);
+    }
+
+    #[test]
+    fn run_binding_not_found_errors() {
+        let src = "main = cube 1.0 1.0 1.0";
+        let prog = compile(src).expect("compile");
+        let result = run_binding(&prog, "no_such_binding", &Inputs::default());
+        assert!(result.is_err(), "expected Err for missing binding");
+    }
+
+    #[test]
+    fn previewable_excludes_non_renderable_returns() {
+        let src = "\
+constant_int = 42
+main = cube 1.0 1.0 1.0
+";
+        let prog = compile(src).expect("compile");
+        let bindings = prog.previewable_bindings();
+        let names: Vec<&str> = bindings.iter().map(|b| b.name.as_str()).collect();
+        assert!(
+            !names.contains(&"constant_int"),
+            "Int constant should not be previewable; got {names:?}"
+        );
     }
 }

@@ -2,15 +2,18 @@
 //!
 //! コード変更時と slider 操作時で再実行すべき処理が違うので、2 つの job に分ける:
 //!
-//! - [`run_compile_job`] : ソース文字列 → `CompiledProgram` + `MainSignature`。
+//! - [`run_compile_job`] : ソース文字列 → `CompiledProgram`。
 //!   パース・型推論・slider 抽出・網羅性検査までやる重い処理。
-//! - [`run_eval_job`] : `CompiledProgram` + slider 値 → 頂点・インデックス + BOM。
-//!   `run_main` + `manifold_bridge::to_mesh_arrays_with_paths` の薄ラッパで、
-//!   slider を動かすたびに呼ぶ。`CompiledProgram` は `Clone` なので GUI 側 Model に保持する。
+//! - [`run_eval_job`] : `CompiledProgram` + slider 値 + target binding 名 → 頂点・
+//!   インデックス + BOM。`run_binding` + `manifold_bridge::to_mesh_arrays_with_paths`
+//!   の薄ラッパで、slider を動かすたびに呼ぶ。`CompiledProgram` は `Clone` なので
+//!   GUI 側 Model に保持する。
+//! - [`run_collision_job`] : 衝突プレビュー専用。常に `main` の models を pair で
+//!   交差判定する。
 
 use cadhr_lang::runtime::manifold_bridge::{MeshArrays, to_mesh_arrays_with_paths};
 use cadhr_lang::{
-    CompiledProgram, Inputs, MainSignature, Span, SliderDecl, Value, compile_with_paths, run_main,
+    BindingParam, CompiledProgram, Inputs, Span, Value, compile_with_paths, run_binding,
 };
 
 use crate::preview::pipeline::Vertex;
@@ -29,7 +32,6 @@ pub struct CompileJobParams {
 pub enum CompileJobResult {
     Success {
         program: CompiledProgram,
-        signature: MainSignature,
         diagnostics: Vec<String>,
     },
     Error {
@@ -43,11 +45,9 @@ pub fn run_compile_job(params: CompileJobParams) -> CompileJobResult {
     log_compile_request(&params);
     let result = match compile_with_paths(&params.source, &params.search_paths) {
         Ok(prog) => {
-            let signature = prog.main_signature.clone();
             let diagnostics = prog.diagnostics.iter().map(|d| d.message()).collect();
             CompileJobResult::Success {
                 program: prog,
-                signature,
                 diagnostics,
             }
         }
@@ -76,6 +76,15 @@ pub struct EvalJobParams {
     pub search_paths: Vec<PathBuf>,
     /// GUI が control point をドラッグして上書きしたときの (name → position)。
     pub control_overrides: HashMap<String, [f64; 3]>,
+    /// 評価する top-level binding の名前。`"main"` がデフォルト。
+    pub target: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CollisionJobParams {
+    pub program: CompiledProgram,
+    pub slider_values: HashMap<String, f64>,
+    pub search_paths: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -119,17 +128,9 @@ impl std::fmt::Debug for EvalJobResult {
 
 pub fn run_eval_job(params: EvalJobParams) -> EvalJobResult {
     log_eval_request("eval", &params);
-    let mut inputs = Inputs::default();
-    inputs.control_overrides = params.control_overrides.clone();
-    inputs.search_paths = params.search_paths.clone();
-    for p in &params.program.main_signature.params {
-        let v = params.slider_values.get(&p.name).copied();
-        inputs
-            .values
-            .insert(p.name.clone(), build_param_value(p.range.as_ref(), v));
-    }
+    let inputs = build_inputs(&params.program, &params.target, &params);
 
-    let output = match run_main(&params.program, &inputs) {
+    let output = match run_binding(&params.program, &params.target, &inputs) {
         Ok(o) => o,
         Err(d) => {
             let r = EvalJobResult::Error {
@@ -154,22 +155,15 @@ pub fn run_eval_job(params: EvalJobParams) -> EvalJobResult {
 }
 
 /// 衝突チェック: `main` の出力 models をペア毎に intersect して、非空の交差を集める。
-/// 結果メッシュは交差領域だけを集めたもの (色で main mesh と区別)。
-pub fn run_collision_job(params: EvalJobParams) -> EvalJobResult {
-    use cadhr_lang::runtime::manifold_bridge::{evaluate_with_paths, to_mesh_arrays_with_paths};
+/// 結果メッシュは交差領域だけを集めたもの (色で main mesh と区別)。target は常に `main`。
+pub fn run_collision_job(params: CollisionJobParams) -> EvalJobResult {
     use cadhr_lang::Model3D;
+    use cadhr_lang::runtime::manifold_bridge::{evaluate_with_paths, to_mesh_arrays_with_paths};
 
-    log_eval_request("collision", &params);
-    let mut inputs = Inputs::default();
-    inputs.search_paths = params.search_paths.clone();
-    for p in &params.program.main_signature.params {
-        let v = params.slider_values.get(&p.name).copied();
-        inputs
-            .values
-            .insert(p.name.clone(), build_param_value(p.range.as_ref(), v));
-    }
+    log_collision_request(&params);
+    let inputs = build_collision_inputs(&params);
 
-    let output = match run_main(&params.program, &inputs) {
+    let output = match run_binding(&params.program, "main", &inputs) {
         Ok(o) => o,
         Err(d) => {
             let r = EvalJobResult::Error {
@@ -196,11 +190,7 @@ pub fn run_collision_job(params: EvalJobParams) -> EvalJobResult {
         }
         for j in (i + 1)..n {
             // 交差は宣言ツリー上で `Intersect` ノードを作る (lazy 評価のまま)。
-            // 結果が空かどうかは bridge で確かめる必要があるが、面倒なので全て積む。
-            let inter = Model3D::Intersect(
-                Box::new(models[i].clone()),
-                Box::new(models[j].clone()),
-            );
+            let inter = Model3D::Intersect(Box::new(models[i].clone()), Box::new(models[j].clone()));
             // 空かどうか確認: evaluate して vertex 数チェック
             if let Ok(m) = evaluate_with_paths(&inter, &params.search_paths) {
                 let mesh = m.to_mesh();
@@ -244,8 +234,37 @@ pub fn run_collision_job(params: EvalJobParams) -> EvalJobResult {
     result
 }
 
-fn build_param_value(range: Option<&SliderDecl>, v: Option<f64>) -> Value {
-    match (range, v) {
+fn build_inputs(prog: &CompiledProgram, target: &str, params: &EvalJobParams) -> Inputs {
+    let mut inputs = Inputs::default();
+    inputs.control_overrides = params.control_overrides.clone();
+    inputs.search_paths = params.search_paths.clone();
+    if let Some(sig) = prog.binding_signature(target) {
+        for p in &sig.params {
+            let v = params.slider_values.get(&p.name).copied();
+            inputs
+                .values
+                .insert(p.name.clone(), build_param_value(p, v));
+        }
+    }
+    inputs
+}
+
+fn build_collision_inputs(params: &CollisionJobParams) -> Inputs {
+    let mut inputs = Inputs::default();
+    inputs.search_paths = params.search_paths.clone();
+    if let Some(sig) = params.program.binding_signature("main") {
+        for p in &sig.params {
+            let v = params.slider_values.get(&p.name).copied();
+            inputs
+                .values
+                .insert(p.name.clone(), build_param_value(p, v));
+        }
+    }
+    inputs
+}
+
+fn build_param_value(p: &BindingParam, v: Option<f64>) -> Value {
+    match (&p.range, v) {
         (Some(r), Some(x)) => {
             if r.elem_ty == cadhr_lang::ElemTy::Int {
                 Value::Int(x as i64)
@@ -315,13 +334,16 @@ fn log_compile_request(params: &CompileJobParams) {
 fn log_compile_result(result: &CompileJobResult) {
     match result {
         CompileJobResult::Success {
-            signature,
+            program,
             diagnostics,
-            ..
         } => {
             eprintln!("[compile OK]");
-            let names: Vec<&str> = signature.params.iter().map(|p| p.name.as_str()).collect();
-            eprintln!("  main params: [{}]", names.join(", "));
+            let names: Vec<String> = program
+                .previewable_bindings()
+                .into_iter()
+                .map(|b| b.name)
+                .collect();
+            eprintln!("  previewable bindings: [{}]", names.join(", "));
             for d in diagnostics {
                 eprintln!("  diag: {d}");
             }
@@ -341,15 +363,8 @@ fn log_compile_result(result: &CompileJobResult) {
 }
 
 fn log_eval_request(kind: &str, params: &EvalJobParams) {
-    eprintln!("───── cadhr-lang {kind} ─────");
-    if !params.slider_values.is_empty() {
-        eprintln!("[sliders]");
-        let mut items: Vec<(&String, &f64)> = params.slider_values.iter().collect();
-        items.sort_by(|a, b| a.0.cmp(b.0));
-        for (k, v) in items {
-            eprintln!("  {k} = {v}");
-        }
-    }
+    eprintln!("───── cadhr-lang {kind} target={} ─────", params.target);
+    log_slider_table(&params.slider_values);
     if !params.control_overrides.is_empty() {
         eprintln!("[control_overrides]");
         let mut items: Vec<(&String, &[f64; 3])> = params.control_overrides.iter().collect();
@@ -357,6 +372,23 @@ fn log_eval_request(kind: &str, params: &EvalJobParams) {
         for (k, v) in items {
             eprintln!("  {k} = [{}, {}, {}]", v[0], v[1], v[2]);
         }
+    }
+}
+
+fn log_collision_request(params: &CollisionJobParams) {
+    eprintln!("───── cadhr-lang collision ─────");
+    log_slider_table(&params.slider_values);
+}
+
+fn log_slider_table(sliders: &HashMap<String, f64>) {
+    if sliders.is_empty() {
+        return;
+    }
+    eprintln!("[sliders]");
+    let mut items: Vec<(&String, &f64)> = sliders.iter().collect();
+    items.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, v) in items {
+        eprintln!("  {k} = {v}");
     }
 }
 

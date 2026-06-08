@@ -11,12 +11,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+fn default_target_name() -> String {
+    "main".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SessionPreview {
     pub preview_id: u64,
     #[serde(default)]
     pub order: usize,
-    /// slider 名 → 値。
+    /// 評価する top-level binding の名前。欠落時は `"main"`。
+    #[serde(default = "default_target_name")]
+    pub target_name: String,
+    /// 引数名 → 値 (旧 main slider 値もここに残る — target_name=main で扱えば互換)。
     #[serde(default)]
     pub slider_values: HashMap<String, f64>,
     /// control point 名 → (x, y, z) override。CP ドラッグ後のスナップ位置を保存。

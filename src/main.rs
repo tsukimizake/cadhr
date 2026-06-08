@@ -8,12 +8,12 @@ mod ui;
 
 use std::path::PathBuf;
 
-use cadhr_lang::{CompiledProgram, MainSignature, Span};
+use cadhr_lang::{BindingSignature, CompiledProgram, Span};
 use iced::widget::{
-    column, container, pane_grid, pick_list, row, scrollable, slider, text, text_editor, toggler,
+    column, container, pane_grid, pick_list, row, scrollable, text, text_editor, toggler,
 };
 use iced::{Element, Fill, Length, Subscription, Task};
-use interpreter::{CompileJobParams, CompileJobResult, EvalJobResult};
+use interpreter::{CollisionJobParams, CompileJobParams, CompileJobResult, EvalJobResult};
 use ui::parts;
 use ui::preview::{Preview, PreviewMsg};
 
@@ -122,11 +122,14 @@ fn main() -> iced::Result {
 
 struct Model {
     editor: text_editor::Content,
-    /// 複数プレビュー。`previews[0]` が「主プレビュー」、それ以降は追加。
+    /// 複数プレビュー。順序のみで「主」は無く、各 preview が自分の target binding を持つ。
     previews: Vec<Preview>,
     next_preview_id: u64,
     program: Option<CompiledProgram>,
-    signature: MainSignature,
+    /// `previewable_bindings()` のキャッシュ。compile 完了時に更新。
+    candidates: Vec<BindingSignature>,
+    /// combo_box の選択肢用キャッシュ (= `candidates.iter().map(|b| b.name).collect()`)。
+    candidate_names: Vec<String>,
     error_message: String,
     error_span: Option<Span>,
     diagnostics: Vec<String>,
@@ -143,7 +146,6 @@ struct Model {
 enum Msg {
     EditorAction(text_editor::Action),
     UpdatePreviews,
-    SliderChanged(u64, String, f32),
     CompileDone(CompileJobResult),
     EvalDone(u64, EvalJobResult),
     Preview(u64, PreviewMsg),
@@ -180,7 +182,8 @@ fn init() -> (Model, Task<Msg>) {
         previews: vec![Preview::new(0)],
         next_preview_id: 1,
         program: None,
-        signature: MainSignature::default(),
+        candidates: Vec::new(),
+        candidate_names: Vec::new(),
         error_message: String::new(),
         error_span: None,
         diagnostics: Vec::new(),
@@ -253,22 +256,31 @@ fn spawn_eval_for(model: &Model, preview_id: u64) -> Task<Msg> {
     let Some(p) = model.previews.iter().find(|p| p.id == preview_id) else {
         return Task::none();
     };
-    let params = p.build_eval_params(&prog, search_paths(model));
-    let is_collision = p.is_collision;
-    Task::perform(
-        async move {
-            std::thread::spawn(move || {
-                if is_collision {
-                    interpreter::run_collision_job(params)
-                } else {
-                    interpreter::run_eval_job(params)
-                }
-            })
-            .join()
-            .expect("eval worker panicked")
-        },
-        move |r| Msg::EvalDone(preview_id, r),
-    )
+    if p.is_collision {
+        let params = CollisionJobParams {
+            program: prog,
+            slider_values: p.slider_values.clone(),
+            search_paths: search_paths(model),
+        };
+        Task::perform(
+            async move {
+                std::thread::spawn(move || interpreter::run_collision_job(params))
+                    .join()
+                    .expect("eval worker panicked")
+            },
+            move |r| Msg::EvalDone(preview_id, r),
+        )
+    } else {
+        let params = p.build_eval_params(&prog, search_paths(model));
+        Task::perform(
+            async move {
+                std::thread::spawn(move || interpreter::run_eval_job(params))
+                    .join()
+                    .expect("eval worker panicked")
+            },
+            move |r| Msg::EvalDone(preview_id, r),
+        )
+    }
 }
 
 fn spawn_eval_all(model: &Model) -> Task<Msg> {
@@ -289,15 +301,32 @@ fn collect_session_previews(model: &Model) -> Vec<session::SessionPreview> {
         .collect()
 }
 
+/// 各 preview について現在の target binding の signature を引き、未登録 param
+/// に slider 中央値 (range 無しなら 0.0) を populate する。
 fn apply_signature_defaults(model: &mut Model) {
+    let Some(prog) = &model.program else { return };
     for p in &mut model.previews {
-        for param in &model.signature.params {
-            if let Some(r) = &param.range {
-                p.slider_values
-                    .entry(param.name.clone())
-                    .or_insert((r.lo + r.hi) / 2.0);
-            }
+        let target = if p.is_collision { "main" } else { &p.target };
+        let Some(sig) = prog.binding_signature(target) else {
+            continue;
+        };
+        for param in &sig.params {
+            let default = param
+                .range
+                .as_ref()
+                .map(|r| (r.lo + r.hi) / 2.0)
+                .unwrap_or(0.0);
+            p.slider_values
+                .entry(param.name.clone())
+                .or_insert(default);
         }
+    }
+}
+
+/// candidate 一覧が変わったとき、各 preview の combo_box state を更新する。
+fn refresh_preview_candidates(model: &mut Model) {
+    for p in &mut model.previews {
+        p.refresh_candidates(&model.candidate_names);
     }
 }
 
@@ -313,25 +342,19 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             Task::none()
         }
         Msg::UpdatePreviews => spawn_compile_job(model),
-        Msg::SliderChanged(pid, name, v) => {
-            if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
-                p.slider_values.insert(name, v as f64);
-                model.unsaved = true;
-                return spawn_eval_for(model, pid);
-            }
-            Task::none()
-        }
         Msg::CompileDone(result) => match result {
             CompileJobResult::Success {
                 program,
-                signature,
                 diagnostics,
             } => {
-                model.signature = signature;
+                model.candidates = program.previewable_bindings();
+                model.candidate_names =
+                    model.candidates.iter().map(|b| b.name.clone()).collect();
                 model.program = Some(program);
                 model.error_message.clear();
                 model.error_span = None;
                 model.diagnostics = diagnostics;
+                refresh_preview_candidates(model);
                 apply_signature_defaults(model);
                 spawn_eval_all(model)
             }
@@ -432,19 +455,34 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                 let suggested = format!("{}_{pid}.3mf", base_name(model));
                 model.dialogs.export_3mf(suggested, data)
             }
+            PreviewMsg::TargetChanged(new_target) => {
+                if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
+                    if p.target == new_target {
+                        return Task::none();
+                    }
+                    p.target = new_target;
+                    model.unsaved = true;
+                }
+                apply_signature_defaults(model);
+                spawn_eval_for(model, pid)
+            }
+            PreviewMsg::ArgChanged(name, v) => {
+                if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
+                    p.slider_values.insert(name, v);
+                    model.unsaved = true;
+                    return spawn_eval_for(model, pid);
+                }
+                Task::none()
+            }
         },
 
         Msg::AddPreview => {
             let id = model.next_preview_id;
             model.next_preview_id += 1;
             let mut p = Preview::new(id);
-            for param in &model.signature.params {
-                if let Some(r) = &param.range {
-                    p.slider_values
-                        .insert(param.name.clone(), (r.lo + r.hi) / 2.0);
-                }
-            }
+            p.refresh_candidates(&model.candidate_names);
             model.previews.push(p);
+            apply_signature_defaults(model);
             model.unsaved = true;
             spawn_eval_for(model, id)
         }
@@ -452,13 +490,9 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             let id = model.next_preview_id;
             model.next_preview_id += 1;
             let mut p = Preview::new_collision(id);
-            for param in &model.signature.params {
-                if let Some(r) = &param.range {
-                    p.slider_values
-                        .insert(param.name.clone(), (r.lo + r.hi) / 2.0);
-                }
-            }
+            p.refresh_candidates(&model.candidate_names);
             model.previews.push(p);
+            apply_signature_defaults(model);
             model.unsaved = true;
             spawn_eval_for(model, id)
         }
@@ -650,43 +684,13 @@ fn view(model: &Model) -> Element<'_, Msg> {
                 pane_grid::Content::new(editor)
             }
             PaneKind::Preview => {
-                // 最初の preview のスライダーを「主スライダー」として main パネルに出す。
-                // 他の preview は同じ値を共有 (per-preview override は将来課題)。
-                let sliders_view: Element<'_, Msg> =
-                    if model.signature.params.is_empty() || model.previews.is_empty() {
-                        column![].into()
-                    } else {
-                        let main_pid = model.previews[0].id;
-                        let mut col = column![text("Main sliders:").size(13)]
-                            .spacing(4)
-                            .padding(4);
-                        for p in &model.signature.params {
-                            let r = match &p.range {
-                                Some(r) => r,
-                                None => continue,
-                            };
-                            let cur = model.previews[0]
-                                .slider_values
-                                .get(&p.name)
-                                .copied()
-                                .unwrap_or((r.lo + r.hi) / 2.0)
-                                as f32;
-                            let lo = r.lo as f32;
-                            let hi = r.hi as f32;
-                            let name = p.name.clone();
-                            let label = text(format!("{}: {:.2}", p.name, cur));
-                            let widget = slider(lo..=hi, cur, move |v| {
-                                Msg::SliderChanged(main_pid, name.clone(), v)
-                            });
-                            col = col.push(row![label, widget].spacing(8));
-                        }
-                        col.into()
-                    };
-
+                // 各 preview が自分の binding signature に合わせた引数 slider を持つ
+                // (main 用の共有 slider パネルは廃止)。
                 let previews_view: Element<'_, Msg> =
-                    ui::preview::list_view(&model.previews).map(|(id, pm)| Msg::Preview(id, pm));
+                    ui::preview::list_view(&model.previews, &model.candidates)
+                        .map(|(id, pm)| Msg::Preview(id, pm));
 
-                pane_grid::Content::new(column![sliders_view, previews_view].spacing(4))
+                pane_grid::Content::new(previews_view)
             }
         }
     })

@@ -1,11 +1,11 @@
 //! 拡張 builtin の動作テスト。
 //! revolve / complex_extrude / sweep_extrude / 2D CSG / center / bezier。
 
-use cadhr_lang::{Inputs, compile, run_main};
+use cadhr_lang::{Inputs, compile, run_binding};
 
 fn compile_run(src: &str) -> cadhr_lang::MainOutput {
     let prog = compile(src).expect("compile");
-    run_main(&prog, &Inputs::default()).expect("run_main")
+    run_binding(&prog, "main", &Inputs::default()).expect("run_binding")
 }
 
 #[test]
@@ -146,7 +146,8 @@ fn control3d_passes_point_through_default() {
 fn control3d_records_name_and_default() {
     let src = "main = cube 1.0 1.0 1.0 |> translate3d (p3 0.0 0.0 0.0) (control3d \"corner\" (p3 5.0 7.0 9.0))";
     let prog = cadhr_lang::compile(src).expect("compile");
-    let out = cadhr_lang::run_main(&prog, &cadhr_lang::Inputs::default()).expect("run_main");
+    let out = cadhr_lang::run_binding(&prog, "main", &cadhr_lang::Inputs::default())
+        .expect("run_binding");
     assert_eq!(out.control_points.len(), 1);
     assert_eq!(out.control_points[0].0, "corner");
     assert_eq!(out.control_points[0].1, [5.0, 7.0, 9.0]);
@@ -160,7 +161,7 @@ fn control3d_overrides_default_when_inputs_provided() {
     inputs
         .control_overrides
         .insert("corner".into(), [1.0, 2.0, 3.0]);
-    let out = cadhr_lang::run_main(&prog, &inputs).expect("run_main");
+    let out = cadhr_lang::run_binding(&prog, "main", &inputs).expect("run_binding");
     assert_eq!(out.control_points[0].1, [1.0, 2.0, 3.0]);
     // メッシュの bbox が override 通り (translate に override 値が伝播している)
     let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();

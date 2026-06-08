@@ -1,7 +1,7 @@
 //! Point2D / Point3D は構造的 record 型。`.x` 等のフィールドアクセスと、
 //! record リテラルを point として渡せることを確認する。
 
-use cadhr_lang::{Inputs, compile, run_main};
+use cadhr_lang::{Inputs, compile, run_binding};
 
 #[test]
 fn point_field_access_when_type_known() {
@@ -35,6 +35,6 @@ fn record_literal_is_accepted_as_point2d() {
         "診断は無いはず: {:?}",
         prog.diagnostics
     );
-    let out = run_main(&prog, &Inputs::default()).expect("run_main");
+    let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
     assert_eq!(out.models.len(), 1);
 }

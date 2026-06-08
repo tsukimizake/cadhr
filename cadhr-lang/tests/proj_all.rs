@@ -33,8 +33,8 @@ fn try_project(name: &str) {
     for d in &prog.diagnostics {
         eprintln!("{name} [{:?}] {}", d.severity(), d.message());
     }
-    let out = cadhr_lang::run_main(&prog, &Inputs::default())
-        .unwrap_or_else(|e| panic!("{name}: run_main err: {}", e.message()));
+    let out = cadhr_lang::run_binding(&prog, "main", &Inputs::default())
+        .unwrap_or_else(|e| panic!("{name}: run_binding err: {}", e.message()));
     assert!(!out.models.is_empty(), "{name}: no model produced");
     let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0])
         .unwrap_or_else(|e| panic!("{name}: bridge err: {}", e));

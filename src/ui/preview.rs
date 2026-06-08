@@ -1,13 +1,13 @@
 //! 個別プレビュー (Vec<Preview>) の管理。
 //!
-//! 各 preview は独自の slider 値、scene、表示オプション、衝突モードを持つ。
-//! main の `CompiledProgram` は共有し、preview ごとに `run_eval_job` を投げる。
+//! 各 preview は target binding 名・独自の slider 値・scene・表示オプションを持つ。
+//! `CompiledProgram` は共有し、preview ごとに `run_binding` を投げる。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use cadhr_lang::{CompiledProgram, Span};
-use iced::widget::{column, container, row, scrollable, shader, text, text_input};
+use cadhr_lang::{BindingSignature, CompiledProgram, Span};
+use iced::widget::{column, combo_box, container, row, scrollable, shader, slider, text, text_input};
 use iced::{Element, Fill, Length};
 
 use crate::interpreter::{EvalJobParams, EvalJobResult};
@@ -18,6 +18,10 @@ use crate::ui::parts;
 
 pub struct Preview {
     pub id: u64,
+    /// 評価する top-level binding の名前。`"main"` がデフォルト。
+    pub target: String,
+    /// combo_box widget の内部状態。candidate 一覧が変わった時に作り直す。
+    pub target_state: combo_box::State<String>,
     pub scene: Scene,
     pub slider_values: HashMap<String, f64>,
     pub bom: Vec<String>,
@@ -40,6 +44,8 @@ impl Preview {
     pub fn new(id: u64) -> Self {
         Self {
             id,
+            target: "main".to_string(),
+            target_state: combo_box::State::new(Vec::new()),
             scene: Scene::new(),
             slider_values: HashMap::new(),
             bom: Vec::new(),
@@ -68,6 +74,7 @@ impl Preview {
         } else {
             Self::new(sp.preview_id)
         };
+        p.target = sp.target_name.clone();
         p.slider_values = sp.slider_values.clone();
         p.control_overrides = sp.control_point_overrides.clone();
         p.view_at_object_center = sp.view_at_object_center;
@@ -80,6 +87,7 @@ impl Preview {
         SessionPreview {
             preview_id: self.id,
             order,
+            target_name: self.target.clone(),
             slider_values: self.slider_values.clone(),
             control_point_overrides: self.control_overrides.clone(),
             view_at_object_center: self.view_at_object_center,
@@ -124,13 +132,20 @@ impl Preview {
             slider_values: self.slider_values.clone(),
             search_paths,
             control_overrides: self.control_overrides.clone(),
+            target: self.target.clone(),
         }
+    }
+
+    /// candidate 一覧が変わった時に呼ぶ。combo_box state を作り直して、現在 target
+    /// を維持する。
+    pub fn refresh_candidates(&mut self, names: &[String]) {
+        self.target_state = combo_box::State::new(names.to_vec());
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum PreviewMsg {
-    /// Scene が出す SceneMessage（カメラ操作）を preview レイヤーで握りつぶすための no-op。
+    /// Scene が出す SceneMessage (カメラ操作) を preview レイヤーで握りつぶすための no-op。
     SceneIgnored,
     ToggleViewCenter,
     Minimize,
@@ -140,9 +155,20 @@ pub enum PreviewMsg {
     SelectControlPoint(usize),
     ControlPointEdited(String, usize, String),
     Export3MF,
+    /// combo_box で binding 名が確定された (selection or text submit)。
+    TargetChanged(String),
+    /// preview 固有の引数 slider/text 値変更 (引数名、新値)。
+    ArgChanged(String, f64),
 }
 
-pub fn view<'a>(p: &'a Preview, index: usize, total: usize) -> Element<'a, PreviewMsg> {
+pub fn view<'a>(
+    p: &'a Preview,
+    index: usize,
+    total: usize,
+    candidate_signatures: &'a [BindingSignature],
+) -> Element<'a, PreviewMsg> {
+    let current_sig: Option<&BindingSignature> =
+        candidate_signatures.iter().find(|s| s.name == p.target);
     let label = if p.is_collision {
         format!("collision #{} ({}/{})", p.id, index + 1, total)
     } else {
@@ -161,6 +187,22 @@ pub fn view<'a>(p: &'a Preview, index: usize, total: usize) -> Element<'a, Previ
         .on_press(PreviewMsg::ToggleViewCenter),
     ]
     .spacing(2);
+
+    if !p.is_collision {
+        // combo_box で target binding を選択。on_input でテキスト変更を、on_selected
+        // で候補選択を拾い、どちらも TargetChanged にまとめる。
+        let cb = combo_box(
+            &p.target_state,
+            "binding",
+            Some(&p.target),
+            PreviewMsg::TargetChanged,
+        )
+        .on_input(PreviewMsg::TargetChanged)
+        .width(Length::Fixed(160.0))
+        .size(13.0);
+        header = header.push(cb);
+    }
+
     // collision preview は表示専用なので 3MF export は出さない
     if !p.is_collision && !p.last_vertices.is_empty() {
         header = header.push(parts::dark_button("Export 3MF").on_press(PreviewMsg::Export3MF));
@@ -175,10 +217,56 @@ pub fn view<'a>(p: &'a Preview, index: usize, total: usize) -> Element<'a, Previ
         .width(Fill)
         .height(Length::Fixed(220.0))
         .into();
-    // control point ドラッグを実装するときに差し替える）。
     let preview_widget: Element<'a, PreviewMsg> = widget.map(|_| PreviewMsg::SceneIgnored);
 
     let mut col = column![header, preview_widget].spacing(4);
+
+    // collision 以外は当該 binding の引数 widget を出す
+    if !p.is_collision {
+        if let Some(sig) = current_sig {
+            if !sig.params.is_empty() {
+                let mut s_col = column![].spacing(4);
+                for param in &sig.params {
+                    let name = param.name.clone();
+                    let cur = p
+                        .slider_values
+                        .get(&name)
+                        .copied()
+                        .or_else(|| param.range.as_ref().map(|r| (r.lo + r.hi) / 2.0))
+                        .unwrap_or(0.0);
+                    let label = text(format!("{}: {:.2}", name, cur));
+                    let widget_el: Element<'a, PreviewMsg> = if let Some(r) = &param.range {
+                        let lo = r.lo as f32;
+                        let hi = r.hi as f32;
+                        let name_for_slider = name.clone();
+                        slider(lo..=hi, cur as f32, move |v| {
+                            PreviewMsg::ArgChanged(name_for_slider.clone(), v as f64)
+                        })
+                        .into()
+                    } else {
+                        let s = format!("{cur:.2}");
+                        let name_for_input = name.clone();
+                        text_input("", &s)
+                            .on_input(move |new| {
+                                let v = new.parse::<f64>().unwrap_or(0.0);
+                                PreviewMsg::ArgChanged(name_for_input.clone(), v)
+                            })
+                            .width(Length::Fixed(80.0))
+                            .into()
+                    };
+                    s_col = s_col.push(row![label, widget_el].spacing(8));
+                }
+                col = col.push(s_col);
+            }
+        } else if !p.target.is_empty()
+            && !candidate_signatures.iter().any(|s| s.name == p.target)
+        {
+            col = col.push(
+                text(format!("warning: binding `{}` not previewable", p.target))
+                    .color(iced::Color::from_rgb(1.0, 0.7, 0.4)),
+            );
+        }
+    }
 
     if !p.bom.is_empty() {
         let mut b_col = column![text("BOM:").size(13)].spacing(2);
@@ -219,7 +307,10 @@ fn numeric_input<'a>(name: String, axis: usize, value: f64) -> Element<'a, Previ
         .into()
 }
 
-pub fn list_view<'a>(previews: &'a [Preview]) -> Element<'a, (u64, PreviewMsg)> {
+pub fn list_view<'a>(
+    previews: &'a [Preview],
+    candidate_signatures: &'a [BindingSignature],
+) -> Element<'a, (u64, PreviewMsg)> {
     if previews.is_empty() {
         return text("No previews. Press \"Add\" to create one.").into();
     }
@@ -229,7 +320,7 @@ pub fn list_view<'a>(previews: &'a [Preview]) -> Element<'a, (u64, PreviewMsg)> 
         .enumerate()
         .map(|(i, p)| {
             let id = p.id;
-            view(p, i, total).map(move |m| (id, m))
+            view(p, i, total, candidate_signatures).map(move |m| (id, m))
         })
         .collect();
     scrollable(column(items).spacing(8)).height(Fill).into()

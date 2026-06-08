@@ -5,7 +5,7 @@
 //! `import Bolts exposing (m3)` で `<search_path>/Bolts/db.cadhr` を引く
 //! (モジュール = ディレクトリ + db.cadhr の慣習)。
 
-use cadhr_lang::{Inputs, compile_with_paths, run_main};
+use cadhr_lang::{Inputs, compile_with_paths, run_binding};
 use std::fs;
 use tempfile::tempdir;
 
@@ -42,6 +42,6 @@ fn bolts_library_cross_module() {
     fs::create_dir_all(tmp.path().join("Bolts")).unwrap();
     fs::write(tmp.path().join("Bolts/db.cadhr"), BOLTS_SRC).unwrap();
     let prog = compile_with_paths(MAIN_SRC, &[tmp.path().to_path_buf()]).expect("compile");
-    let out = run_main(&prog, &Inputs::default()).expect("run_main");
+    let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
     assert_eq!(out.models.len(), 2);
 }

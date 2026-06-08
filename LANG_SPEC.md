@@ -174,17 +174,24 @@ pub fn compile(
     search_paths: &[PathBuf],
 ) -> Result<CompiledProgram, Vec<Diagnostic>>;
 
-pub fn main_signature(p: &CompiledProgram) -> &MainSignature;
+impl CompiledProgram {
+    /// GUI 用 dropdown 候補一覧。レンダリング可能な戻り型を持つ top-level binding
+    /// (`Shape3D` / `List Shape3D` / `{ models : .. , .. }`) を宣言順で返す。
+    pub fn previewable_bindings(&self) -> Vec<BindingSignature>;
 
-pub struct MainSignature {
-    pub args: Vec<MainArg>,
-    pub return_type: Type,
+    /// 任意の top-level binding 名から引数情報を引く。Pattern::Var のみで構成された
+    /// binding なら返る。
+    pub fn binding_signature(&self, name: &str) -> Option<BindingSignature>;
 }
 
-pub struct MainArg {
+pub struct BindingSignature {
     pub name: String,
-    pub ty: Type,
-    pub slider: Option<SliderDecl>,
+    pub params: Vec<BindingParam>,
+}
+
+pub struct BindingParam {
+    pub name: String,
+    pub range: Option<SliderDecl>,
 }
 
 pub struct SliderDecl {
@@ -194,19 +201,23 @@ pub struct SliderDecl {
 }
 
 pub struct Inputs {
-    pub values: HashMap<String, f64>,            // main の各引数の現在値
-    pub control_overrides: HashMap<String, Point3D>,
+    pub values: HashMap<String, Value>,
+    pub control_overrides: HashMap<String, [f64; 3]>,
+    pub search_paths: Vec<PathBuf>,
 }
 
-pub fn run_main(
+/// 任意の top-level binding を実行する。`binding == "main"` で旧 run_main 相当。
+pub fn run_binding(
     p: &CompiledProgram,
+    binding: &str,
     inputs: &Inputs,
 ) -> Result<MainOutput, Diagnostic>;
 
 pub struct MainOutput {
-    pub models: Vec<Shape3D>,
-    pub bom: Vec<BomEntry>,
-    pub controls: Vec<Control>,
+    pub models: Vec<Model3D>,
+    pub bom: Vec<Value>,
+    pub controls: Vec<Value>,
+    pub control_points: Vec<(String, [f64; 3])>,
 }
 ```
 
@@ -215,7 +226,7 @@ pub struct MainOutput {
 ```
 cadhr-lang/                    # 言語コア
   src/
-    lib.rs                     # 公開 API: compile / run_main / MainSignature
+    lib.rs                     # 公開 API: compile / run_binding / BindingSignature
     syntax/                    # Phase 1
       ast.rs / lex.rs / parse.rs / pretty.rs
     sema/                      # Phase 2
