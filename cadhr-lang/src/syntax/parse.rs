@@ -502,6 +502,7 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
         let lambda = just(Token::BackSlash)
             .ignore_then(pat.clone().repeated().at_least(1).collect::<Vec<_>>())
             .then_ignore(just(Token::Arrow))
+            .then_ignore(nl())
             .then(expr.clone())
             .map_with(|(params, body), e| Expr::Lambda {
                 params,
@@ -1160,6 +1161,18 @@ mod tests {
     #[test]
     fn lambda_expr() {
         let m = parse_ok("f = \\x y -> x + y");
+        match &m.decls[0] {
+            Decl::Value(v) => match &v.body {
+                Expr::Lambda { params, .. } => assert_eq!(params.len(), 2),
+                _ => panic!("expected Lambda"),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn lambda_newline_after_arrow() {
+        let m = parse_ok("f = \\x y ->\n    x + y");
         match &m.decls[0] {
             Decl::Value(v) => match &v.body {
                 Expr::Lambda { params, .. } => assert_eq!(params.len(), 2),
