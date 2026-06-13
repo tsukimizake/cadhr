@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn non_exhaustive_case_reports_warning() {
-        let src = "f x = case x of | True -> 1";
+        let src = "f x = case x of\n    True -> 1";
         let prog = compile(src).expect("compile");
         assert!(
             prog.diagnostics

@@ -14,7 +14,8 @@
 //! - 演算子 / 区切り記号
 //!
 //! コメントは `--` 行コメント、`{- ... -}` ブロックコメント (ネスト対応)。
-//! 改行は構造上意味を持たず、空白として扱う (cadhr は indent-sensitive ではない)。
+//! 改行は `Token::Newline` として残し、後段の layout pass (`layout::apply_layout`) が
+//! インデント (オフサイドルール) に基づいて BlockOpen/BlockSep/BlockClose に変換する。
 
 use crate::diagnostic::Span;
 use chumsky::prelude::*;
@@ -86,9 +87,17 @@ pub enum Token<'src> {
     Underscore,
 
     /// 改行 (1 個以上連続する `\n` を 1 つの Newline トークンに集約)。
-    /// expression / pattern / type 内では parser 側で whitespace と同等に skip され、
-    /// top-level decl の境界では区切りとして意味を持つ。
+    /// lexer が出力し、後段の layout pass (`layout::apply_layout`) が消費する。
+    /// parser には届かない (layout pass で BlockOpen/BlockSep/BlockClose に変換される)。
     Newline,
+
+    /// layout pass が挿入する仮想トークン。let / case-of ブロックの開始。
+    BlockOpen,
+    /// layout pass が挿入する仮想トークン。同一レイアウト列に揃った兄弟要素の区切り
+    /// (top-level decl / let binding / case arm の間)。
+    BlockSep,
+    /// layout pass が挿入する仮想トークン。let / case-of ブロックの終了。
+    BlockClose,
 }
 
 impl<'src> std::fmt::Display for Token<'src> {
@@ -148,6 +157,9 @@ impl<'src> std::fmt::Display for Token<'src> {
             Token::Comma => f.write_str(","),
             Token::Underscore => f.write_str("_"),
             Token::Newline => f.write_str("<newline>"),
+            Token::BlockOpen => f.write_str("<block-open>"),
+            Token::BlockSep => f.write_str("<block-sep>"),
+            Token::BlockClose => f.write_str("<block-close>"),
         }
     }
 }

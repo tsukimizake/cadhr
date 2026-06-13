@@ -97,8 +97,9 @@ fn center2d_with_translate2d_centers_polygon() {
     // 10x10 の正方形を (50,50) 平行移動した後、center2d + translate2d で原点に戻す。
     // 結果を XY で extrude して bbox を見ると -5..5 になるはず。
     let src = "main =
-    let sq = polygon [p2 0.0 0.0, p2 10.0 0.0, p2 10.0 10.0, p2 0.0 10.0]
-        |> translate2d (p2 0.0 0.0) (p2 50.0 50.0)
+    let sq =
+            polygon [p2 0.0 0.0, p2 10.0 0.0, p2 10.0 10.0, p2 0.0 10.0]
+                |> translate2d (p2 0.0 0.0) (p2 50.0 50.0)
     in
     sq |> translate2d (center2d sq) (p2 0.0 0.0) |> extrude_xy 1.0
 ";

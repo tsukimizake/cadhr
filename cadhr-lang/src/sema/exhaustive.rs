@@ -399,19 +399,19 @@ mod tests {
 
     #[test]
     fn wildcard_makes_exhaustive() {
-        let src = "f x = case x of | 1 -> 1 | _ -> 0";
+        let src = "f x = case x of\n    1 -> 1\n    _ -> 0";
         assert!(run(src).is_empty());
     }
 
     #[test]
     fn var_makes_exhaustive() {
-        let src = "f x = case x of | 1 -> 1 | n -> n";
+        let src = "f x = case x of\n    1 -> 1\n    n -> n";
         assert!(run(src).is_empty());
     }
 
     #[test]
     fn missing_bool_branch_is_warning() {
-        let src = "f x = case x of | True -> 1";
+        let src = "f x = case x of\n    True -> 1";
         let d = run(src);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].severity(), Severity::Warning);
@@ -420,14 +420,14 @@ mod tests {
 
     #[test]
     fn both_bool_branches_ok() {
-        let src = "f x = case x of | True -> 1 | False -> 0";
+        let src = "f x = case x of\n    True -> 1\n    False -> 0";
         assert!(run(src).is_empty());
     }
 
     #[test]
     fn missing_adt_ctor_is_warning() {
         let src = "type Shape = Cube Float Float Float | Sphere Float | Empty\n\
-                   f s = case s of | Cube _ _ _ -> 1 | Sphere _ -> 2";
+                   f s = case s of\n    Cube _ _ _ -> 1\n    Sphere _ -> 2";
         let d = run(src);
         assert_eq!(d.len(), 1);
         assert!(d[0].message().contains("Empty"));
@@ -436,13 +436,13 @@ mod tests {
     #[test]
     fn all_adt_ctors_ok() {
         let src = "type Shape = Cube Float Float Float | Sphere Float\n\
-                   f s = case s of | Cube _ _ _ -> 1 | Sphere _ -> 2";
+                   f s = case s of\n    Cube _ _ _ -> 1\n    Sphere _ -> 2";
         assert!(run(src).is_empty());
     }
 
     #[test]
     fn missing_empty_list_is_warning() {
-        let src = "f xs = case xs of | x :: _ -> x";
+        let src = "f xs = case xs of\n    x :: _ -> x";
         let d = run(src);
         assert_eq!(d.len(), 1);
         assert!(d[0].message().contains("[]"));
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn missing_cons_list_is_warning() {
-        let src = "f xs = case xs of | [] -> 0";
+        let src = "f xs = case xs of\n    [] -> 0";
         let d = run(src);
         assert_eq!(d.len(), 1);
         assert!(d[0].message().contains("::"));
@@ -458,13 +458,13 @@ mod tests {
 
     #[test]
     fn both_list_cases_ok() {
-        let src = "f xs = case xs of | [] -> 0 | x :: _ -> x";
+        let src = "f xs = case xs of\n    [] -> 0\n    x :: _ -> x";
         assert!(run(src).is_empty());
     }
 
     #[test]
     fn int_lit_without_wildcard_is_warning() {
-        let src = "f x = case x of | 0 -> 0 | 1 -> 1";
+        let src = "f x = case x of\n    0 -> 0\n    1 -> 1";
         let d = run(src);
         assert_eq!(d.len(), 1);
         assert!(d[0].message().contains("`_ ->`"));
@@ -477,7 +477,7 @@ mod tests {
         // `Just _ Just _` は書いてるが `Just _ Nothing` が漏れている
         let src = "type Maybe a = Just a | Nothing\n\
                    type Pair = MkPair (Maybe Float) (Maybe Float)\n\
-                   f p = case p of | MkPair (Just _) (Just _) -> 1 | MkPair Nothing _ -> 2";
+                   f p = case p of\n    MkPair (Just _) (Just _) -> 1\n    MkPair Nothing _ -> 2";
         let d = run(src);
         assert_eq!(d.len(), 1, "got {d:?}");
         // Maybe の Nothing が「MkPair の 2 番目の引数」位置で漏れているはず
@@ -492,7 +492,7 @@ mod tests {
     fn nested_adt_fully_covered() {
         let src = "type Maybe a = Just a | Nothing\n\
                    type Pair = MkPair (Maybe Float) (Maybe Float)\n\
-                   f p = case p of | MkPair (Just _) (Just _) -> 1 | MkPair (Just _) Nothing -> 2 | MkPair Nothing _ -> 3";
+                   f p = case p of\n    MkPair (Just _) (Just _) -> 1\n    MkPair (Just _) Nothing -> 2\n    MkPair Nothing _ -> 3";
         let d = run(src);
         assert!(d.is_empty(), "expected exhaustive, got {d:?}");
     }
@@ -501,7 +501,7 @@ mod tests {
     fn nested_bool_in_adt() {
         // ctor の引数が Bool だが True しか書いてない → 漏れ検出
         let src = "type Wrap = MkWrap Bool\n\
-                   f w = case w of | MkWrap True -> 1";
+                   f w = case w of\n    MkWrap True -> 1";
         let d = run(src);
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(d[0].message().contains("False"), "{}", d[0].message());
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn cons_head_bool_missing() {
-        let src = "f xs = case xs of | [] -> 0 | True :: _ -> 1";
+        let src = "f xs = case xs of\n    [] -> 0\n    True :: _ -> 1";
         let d = run(src);
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(d[0].message().contains("False"), "{}", d[0].message());
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn nested_walks_into_lambda_and_let() {
-        let src = "f x = \\y -> case y of | True -> 1";
+        let src = "f x = \\y -> case y of\n    True -> 1";
         let d = run(src);
         assert_eq!(d.len(), 1);
     }
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn fixed_length_list_pattern_missing_empty() {
         // [a, b] は cons cons nil に展開される。空リスト [] と 1 要素 [_] が漏れる
-        let src = "f xs = case xs of | [a, b] -> a";
+        let src = "f xs = case xs of\n    [a, b] -> a";
         let d = run(src);
         assert_eq!(d.len(), 1, "{d:?}");
     }

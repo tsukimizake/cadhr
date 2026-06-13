@@ -11,6 +11,13 @@ use crate::syntax::ast::*;
 
 const INDENT: &str = "    ";
 
+/// 指定数の半角スペースを push する (layout 出力のインデント用)。
+fn push_indent(n: usize, buf: &mut String) {
+    for _ in 0..n {
+        buf.push(' ');
+    }
+}
+
 pub fn pretty_module(m: &Module) -> String {
     let mut buf = String::new();
     if let Some(h) = &m.header {
@@ -104,7 +111,7 @@ fn pretty_decl(d: &Decl, buf: &mut String) {
             }
             buf.push_str(" =\n");
             buf.push_str(INDENT);
-            pretty_expr(&v.body, buf);
+            pretty_expr(&v.body, INDENT.len(), buf);
         }
         Decl::Type(t) => {
             buf.push_str("type ");
@@ -138,7 +145,7 @@ fn pretty_decl(d: &Decl, buf: &mut String) {
             buf.push_str("slider ");
             buf.push_str(&s.name);
             buf.push_str(" = ");
-            pretty_expr(&s.body, buf);
+            pretty_expr(&s.body, 0, buf);
         }
     }
 }
@@ -212,11 +219,12 @@ fn pretty_type_atom(t: &TypeExpr, buf: &mut String) {
 }
 
 /// 式の pretty。優先度 0 から始める (括弧なし)。
-pub fn pretty_expr(e: &Expr, buf: &mut String) {
-    pretty_expr_prec(e, 0, buf);
+/// `indent` は現在の式が属する行の字下げ列。case / let の継続行はこれを基準に深くする。
+pub fn pretty_expr(e: &Expr, indent: usize, buf: &mut String) {
+    pretty_expr_prec(e, 0, indent, buf);
 }
 
-fn pretty_expr_prec(e: &Expr, prec: u8, buf: &mut String) {
+fn pretty_expr_prec(e: &Expr, prec: u8, indent: usize, buf: &mut String) {
     match e {
         Expr::Var { module, name, .. } => {
             if let Some(m) = module {
@@ -239,7 +247,7 @@ fn pretty_expr_prec(e: &Expr, prec: u8, buf: &mut String) {
                 if i > 0 {
                     buf.push_str(", ");
                 }
-                pretty_expr(item, buf);
+                pretty_expr(item, indent, buf);
             }
             buf.push(']');
         }
@@ -251,13 +259,13 @@ fn pretty_expr_prec(e: &Expr, prec: u8, buf: &mut String) {
                 }
                 buf.push_str(&f.name);
                 buf.push_str(" = ");
-                pretty_expr(&f.value, buf);
+                pretty_expr(&f.value, indent, buf);
             }
             buf.push_str(" }");
         }
         Expr::RecordUpdate { base, updates, .. } => {
             buf.push_str("{ ");
-            pretty_expr(base, buf);
+            pretty_expr(base, indent, buf);
             buf.push_str(" | ");
             for (i, f) in updates.iter().enumerate() {
                 if i > 0 {
@@ -265,12 +273,12 @@ fn pretty_expr_prec(e: &Expr, prec: u8, buf: &mut String) {
                 }
                 buf.push_str(&f.name);
                 buf.push_str(" = ");
-                pretty_expr(&f.value, buf);
+                pretty_expr(&f.value, indent, buf);
             }
             buf.push_str(" }");
         }
         Expr::Field { receiver, name, .. } => {
-            pretty_expr_prec(receiver, 10, buf);
+            pretty_expr_prec(receiver, 10, indent, buf);
             buf.push('.');
             buf.push_str(name);
         }
@@ -278,9 +286,9 @@ fn pretty_expr_prec(e: &Expr, prec: u8, buf: &mut String) {
             if prec > 8 {
                 buf.push('(');
             }
-            pretty_expr_prec(func, 8, buf);
+            pretty_expr_prec(func, 8, indent, buf);
             buf.push(' ');
-            pretty_expr_prec(arg, 9, buf);
+            pretty_expr_prec(arg, 9, indent, buf);
             if prec > 8 {
                 buf.push(')');
             }
@@ -297,7 +305,7 @@ fn pretty_expr_prec(e: &Expr, prec: u8, buf: &mut String) {
                 pretty_pattern_atom(p, buf);
             }
             buf.push_str(" -> ");
-            pretty_expr(body, buf);
+            pretty_expr(body, indent, buf);
             if prec > 0 {
                 buf.push(')');
             }
@@ -306,21 +314,24 @@ fn pretty_expr_prec(e: &Expr, prec: u8, buf: &mut String) {
             if prec > 0 {
                 buf.push('(');
             }
-            buf.push_str("let ");
-            for (i, b) in bindings.iter().enumerate() {
-                if i > 0 {
-                    buf.push_str(", ");
-                }
+            // Elm 流の複数行 let。binding は indent+4、`in` と body は indent に揃える。
+            buf.push_str("let");
+            for b in bindings {
+                buf.push('\n');
+                push_indent(indent + 4, buf);
                 buf.push_str(&b.name);
                 for p in &b.params {
                     buf.push(' ');
                     pretty_pattern_atom(p, buf);
                 }
                 buf.push_str(" = ");
-                pretty_expr(&b.body, buf);
+                pretty_expr(&b.body, indent + 4, buf);
             }
-            buf.push_str(" in ");
-            pretty_expr(body, buf);
+            buf.push('\n');
+            push_indent(indent, buf);
+            buf.push_str("in\n");
+            push_indent(indent, buf);
+            pretty_expr(body, indent, buf);
             if prec > 0 {
                 buf.push(')');
             }
@@ -335,11 +346,11 @@ fn pretty_expr_prec(e: &Expr, prec: u8, buf: &mut String) {
                 buf.push('(');
             }
             buf.push_str("if ");
-            pretty_expr(cond, buf);
+            pretty_expr(cond, indent, buf);
             buf.push_str(" then ");
-            pretty_expr(then_branch, buf);
+            pretty_expr(then_branch, indent, buf);
             buf.push_str(" else ");
-            pretty_expr(else_branch, buf);
+            pretty_expr(else_branch, indent, buf);
             if prec > 0 {
                 buf.push(')');
             }
@@ -350,14 +361,20 @@ fn pretty_expr_prec(e: &Expr, prec: u8, buf: &mut String) {
             if prec > 0 {
                 buf.push('(');
             }
+            // Elm 流の複数行 case。arm の pattern は indent+4、body は次行 indent+8。
             buf.push_str("case ");
-            pretty_expr(scrutinee, buf);
+            pretty_expr(scrutinee, indent, buf);
             buf.push_str(" of");
-            for arm in arms {
-                buf.push_str(" | ");
+            for (i, arm) in arms.iter().enumerate() {
+                buf.push('\n');
+                if i > 0 {
+                    buf.push('\n'); // arm 間に空行 (Elm スタイル)
+                }
+                push_indent(indent + 4, buf);
                 pretty_pattern(&arm.pattern, buf);
-                buf.push_str(" -> ");
-                pretty_expr(&arm.body, buf);
+                buf.push_str(" ->\n");
+                push_indent(indent + 8, buf);
+                pretty_expr(&arm.body, indent + 8, buf);
             }
             if prec > 0 {
                 buf.push(')');
@@ -371,23 +388,23 @@ fn pretty_expr_prec(e: &Expr, prec: u8, buf: &mut String) {
             if needs_paren {
                 buf.push('(');
             }
-            pretty_expr_prec(left, op_prec, buf);
+            pretty_expr_prec(left, op_prec, indent, buf);
             buf.push(' ');
             buf.push_str(op_str);
             buf.push(' ');
-            pretty_expr_prec(right, op_prec + 1, buf);
+            pretty_expr_prec(right, op_prec + 1, indent, buf);
             if needs_paren {
                 buf.push(')');
             }
         }
         Expr::Negate(inner, _) => {
             buf.push('-');
-            pretty_expr_prec(inner, 10, buf);
+            pretty_expr_prec(inner, 10, indent, buf);
         }
         Expr::Range { lo, hi, .. } => {
-            pretty_expr_prec(lo, 5, buf);
+            pretty_expr_prec(lo, 5, indent, buf);
             buf.push_str(" .. ");
-            pretty_expr_prec(hi, 5, buf);
+            pretty_expr_prec(hi, 5, indent, buf);
         }
         Expr::Error(_) => buf.push_str("<error>"),
     }
@@ -590,7 +607,7 @@ mod tests {
 
     #[test]
     fn rt_case() {
-        round_trip("f s = case s of | Cube x y z -> x | Sphere r -> r");
+        round_trip("f s = case s of\n    Cube x y z -> x\n    Sphere r -> r");
     }
 
     #[test]
@@ -615,7 +632,7 @@ mod tests {
 
     #[test]
     fn rt_cons_pattern() {
-        round_trip("f xs = case xs of | x :: rest -> x | [] -> 0");
+        round_trip("f xs = case xs of\n    x :: rest -> x\n    [] -> 0");
     }
 
     #[test]

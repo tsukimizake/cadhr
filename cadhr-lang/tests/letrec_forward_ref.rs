@@ -14,8 +14,8 @@ fn main_forward_refs_recursive_function() {
         get : Int -> List Int -> Int\n\
         get n xs =\n\
         \x20   case xs of\n\
-        \x20       | [] -> 0\n\
-        \x20       | x :: rest -> if n == 0 then x else get (n - 1) rest\n";
+        \x20       [] -> 0\n\
+        \x20       x :: rest -> if n == 0 then x else get (n - 1) rest\n";
     let prog = compile(src).expect("compile");
     assert!(
         prog.diagnostics.is_empty(),
@@ -40,8 +40,8 @@ fn main_forward_refs_eager_top_level_value() {
         mapList : (a -> b) -> List a -> List b\n\
         mapList f xs =\n\
         \x20   case xs of\n\
-        \x20       | [] -> []\n\
-        \x20       | x :: rest -> f x :: mapList f rest\n\
+        \x20       [] -> []\n\
+        \x20       x :: rest -> f x :: mapList f rest\n\
         \n\
         shift : Float -> Float -> Shape3D\n\
         shift base h = cube (base + h) 1.0 1.0\n\
@@ -103,15 +103,15 @@ fn signature_less_mutual_recursion_is_typecheckable() {
         \x20   { models = [cube (head_or xs) 1.0 1.0], bom = [], controls = [] }\n\
         \n\
         mapA xs = case xs of\n\
-        \x20   | [] -> []\n\
-        \x20   | x :: rest -> x :: mapB rest\n\
+        \x20   [] -> []\n\
+        \x20   x :: rest -> x :: mapB rest\n\
         mapB xs = case xs of\n\
-        \x20   | [] -> []\n\
-        \x20   | x :: rest -> x :: mapA rest\n\
+        \x20   [] -> []\n\
+        \x20   x :: rest -> x :: mapA rest\n\
         \n\
         head_or xs = case xs of\n\
-        \x20   | [] -> 0.0\n\
-        \x20   | x :: _ -> x\n";
+        \x20   [] -> 0.0\n\
+        \x20   x :: _ -> x\n";
     let prog = compile(src).expect("compile");
     assert!(
         prog.diagnostics.is_empty(),

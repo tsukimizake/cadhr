@@ -44,19 +44,19 @@ fn field_access_on_lambda_param_resolved_later() {
     // `map (\p -> p.x) xs` のラムダ本体を推論する時点では p の型はまだ型変数。
     // 要素型 (Point2D) は list 引数との単一化で後から決まる。フィールドアクセスの
     // 解決を SCC 境界に遅延することで、署名なしでも通るべき (旧: NotARecord)。
-    let src = "\
-map : (a -> b) -> List a -> List b\n\
-map f xs =\n\
-    case xs of\n\
-        | [] -> []\n\
-        | x :: rest -> f x :: map f rest\n\
-\n\
-main =\n\
-    let\n\
-        pts = [p2 1.0 2.0, p2 3.0 4.0]\n\
-        ys = pts |> map (\\p -> p3 p.x p.y 0.0)\n\
-    in\n\
-    { models = [], bom = [], controls = [] }\n";
+    let src = "map : (a -> b) -> List a -> List b
+map f xs =
+    case xs of
+        [] -> []
+        x :: rest -> f x :: map f rest
+
+main =
+    let
+        pts = [p2 1.0 2.0, p2 3.0 4.0]
+        ys = pts |> map (\\p -> p3 p.x p.y 0.0)
+    in
+    { models = [], bom = [], controls = [] }
+";
     let prog = compile(src).expect("compile");
     assert!(
         prog.diagnostics.is_empty(),
@@ -68,19 +68,19 @@ main =\n\
 #[test]
 fn deferred_field_access_still_rejects_missing_field() {
     // 遅延解決しても、解決後に存在しないフィールドはきちんとエラーになること。
-    let src = "\
-map : (a -> b) -> List a -> List b\n\
-map f xs =\n\
-    case xs of\n\
-        | [] -> []\n\
-        | x :: rest -> f x :: map f rest\n\
-\n\
-main =\n\
-    let\n\
-        pts = [p2 1.0 2.0]\n\
-        ys = pts |> map (\\p -> p.z)\n\
-    in\n\
-    { models = [], bom = [], controls = [] }\n";
+    let src = "map : (a -> b) -> List a -> List b
+map f xs =
+    case xs of
+        [] -> []
+        x :: rest -> f x :: map f rest
+
+main =
+    let
+        pts = [p2 1.0 2.0]
+        ys = pts |> map (\\p -> p.z)
+    in
+    { models = [], bom = [], controls = [] }
+";
     let diags = match compile(src) {
         Ok(prog) => prog.diagnostics,
         Err(ds) => ds,

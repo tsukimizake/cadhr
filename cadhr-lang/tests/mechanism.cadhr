@@ -11,18 +11,18 @@ type Gear
 gear_z : Gear -> Float
 gear_z g =
     case g of
-        | Gear _ z _ _ _ _ -> z
+        Gear _ z _ _ _ _ -> z
 
 gear_theta : Gear -> Float
 gear_theta g =
     case g of
-        | Gear _ _ _ _ t _ -> t
+        Gear _ _ _ _ t _ -> t
 
 -- 歯車本体をピッチ円半径の円柱で描画。ローカル原点 = 中心。
 render : Gear -> Shape3D
 render g =
     case g of
-        | Gear m z x y theta th ->
+        Gear m z x y theta th ->
             cylinder (m * z / 2.0) th
                 |> rotate3d (p3 0.0 0.0 theta)
                 |> translate3d (p3 0.0 0.0 0.0) (p3 x y 0.0)

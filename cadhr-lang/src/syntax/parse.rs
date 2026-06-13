@@ -32,11 +32,11 @@ fn dspan(s: SimpleSpan) -> DSpan {
     DSpan::from(s)
 }
 
-/// 改行トークン (0 個以上) を skip する parser。
-/// expression / pattern / type の atom 間で line continuation を許すために使う。
-fn nl<'tokens, 'src: 'tokens>()
+/// top-level 要素間の区切り `BlockSep` (0 個以上) を skip する parser。
+/// layout pass が decl 境界に挿入する。
+fn top_sep<'tokens, 'src: 'tokens>()
 -> impl Parser<'tokens, ParserInput<'tokens, 'src>, (), ParserError<'tokens, 'src>> + Clone {
-    just(Token::Newline).repeated().ignored()
+    just(Token::BlockSep).repeated().ignored()
 }
 
 /// 小文字始まりの識別子を取り出す。
@@ -225,7 +225,8 @@ fn type_expr_parser<'tokens, 'src: 'tokens>()
             }
         });
 
-        // `{ field : Type, ... }` の record 型。フィールド間で改行を許す。
+        // `{ field : Type, ... }` の record 型。括弧内は layout 停止なので改行は透過し、
+        // カンマ区切りのみで扱う。
         let record_field = lower_ident()
             .then_ignore(just(Token::Colon))
             .then(ty.clone())
@@ -234,16 +235,11 @@ fn type_expr_parser<'tokens, 'src: 'tokens>()
                 ty,
                 span: dspan(e.span()),
             });
-        let record = just(Token::LBrace)
-            .ignore_then(nl())
-            .ignore_then(
-                record_field
-                    .separated_by(nl().then(just(Token::Comma)).then(nl()))
-                    .allow_trailing()
-                    .collect::<Vec<_>>(),
-            )
-            .then_ignore(nl())
-            .then_ignore(just(Token::RBrace))
+        let record = record_field
+            .separated_by(just(Token::Comma))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LBrace), just(Token::RBrace))
             .map_with(|fields, e| TypeExpr::Record(fields, dspan(e.span())));
 
         let atom = choice((
@@ -352,16 +348,12 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
 
         let lit = lit_atom().map_with(|l, e| Expr::Lit(l, dspan(e.span())));
 
-        let list = just(Token::LBracket)
-            .ignore_then(nl())
-            .ignore_then(
-                expr.clone()
-                    .separated_by(nl().then(just(Token::Comma)).then(nl()))
-                    .allow_trailing()
-                    .collect::<Vec<_>>(),
-            )
-            .then_ignore(nl())
-            .then_ignore(just(Token::RBracket))
+        let list = expr
+            .clone()
+            .separated_by(just(Token::Comma))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LBracket), just(Token::RBracket))
             .map_with(|items, e| Expr::List(items, dspan(e.span())));
 
         // `{ field = expr, ... }` の record literal。
@@ -377,16 +369,13 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
             });
 
         let record_or_update = just(Token::LBrace)
-            .ignore_then(nl())
             .ignore_then(lower_ident().then_ignore(just(Token::Pipe)).or_not())
-            .then_ignore(nl())
             .then(
                 record_field
-                    .separated_by(nl().then(just(Token::Comma)).then(nl()))
+                    .separated_by(just(Token::Comma))
                     .allow_trailing()
                     .collect::<Vec<_>>(),
             )
-            .then_ignore(nl())
             .then_ignore(just(Token::RBrace))
             .map_with(|(base_name, fields), e| {
                 let span = dspan(e.span());
@@ -404,8 +393,8 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
                 }
             });
 
-        // `let x = e1; y = e2 in body` (セミコロン区切り)。
-        // Elm 純正は indent ベースだが、明示セミコロンを許容して曖昧性を下げる。
+        // `let <bindings> in body`。binding 列は layout pass が BlockOpen/BlockSep/BlockClose で
+        // 区切る (Elm 流のインデント整列)。
         let value_binding = lower_ident()
             .then(pat.clone().repeated().collect::<Vec<_>>())
             .then_ignore(just(Token::Eq))
@@ -417,21 +406,17 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
                 span: dspan(e.span()),
             });
         let let_expr = just(Token::Let)
-            .ignore_then(nl())
+            .ignore_then(just(Token::BlockOpen))
             .ignore_then(
                 value_binding
                     .clone()
-                    .separated_by(
-                        just(Token::Comma)
-                            .or(just(Token::Pipe))
-                            .or(just(Token::Newline)),
-                    )
+                    .separated_by(just(Token::BlockSep))
+                    .allow_trailing()
                     .at_least(1)
                     .collect::<Vec<_>>(),
             )
-            .then_ignore(nl())
+            .then_ignore(just(Token::BlockClose))
             .then_ignore(just(Token::In))
-            .then_ignore(nl())
             .then(expr.clone())
             .map_with(|(bindings, body), e| Expr::Let {
                 bindings,
@@ -440,15 +425,12 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
             });
 
         // `if cond then a else b`
-        // then-branch / else-branch を次行に書ける (`then`/`else` の前後の改行を許す)。
+        // 各分岐を次行に書く場合、layout pass が継続行 (深い字下げ) として透過する。
         let if_expr = just(Token::If)
             .ignore_then(expr.clone())
             .then_ignore(just(Token::Then))
-            .then_ignore(nl())
             .then(expr.clone())
-            .then_ignore(nl())
             .then_ignore(just(Token::Else))
-            .then_ignore(nl())
             .then(expr.clone())
             .map_with(|((cond, then_b), else_b), e| Expr::If {
                 cond: Box::new(cond),
@@ -457,12 +439,11 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
                 span: dspan(e.span()),
             });
 
-        // `case scrutinee of | pat -> body | pat -> body ...`
-        // セパレータは `|` を使う (Elm はインデントベースだが、明示記号で曖昧性を下げる)。
+        // `case scrutinee of` の後、arm をインデント整列で並べる (Elm 流, 先頭 `|` 無し)。
+        // arm 列は layout pass が BlockOpen/BlockSep/BlockClose で区切る。
         let case_arm = pat
             .clone()
             .then_ignore(just(Token::Arrow))
-            .then_ignore(nl())
             .then(expr.clone())
             .map_with(|(pattern, body), e| CaseArm {
                 pattern,
@@ -470,39 +451,29 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
                 body,
                 span: dspan(e.span()),
             });
-        // arm 列の間に改行を許す。`case s of\n  | A -> 1\n  | B -> 2` のような
-        // Elm スタイルの記述ができるようにする。
         let case_expr = just(Token::Case)
             .ignore_then(expr.clone())
             .then_ignore(just(Token::Of))
-            .then_ignore(nl())
+            .then_ignore(just(Token::BlockOpen))
             .then(
-                just(Token::Pipe)
-                    .or_not()
-                    .ignore_then(case_arm.clone())
-                    .then(
-                        nl().then(just(Token::Pipe))
-                            .ignore_then(case_arm.clone())
-                            .repeated()
-                            .collect::<Vec<_>>(),
-                    )
-                    .map(|(first, rest)| {
-                        let mut arms = vec![first];
-                        arms.extend(rest);
-                        arms
-                    }),
+                case_arm
+                    .clone()
+                    .separated_by(just(Token::BlockSep))
+                    .allow_trailing()
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
             )
+            .then_ignore(just(Token::BlockClose))
             .map_with(|(scrutinee, arms), e| Expr::Case {
                 scrutinee: Box::new(scrutinee),
                 arms,
                 span: dspan(e.span()),
             });
 
-        // `\x y -> body`
+        // `\x y -> body` (`->` の後で改行した場合 layout pass が継続行として透過する)
         let lambda = just(Token::BackSlash)
             .ignore_then(pat.clone().repeated().at_least(1).collect::<Vec<_>>())
             .then_ignore(just(Token::Arrow))
-            .then_ignore(nl())
             .then(expr.clone())
             .map_with(|(params, body), e| Expr::Lambda {
                 params,
@@ -559,191 +530,123 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
         // 低い順: || (2), && (3), 比較 (4), :: ++ (5), + - (6), * / (7),
         //         関数合成 << >> (9), パイプ <| |> (0/負)
         // Range `a..b` は最も低い優先度の演算子として扱う。
-        // 二項演算子は手前に改行を許す: `cube .. \n  |> rotate3d ..` のような
-        // 複数行 pipe チェーンが書けるようにする。
+        // 複数行 pipe チェーン (`cube ..\n  |> rotate3d ..`) は、継続行が深い字下げのとき
+        // layout pass が改行を透過する (区切りを挿入しない) ことで成立する。
         app.pratt((
-            infix(
-                left(0),
-                nl().ignore_then(just(Token::PipeFwd)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::ApplyR,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                right(0),
-                nl().ignore_then(just(Token::PipeBwd)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::ApplyL,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                left(2),
-                nl().ignore_then(just(Token::OrOr)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::Or,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                left(3),
-                nl().ignore_then(just(Token::AndAnd)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::And,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                left(4),
-                nl().ignore_then(just(Token::EqEq)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::Eq,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                left(4),
-                nl().ignore_then(just(Token::NotEq)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::NotEq,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(left(4), nl().ignore_then(just(Token::Lt)), |l, _, r, e| {
-                Expr::BinOp {
-                    op: BinOp::Lt,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                }
+            infix(left(0), just(Token::PipeFwd), |l, _, r, e| Expr::BinOp {
+                op: BinOp::ApplyR,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
             }),
-            infix(left(4), nl().ignore_then(just(Token::Le)), |l, _, r, e| {
-                Expr::BinOp {
-                    op: BinOp::Le,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                }
+            infix(right(0), just(Token::PipeBwd), |l, _, r, e| Expr::BinOp {
+                op: BinOp::ApplyL,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
             }),
-            infix(left(4), nl().ignore_then(just(Token::Gt)), |l, _, r, e| {
-                Expr::BinOp {
-                    op: BinOp::Gt,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                }
+            infix(left(2), just(Token::OrOr), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Or,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
             }),
-            infix(left(4), nl().ignore_then(just(Token::Ge)), |l, _, r, e| {
-                Expr::BinOp {
-                    op: BinOp::Ge,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                }
+            infix(left(3), just(Token::AndAnd), |l, _, r, e| Expr::BinOp {
+                op: BinOp::And,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
             }),
-            infix(
-                right(5),
-                nl().ignore_then(just(Token::Cons)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::Cons,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                right(5),
-                nl().ignore_then(just(Token::PlusPlus)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::Append,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                left(6),
-                nl().ignore_then(just(Token::Plus)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::Add,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                left(6),
-                nl().ignore_then(just(Token::Minus)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::Sub,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                left(7),
-                nl().ignore_then(just(Token::Star)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::Mul,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                left(7),
-                nl().ignore_then(just(Token::Slash)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::Div,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                right(9),
-                nl().ignore_then(just(Token::Compose)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::Compose,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
-            infix(
-                right(9),
-                nl().ignore_then(just(Token::ComposeR)),
-                |l, _, r, e| Expr::BinOp {
-                    op: BinOp::ComposeR,
-                    left: Box::new(l),
-                    right: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
+            infix(left(4), just(Token::EqEq), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Eq,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(left(4), just(Token::NotEq), |l, _, r, e| Expr::BinOp {
+                op: BinOp::NotEq,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(left(4), just(Token::Lt), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Lt,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(left(4), just(Token::Le), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Le,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(left(4), just(Token::Gt), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Gt,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(left(4), just(Token::Ge), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Ge,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(right(5), just(Token::Cons), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Cons,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(right(5), just(Token::PlusPlus), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Append,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(left(6), just(Token::Plus), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Add,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(left(6), just(Token::Minus), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Sub,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(left(7), just(Token::Star), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Mul,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(left(7), just(Token::Slash), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Div,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(right(9), just(Token::Compose), |l, _, r, e| Expr::BinOp {
+                op: BinOp::Compose,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
+            infix(right(9), just(Token::ComposeR), |l, _, r, e| Expr::BinOp {
+                op: BinOp::ComposeR,
+                left: Box::new(l),
+                right: Box::new(r),
+                span: dspan(e.span()),
+            }),
             // Range `lo..hi` は最も低い優先度。
-            infix(
-                left(1),
-                nl().ignore_then(just(Token::DotDot)),
-                |l, _, r, e| Expr::Range {
-                    lo: Box::new(l),
-                    hi: Box::new(r),
-                    span: dspan(e.span()),
-                },
-            ),
+            infix(left(1), just(Token::DotDot), |l, _, r, e| Expr::Range {
+                lo: Box::new(l),
+                hi: Box::new(r),
+                span: dspan(e.span()),
+            }),
         ))
     })
 }
@@ -770,11 +673,10 @@ pub fn decl_parser<'tokens, 'src: 'tokens>()
         });
 
     // `name pat... = body` の value 宣言。signature と区別するため `=` の存在で確定。
-    // `=` の直後で改行を許可する (Elm 流の複数行 body)。
+    // `=` の直後で改行した body は layout pass が継続行として透過する (Elm 流の複数行 body)。
     let value = lower_ident()
         .then(pat.clone().repeated().collect::<Vec<_>>())
         .then_ignore(just(Token::Eq))
-        .then_ignore(nl())
         .then(expr.clone())
         .map_with(|((name, params), body), e| {
             Decl::Value(ValueDecl {
@@ -788,13 +690,11 @@ pub fn decl_parser<'tokens, 'src: 'tokens>()
     // `type T a b = C1 a | C2 b`
     // constructor の引数は **atomic** な type expr のみ (パイプ `|` で次の constructor に
     // 進めるよう、空白区切りの繰り返しで type_expr を全部食べないようにする)。
-    // `=` の直後と `|` の直前後で改行を許容する。
+    // 複数行の `= C1\n | C2` は継続行 (深い字下げ) として layout pass が改行を透過する。
     let type_decl = just(Token::Type)
         .ignore_then(upper_ident())
         .then(lower_ident().repeated().collect::<Vec<_>>())
-        .then_ignore(nl())
         .then_ignore(just(Token::Eq))
-        .then_ignore(nl())
         .then({
             let ctor = upper_ident()
                 .then(type_atom_parser().repeated().collect::<Vec<_>>())
@@ -803,7 +703,7 @@ pub fn decl_parser<'tokens, 'src: 'tokens>()
                     args,
                     span: dspan(e.span()),
                 });
-            ctor.separated_by(nl().then(just(Token::Pipe)).then(nl()))
+            ctor.separated_by(just(Token::Pipe))
                 .at_least(1)
                 .collect::<Vec<_>>()
         })
@@ -821,9 +721,7 @@ pub fn decl_parser<'tokens, 'src: 'tokens>()
         .then(just(Token::Alias))
         .ignore_then(upper_ident())
         .then(lower_ident().repeated().collect::<Vec<_>>())
-        .then_ignore(nl())
         .then_ignore(just(Token::Eq))
-        .then_ignore(nl())
         .then(ty.clone())
         .map_with(|((name, params), body), e| {
             Decl::TypeAlias(TypeAliasDecl {
@@ -838,7 +736,6 @@ pub fn decl_parser<'tokens, 'src: 'tokens>()
     let slider = just(Token::Slider)
         .ignore_then(lower_ident())
         .then_ignore(just(Token::Eq))
-        .then_ignore(nl())
         .then(expr.clone())
         .map_with(|(name, body), e| {
             Decl::Slider(SliderDecl {
@@ -924,16 +821,13 @@ fn import_parser<'tokens, 'src: 'tokens>()
 
 pub fn module_parser<'tokens, 'src: 'tokens>()
 -> impl Parser<'tokens, ParserInput<'tokens, 'src>, Module, ParserError<'tokens, 'src>> + Clone {
-    // 各 top-level 要素は前後に Newline を許容する。Newline は decl 境界として
-    // 振る舞うが、ここでは consumed して透過扱いにする (各 decl 自身が「自分の終端
-    // の直前で type_expr / body が greedy にならない」のは、各 decl が自身の構造で
-    // 自然に終わる前提)。decl 間の Newline は明示的に消費しないと、parser が
-    // 「expected EOF」エラーを出す可能性があるため、ここで吸収する。
-    let header = module_header_parser().then_ignore(nl());
-    let import = import_parser().then_ignore(nl());
-    let decl = decl_parser().then_ignore(nl());
+    // top-level 要素の境界は layout pass が `BlockSep` で区切る。各要素の後ろで
+    // `BlockSep` (0 個以上) を吸収する。先頭の余分な `BlockSep` も leading で吸収する。
+    let header = module_header_parser().then_ignore(top_sep());
+    let import = import_parser().then_ignore(top_sep());
+    let decl = decl_parser().then_ignore(top_sep());
 
-    nl().ignore_then(
+    top_sep().ignore_then(
         header
             .or_not()
             .then(import.repeated().collect::<Vec<_>>())
@@ -961,6 +855,7 @@ pub fn parse(src: &str) -> Result<Module, Vec<crate::diagnostic::Diagnostic>> {
                 .collect());
         }
     };
+    let tokens = crate::syntax::layout::apply_layout(src, tokens);
     let eoi: SimpleSpan = (src.len()..src.len()).into();
     let input = tokens[..].split_spanned(eoi);
     match module_parser().parse(input).into_result() {
@@ -1148,7 +1043,7 @@ mod tests {
 
     #[test]
     fn case_expr() {
-        let m = parse_ok("f s = case s of | Cube x y z -> x | Sphere r -> r");
+        let m = parse_ok("f s = case s of\n    Cube x y z -> x\n    Sphere r -> r");
         match &m.decls[0] {
             Decl::Value(v) => match &v.body {
                 Expr::Case { arms, .. } => assert_eq!(arms.len(), 2),
@@ -1217,7 +1112,7 @@ mod tests {
 
     #[test]
     fn cons_pattern() {
-        let m = parse_ok("f xs = case xs of | x :: rest -> x");
+        let m = parse_ok("f xs = case xs of\n    x :: rest -> x");
         match &m.decls[0] {
             Decl::Value(v) => match &v.body {
                 Expr::Case { arms, .. } => {

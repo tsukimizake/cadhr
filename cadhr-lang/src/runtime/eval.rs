@@ -1060,7 +1060,7 @@ mod tests {
     #[test]
     fn eval_case_pattern_match() {
         let src = "type Shape = Cube Float Float Float | Sphere Float\n\
-                   describe s = case s of | Cube _ _ _ -> 1 | Sphere _ -> 2\n\
+                   describe s = case s of\n    Cube _ _ _ -> 1\n    Sphere _ -> 2\n\
                    result = describe (Sphere 5.0)";
         let (env, diag) = eval_src(src);
         assert!(diag.is_empty(), "diag: {diag:?}");
@@ -1076,7 +1076,7 @@ mod tests {
 
     #[test]
     fn eval_list_cons_match() {
-        let src = "head_or xs = case xs of | x :: _ -> x | [] -> 0\n\
+        let src = "head_or xs = case xs of\n    x :: _ -> x\n    [] -> 0\n\
                    r1 = head_or [1, 2, 3]\n\
                    r2 = head_or []";
         let (env, diag) = eval_src(src);

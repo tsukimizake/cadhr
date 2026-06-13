@@ -23,20 +23,19 @@ fn diag_strings(src: &str) -> Vec<String> {
 fn partial_app_in_recursion_should_fail_typecheck() {
     // get の再帰で default 引数を渡し忘れ → if の then 枝が `a`、else 枝が `a -> a`
     // となるべき型不一致。以前は case が型検査されず素通りしていた。
-    let src = "\
-get : Int -> List a -> a -> a\n\
-get index xs default =\n\
-    case xs of\n\
-        | [] ->\n\
-            default\n\
-        | x :: rest ->\n\
-            if index == 0 then\n\
-                x\n\
-            else\n\
-                get (index - 1) rest\n\
-\n\
-main =\n\
-    { models = [cube 1.0 1.0 1.0], bom = [], controls = [] }\n\
+    let src = "get : Int -> List a -> a -> a
+get index xs default =
+    case xs of
+        [] ->
+            default
+        x :: rest ->
+            if index == 0 then
+                x
+            else
+                get (index - 1) rest
+
+main =
+    { models = [cube 1.0 1.0 1.0], bom = [], controls = [] }
 ";
     let diags = diag_strings(src);
     assert!(
@@ -48,13 +47,12 @@ main =\n\
 #[test]
 fn nonrec_if_branch_mismatch_should_fail() {
     // 関数本体直下の if の分岐型不一致は元々検出されていた (回帰防止)。
-    let src = "\
-f : Int -> Int -> Int\n\
-f a b =\n\
-    if a == 0 then b else f\n\
-\n\
-main =\n\
-    { models = [cube 1.0 1.0 1.0], bom = [], controls = [] }\n\
+    let src = "f : Int -> Int -> Int
+f a b =
+    if a == 0 then b else f
+
+main =
+    { models = [cube 1.0 1.0 1.0], bom = [], controls = [] }
 ";
     let diags = diag_strings(src);
     assert!(!diags.is_empty(), "if 分岐の型不一致で型エラーが出るべき");
@@ -63,15 +61,14 @@ main =\n\
 #[test]
 fn case_branch_mismatch_should_fail() {
     // case の各アーム本体型の不一致が検出されること。
-    let src = "\
-g : Int -> Int\n\
-g n =\n\
-    case n of\n\
-        | 0 -> 1\n\
-        | _ -> g\n\
-\n\
-main =\n\
-    { models = [cube 1.0 1.0 1.0], bom = [], controls = [] }\n\
+    let src = "g : Int -> Int
+g n =
+    case n of
+        0 -> 1
+        _ -> g
+
+main =
+    { models = [cube 1.0 1.0 1.0], bom = [], controls = [] }
 ";
     let diags = diag_strings(src);
     assert!(!diags.is_empty(), "case 分岐の型不一致で型エラーが出るべき");
@@ -81,21 +78,20 @@ main =\n\
 fn list_get_with_int_arithmetic_typechecks() {
     // Num a => a -> a -> a 化により Int の `-` も通る。
     // (以前は Sub が Float 固定だったため `index - 1` でエラーになっていた。)
-    let src = "\
-get : Int -> List a -> a -> a\n\
-get index xs default =\n\
-    case xs of\n\
-        | [] ->\n\
-            default\n\
-        | x :: rest ->\n\
-            if index == 0 then\n\
-                x\n\
-            else\n\
-                get (index - 1) rest default\n\
-\n\
-main =\n\
-    let v = get 1 [10, 20, 30] 0 in\n\
-    { models = [cube (fromInt v) 1.0 1.0], bom = [], controls = [] }\n\
+    let src = "get : Int -> List a -> a -> a
+get index xs default =
+    case xs of
+        [] ->
+            default
+        x :: rest ->
+            if index == 0 then
+                x
+            else
+                get (index - 1) rest default
+
+main =
+    let v = get 1 [10, 20, 30] 0 in
+    { models = [cube (fromInt v) 1.0 1.0], bom = [], controls = [] }
 ";
     let diags = diag_strings(src);
     assert!(diags.is_empty(), "正しい get は通るべき: {diags:?}");
@@ -104,10 +100,9 @@ main =\n\
 #[test]
 fn float_arithmetic_still_works() {
     // Float でも従来通り動くこと。
-    let src = "\
-main =\n\
-    let v = 1.5 + 2.5 in\n\
-    { models = [cube v 1.0 1.0], bom = [], controls = [] }\n\
+    let src = "main =
+    let v = 1.5 + 2.5 in
+    { models = [cube v 1.0 1.0], bom = [], controls = [] }
 ";
     let diags = diag_strings(src);
     assert!(diags.is_empty(), "Float arithmetic は通るべき: {diags:?}");
@@ -116,10 +111,9 @@ main =\n\
 #[test]
 fn num_class_rejects_string() {
     // `Num String` は無いのでエラーになる。
-    let src = "\
-main =\n\
-    let v = \"a\" + \"b\" in\n\
-    { models = [cube 1.0 1.0 1.0], bom = [], controls = [] }\n\
+    let src = "main =
+    let v = \"a\" + \"b\" in
+    { models = [cube 1.0 1.0 1.0], bom = [], controls = [] }
 ";
     let diags = diag_strings(src);
     assert!(

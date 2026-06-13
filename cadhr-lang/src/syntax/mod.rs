@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod free_vars;
+pub mod layout;
 pub mod lex;
 pub mod parse;
 pub mod pretty;
