@@ -1,16 +1,26 @@
-//! Algorithm W ベースの HM 型推論。
+//! Algorithm J ベースの HM 型推論。
 //!
-//! 各 AST node に対して `infer_expr` で「推論結果型 + 累積置換」を返す。最終的に
-//! トップレベル decl の集合に対して `infer_module` を呼び、各値定義の型を確定する。
+//! 型変数は [`crate::sema::infer_ty`] の `Rc<RefCell>` 共有セルで表し、単一化は
+//! セルを破壊的に書き換える。よって `infer_expr` は型 (`InferTy`) のみを返し、
+//! 置換 (`Subst`) を引き回さない。これにより「env / pending に置換を適用し忘れる」
+//! 系統のバグが構造的に発生しない。
 //!
-//! 多相は rank-1 (let-polymorphism + シグネチャ全称量化)。シグネチャ宣言と value
-//! decl の name 一致で型を紐付ける。
+//! 多相は rank-1 (let-polymorphism + シグネチャ全称量化)。generalize は Rémy の
+//! level 方式: 各未束縛変数の生成深さ (`level`) を持ち、`level > 現在深さ` の変数を
+//! 全称化する。
+//!
+//! 公開 API (`infer_unit` / `infer_module`) は immutable な `Scheme` を返す
+//! (`CompiledProgram` に載せてスレッド境界を越えるため)。`InferTy` ↔ `Type` の変換は
+//! `instantiate` / `generalize` / 結果構築の境界でのみ行う。
 
 use crate::diagnostic::{Diagnostic, Span};
 use crate::sema::builtin::BuiltinRegistry;
 use crate::sema::class::{ClassCheck, ClassRegistry, Constraint};
 use crate::sema::env::TypeEnv;
-use crate::sema::subst::{Subst, UnifyError, unify};
+use crate::sema::infer_ty::{
+    InferConstraint, InferScheme, InferTy, TyRef, UnifyError, VarCell, new_generic, new_unbound,
+    resolve, to_type_raw, unify, zonk,
+};
 use crate::sema::ty::{Scheme, TyVar, TyVarGen, Type};
 use crate::syntax::ast::*;
 use crate::syntax::free_vars::value_decl_free_names;
@@ -19,11 +29,13 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Default)]
 pub struct Infer {
     pub var_gen: TyVarGen,
-    /// シグネチャ宣言 (`f : T`) から得られた scheme。後続の value decl で参照する。
+    /// 現在の let ネスト深さ。fresh 変数の level / generalize 判定に使う。
+    pub current_level: u32,
+    /// シグネチャ宣言 (`f : T`) の immutable scheme。結果スキームとしても使う。
     pub signatures: HashMap<String, Scheme>,
     /// type alias 宣言。typecheck 時に展開する。
     pub aliases: HashMap<String, TypeAliasDecl>,
-    /// ADT 型宣言。コンストラクタ → 関数型を引く。
+    /// ADT 型宣言。コンストラクタ → 関数型を引く (immutable scheme)。
     pub ctor_types: HashMap<String, Scheme>,
     /// record type alias の field マップ (record literal / update / field access で参照)。
     pub record_aliases: HashMap<String, Vec<(String, Type)>>,
@@ -32,13 +44,40 @@ pub struct Infer {
     /// 推論中に蓄積した未解決制約。SCC / decl 単位で `solve_constraints` を
     /// 呼んで解消する。span は診断用。
     pub pending: Vec<PendingConstraint>,
+    /// 受け手の型がまだ型変数だったフィールドアクセス。SCC 境界で型が確定した後に
+    /// 実フィールド型と result を unify する。
+    pub pending_fields: Vec<FieldObligation>,
 }
 
 #[derive(Clone, Debug)]
 pub struct PendingConstraint {
-    pub constraint: Constraint,
+    pub constraint: InferConstraint,
     pub span: Span,
     pub context: String,
+}
+
+/// 「receiver の field を取った結果が result 型」という遅延フィールドアクセス。
+#[derive(Clone, Debug)]
+pub struct FieldObligation {
+    pub receiver: InferTy,
+    pub field: String,
+    pub result: InferTy,
+    pub span: Span,
+}
+
+/// `lookup_field` の結果。
+enum FieldLookup {
+    Found(InferTy),
+    NoField,
+    NoFieldAlias(String),
+    Unresolved,
+    NotRecord,
+}
+
+/// 型変数セルの種別 (制約の generalize 判定に使う)。
+enum CellKind {
+    Unbound,
+    Generic(u32),
 }
 
 impl Infer {
@@ -49,60 +88,336 @@ impl Infer {
         }
     }
 
-    /// fresh な単型変数を生成。
-    pub fn fresh(&mut self) -> Type {
-        Type::Var(self.var_gen.fresh())
+    /// 現在 level の fresh 単型変数を生成。
+    pub fn fresh(&mut self) -> InferTy {
+        InferTy::Var(new_unbound(self.var_gen.fresh().0, self.current_level))
     }
 
-    /// Scheme を fresh 変数で instantiate する。`forall a b. a -> b` → `t0 -> t1`。
-    /// 制約付き scheme の場合は、制約を rename して pending に積む。span/context は
-    /// 「呼び出し元のどこで使われたか」を載せる。
-    pub fn instantiate(&mut self, sc: &Scheme) -> Type {
-        self.instantiate_with(sc, Span { start: 0, end: 0 }, "")
+    pub fn enter_level(&mut self) {
+        self.current_level += 1;
     }
 
-    pub fn instantiate_with(&mut self, sc: &Scheme, span: Span, context: &str) -> Type {
-        let mut s = Subst::empty();
-        for v in &sc.vars {
-            let fresh = self.fresh();
-            s.insert(*v, fresh);
-        }
+    pub fn exit_level(&mut self) {
+        self.current_level -= 1;
+    }
+
+    /// `InferScheme` を fresh 変数で instantiate する。Generic セルだけを fresh な
+    /// 未束縛セルへ置き換え、自由変数 (Unbound) は共有のまま残す。制約は rename して
+    /// pending に積む。
+    pub fn instantiate_with(&mut self, sc: &InferScheme, span: Span, context: &str) -> InferTy {
+        let mut map: HashMap<u32, TyRef> = HashMap::new();
+        let ty = self.inst_walk(&sc.ty, &mut map);
         for c in &sc.constraints {
-            let mapped = s.apply_constraint(c);
+            let cty = self.inst_walk(&c.ty, &mut map);
             self.pending.push(PendingConstraint {
-                constraint: mapped,
+                constraint: InferConstraint {
+                    class_name: c.class_name.clone(),
+                    ty: cty,
+                },
                 span,
                 context: context.to_string(),
             });
         }
-        s.apply(&sc.ty)
+        ty
     }
 
-    /// pending の各制約に subst を適用する。
-    pub fn apply_subst_to_pending(&mut self, subst: &Subst) {
-        for p in &mut self.pending {
-            p.constraint = subst.apply_constraint(&p.constraint);
+    fn inst_walk(&mut self, t: &InferTy, map: &mut HashMap<u32, TyRef>) -> InferTy {
+        match resolve(t) {
+            InferTy::Var(cell) => {
+                let gid = match &*cell.borrow() {
+                    VarCell::Generic(id) => Some(*id),
+                    _ => None,
+                };
+                match gid {
+                    Some(id) => {
+                        if let Some(c) = map.get(&id) {
+                            return InferTy::Var(c.clone());
+                        }
+                        let nc = new_unbound(self.var_gen.fresh().0, self.current_level);
+                        map.insert(id, nc.clone());
+                        InferTy::Var(nc)
+                    }
+                    None => InferTy::Var(cell),
+                }
+            }
+            InferTy::Con(n, args) => {
+                InferTy::Con(n, args.iter().map(|a| self.inst_walk(a, map)).collect())
+            }
+            InferTy::Arrow(f, to) => {
+                InferTy::arrow(self.inst_walk(&f, map), self.inst_walk(&to, map))
+            }
+            InferTy::Record(fs) => InferTy::Record(
+                fs.iter()
+                    .map(|(n, t)| (n.clone(), self.inst_walk(t, map)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// 型 ty の generalize: `level > current_level` の未束縛変数を Generic 化して
+    /// 全称化する。pending のうち、generalize 対象の変数だけで構成される制約を
+    /// scheme.constraints へ「持ち上げ」、それ以外は pending に残す。
+    pub fn generalize(&mut self, ty: &InferTy) -> InferScheme {
+        let ty = zonk(ty);
+        let mut vars: Vec<u32> = Vec::new();
+        self.gen_walk(&ty, &mut vars);
+        let var_set: HashSet<u32> = vars.iter().copied().collect();
+
+        let mut lifted: Vec<InferConstraint> = Vec::new();
+        let mut keep: Vec<PendingConstraint> = Vec::new();
+        for p in std::mem::take(&mut self.pending) {
+            match self.try_lift(&p, &var_set) {
+                Some(c) => lifted.push(c),
+                None => keep.push(p),
+            }
+        }
+        self.pending = keep;
+        InferScheme {
+            vars,
+            constraints: lifted,
+            ty,
+        }
+    }
+
+    /// 全称化対象の未束縛変数を Generic セルへ書き換えつつ id を集める。
+    fn gen_walk(&mut self, t: &InferTy, vars: &mut Vec<u32>) {
+        let rt = resolve(t);
+        match &rt {
+            InferTy::Var(cell) => {
+                enum Act {
+                    Generalize(u32),
+                    Already(u32),
+                    No,
+                }
+                let act = match &*cell.borrow() {
+                    VarCell::Unbound { id, level } => {
+                        if *level > self.current_level {
+                            Act::Generalize(*id)
+                        } else {
+                            Act::No
+                        }
+                    }
+                    VarCell::Generic(id) => Act::Already(*id),
+                    VarCell::Link(_) => Act::No,
+                };
+                match act {
+                    Act::Generalize(id) => {
+                        *cell.borrow_mut() = VarCell::Generic(id);
+                        if !vars.contains(&id) {
+                            vars.push(id);
+                        }
+                    }
+                    Act::Already(id) => {
+                        if !vars.contains(&id) {
+                            vars.push(id);
+                        }
+                    }
+                    Act::No => {}
+                }
+            }
+            InferTy::Con(_, args) => {
+                for a in args {
+                    self.gen_walk(a, vars);
+                }
+            }
+            InferTy::Arrow(f, to) => {
+                self.gen_walk(f, vars);
+                self.gen_walk(to, vars);
+            }
+            InferTy::Record(fs) => {
+                for (_, t) in fs {
+                    self.gen_walk(t, vars);
+                }
+            }
+        }
+    }
+
+    /// 制約が「全称化対象の変数だけ」で構成されるなら scheme に持ち上げる。
+    /// 自由変数 (Unbound) を含む / 対象外の Generic を含む / 変数を全く含まない場合は
+    /// 持ち上げず pending に残す (具体型制約は finalize_pending で判定)。
+    fn try_lift(&self, p: &PendingConstraint, var_set: &HashSet<u32>) -> Option<InferConstraint> {
+        let zc = zonk(&p.constraint.ty);
+        let mut kinds = Vec::new();
+        cell_kinds(&zc, &mut kinds);
+        if kinds.is_empty() {
+            return None;
+        }
+        let liftable = kinds.iter().all(|k| match k {
+            CellKind::Unbound => false,
+            CellKind::Generic(id) => var_set.contains(id),
+        });
+        if liftable {
+            Some(InferConstraint {
+                class_name: p.constraint.class_name.clone(),
+                ty: zc,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// immutable `Scheme` を推論用 `InferScheme` に変換する (量化変数を Generic セルに)。
+    pub fn scheme_to_infer(&mut self, sc: &Scheme) -> InferScheme {
+        let mut map: HashMap<TyVar, TyRef> = HashMap::new();
+        let mut vars: Vec<u32> = Vec::new();
+        for tv in &sc.vars {
+            let id = self.var_gen.fresh().0;
+            map.insert(*tv, new_generic(id));
+            vars.push(id);
+        }
+        let ty = self.type_to_generic(&sc.ty, &mut map, &mut vars);
+        let constraints = sc
+            .constraints
+            .iter()
+            .map(|c| InferConstraint {
+                class_name: c.class_name.clone(),
+                ty: self.type_to_generic(&c.ty, &mut map, &mut vars),
+            })
+            .collect();
+        InferScheme {
+            vars,
+            constraints,
+            ty,
+        }
+    }
+
+    fn type_to_generic(
+        &mut self,
+        t: &Type,
+        map: &mut HashMap<TyVar, TyRef>,
+        vars: &mut Vec<u32>,
+    ) -> InferTy {
+        match t {
+            Type::Var(tv) => {
+                if let Some(cell) = map.get(tv) {
+                    return InferTy::Var(cell.clone());
+                }
+                let id = self.var_gen.fresh().0;
+                let cell = new_generic(id);
+                map.insert(*tv, cell.clone());
+                vars.push(id);
+                InferTy::Var(cell)
+            }
+            Type::Con(n, args) => InferTy::Con(
+                n.clone(),
+                args.iter()
+                    .map(|a| self.type_to_generic(a, map, vars))
+                    .collect(),
+            ),
+            Type::Arrow(f, to) => InferTy::arrow(
+                self.type_to_generic(f, map, vars),
+                self.type_to_generic(to, map, vars),
+            ),
+            Type::Record(fs) => InferTy::Record(
+                fs.iter()
+                    .map(|(n, t)| (n.clone(), self.type_to_generic(t, map, vars)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// immutable `Type` を fresh な未束縛変数つきの `InferTy` に変換する
+    /// (record alias の field 型を使う場面など、その場で instantiate したいとき)。
+    fn type_to_infer_fresh(&mut self, t: &Type) -> InferTy {
+        let mut map: HashMap<TyVar, TyRef> = HashMap::new();
+        self.type_to_infer_fresh_walk(t, &mut map)
+    }
+
+    fn type_to_infer_fresh_walk(&mut self, t: &Type, map: &mut HashMap<TyVar, TyRef>) -> InferTy {
+        match t {
+            Type::Var(tv) => {
+                if let Some(cell) = map.get(tv) {
+                    return InferTy::Var(cell.clone());
+                }
+                let cell = new_unbound(self.var_gen.fresh().0, self.current_level);
+                map.insert(*tv, cell.clone());
+                InferTy::Var(cell)
+            }
+            Type::Con(n, args) => InferTy::Con(
+                n.clone(),
+                args.iter()
+                    .map(|a| self.type_to_infer_fresh_walk(a, map))
+                    .collect(),
+            ),
+            Type::Arrow(f, to) => InferTy::arrow(
+                self.type_to_infer_fresh_walk(f, map),
+                self.type_to_infer_fresh_walk(to, map),
+            ),
+            Type::Record(fs) => InferTy::Record(
+                fs.iter()
+                    .map(|(n, t)| (n.clone(), self.type_to_infer_fresh_walk(t, map)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// `Type` を `InferTy` に戻す。`map` にある変数 id は元のセルへ復元し
+    /// (`infer_to_type_tracked` と対で使う)、無い id は fresh な未束縛セルにする。
+    /// derived 制約を元の変数と結びつけ直すために使う。
+    fn type_to_infer_via_map(&mut self, t: &Type, map: &HashMap<u32, TyRef>) -> InferTy {
+        match t {
+            Type::Var(tv) => match map.get(&tv.0) {
+                Some(cell) => InferTy::Var(cell.clone()),
+                None => InferTy::Var(new_unbound(self.var_gen.fresh().0, self.current_level)),
+            },
+            Type::Con(n, args) => InferTy::Con(
+                n.clone(),
+                args.iter()
+                    .map(|a| self.type_to_infer_via_map(a, map))
+                    .collect(),
+            ),
+            Type::Arrow(f, to) => InferTy::arrow(
+                self.type_to_infer_via_map(f, map),
+                self.type_to_infer_via_map(to, map),
+            ),
+            Type::Record(fs) => InferTy::Record(
+                fs.iter()
+                    .map(|(n, t)| (n.clone(), self.type_to_infer_via_map(t, map)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// 型 `recv` から field を引いた結果。
+    fn lookup_field(&mut self, recv: &InferTy, field: &str) -> FieldLookup {
+        match resolve(recv) {
+            InferTy::Record(fs) => match fs.iter().find(|(n, _)| n == field) {
+                Some((_, t)) => FieldLookup::Found(t.clone()),
+                None => FieldLookup::NoField,
+            },
+            InferTy::Con(alias, _) => match self.record_aliases.get(&alias).cloned() {
+                Some(fields) => match fields.iter().find(|(n, _)| n == field) {
+                    Some((_, t)) => FieldLookup::Found(self.type_to_infer_fresh(t)),
+                    None => FieldLookup::NoFieldAlias(alias),
+                },
+                None => FieldLookup::NotRecord,
+            },
+            InferTy::Var(_) => FieldLookup::Unresolved,
+            _ => FieldLookup::NotRecord,
         }
     }
 
     /// 全 decl 推論を終えた時点で残った制約を処理する。
-    /// - 具体型に解決された制約 → ClassCheck で Yes/No 判定 (Yes なら derived を解決)。
-    /// - 型変数のまま残った制約 → `AmbiguousConstraint` エラー (Haskell の default
-    ///   のような暗黙フォールバックは行わない: 呼び出し側で型注釈が必要)。
+    /// - 具体型に解決された制約 → ClassCheck で Yes/No 判定 (Yes なら derived を再投入)。
+    /// - 型変数のまま残った制約 → `AmbiguousConstraint` エラー (暗黙 default は無し)。
     pub fn finalize_pending(&mut self, diag: &mut Vec<Diagnostic>) {
-        // 派生制約の連鎖を全部解消するまでループ。1 パスで処理できないのは、
-        // Eq (List Int) → Eq Int のような派生が発生するため。
         loop {
             let pending = std::mem::take(&mut self.pending);
             if pending.is_empty() {
                 return;
             }
             for p in pending {
-                match self.class_registry.check(&p.constraint.class_name, &p.constraint.ty) {
+                let mut map: HashMap<u32, TyRef> = HashMap::new();
+                let zt = infer_to_type_tracked(&p.constraint.ty, &mut map);
+                match self.class_registry.check(&p.constraint.class_name, &zt) {
                     ClassCheck::Yes { derived } => {
                         for d in derived {
+                            let ity = self.type_to_infer_via_map(&d.ty, &map);
                             self.pending.push(PendingConstraint {
-                                constraint: d,
+                                constraint: InferConstraint {
+                                    class_name: d.class_name,
+                                    ty: ity,
+                                },
                                 span: p.span,
                                 context: p.context.clone(),
                             });
@@ -113,7 +428,7 @@ impl Infer {
                             span: p.span,
                             context: p.context.clone(),
                             class_name: p.constraint.class_name.clone(),
-                            ty: format!("{}", p.constraint.ty),
+                            ty: format!("{zt}"),
                         });
                     }
                     ClassCheck::Unknown => {
@@ -125,54 +440,6 @@ impl Infer {
                     }
                 }
             }
-        }
-    }
-
-    /// 環境 env における型 ty の generalize: env 自由でない型変数のみ全称化する。
-    /// `pending` のうち、generalize 対象 var に絡む制約だけを scheme.constraints に
-    /// 「持ち上げ」、それ以外は pending に残す。
-    pub fn generalize(&mut self, env: &TypeEnv, ty: &Type) -> Scheme {
-        let env_free = env.free_vars();
-        let ty_free = ty.free_vars();
-        let vars_set: HashSet<TyVar> = ty_free.difference(&env_free).copied().collect();
-        let mut vars: Vec<TyVar> = vars_set.iter().copied().collect();
-        vars.sort();
-        let mut lifted: Vec<Constraint> = Vec::new();
-        let mut keep: Vec<PendingConstraint> = Vec::new();
-        for p in self.pending.drain(..) {
-            // 制約に出てくる自由変数が「すべて generalize 対象に含まれる」場合
-            // のみ scheme に持ち上げる (env に固定された var が混ざっていれば pending に残す)。
-            let fvs = p.constraint.ty.free_vars();
-            if fvs.is_empty() {
-                // 具体型: ここで判定して終わり
-                match self.class_registry.check(&p.constraint.class_name, &p.constraint.ty) {
-                    ClassCheck::Yes { derived } => {
-                        for d in derived {
-                            keep.push(PendingConstraint {
-                                constraint: d,
-                                span: p.span,
-                                context: p.context.clone(),
-                            });
-                        }
-                    }
-                    ClassCheck::No => {
-                        // 具体型でインスタンスなし → 違反だが、ここでは collect だけ。
-                        // 呼び出し側 (solve) で diag に変換するため pending に戻す。
-                        keep.push(p);
-                    }
-                    ClassCheck::Unknown => unreachable!(),
-                }
-            } else if fvs.iter().all(|v| vars_set.contains(v)) {
-                lifted.push(p.constraint);
-            } else {
-                keep.push(p);
-            }
-        }
-        self.pending = keep;
-        Scheme {
-            vars,
-            constraints: lifted,
-            ty: ty.clone(),
         }
     }
 
@@ -211,7 +478,6 @@ impl Infer {
                         });
                         return Type::con("<error>");
                     }
-                    // alias の params を仮 var に対応させて展開
                     let mut subst_map: HashMap<String, Type> = HashMap::new();
                     for (p, a) in alias.params.iter().zip(args_ty.iter()) {
                         subst_map.insert(p.clone(), a.clone());
@@ -220,8 +486,7 @@ impl Infer {
                     let raw = self.ty_of_type_expr(&alias.body, &mut alias_var_map, diag);
                     return substitute_named(&raw, &subst_map, &alias_var_map);
                 }
-                // Point2D / Point3D は組み込みの構造的 record 型に解決する
-                // (sema::builtin の point2d / point3d と同一形)。
+                // Point2D / Point3D は組み込みの構造的 record 型に解決する。
                 match name.as_str() {
                     "Point2D" => {
                         return Type::Record(vec![
@@ -255,6 +520,80 @@ impl Infer {
     }
 }
 
+/// `InferTy` を `Type` に焼きつつ、各変数の `id → セル` を記録する。
+/// `ClassRegistry::check` (Type ベース) に渡しつつ、derived 制約を元のセルへ
+/// 戻せるようにするため (セル同一性を保たないと偽の AmbiguousConstraint が出る)。
+fn infer_to_type_tracked(t: &InferTy, map: &mut HashMap<u32, TyRef>) -> Type {
+    match resolve(t) {
+        InferTy::Var(cell) => {
+            let id = match &*cell.borrow() {
+                VarCell::Unbound { id, .. } | VarCell::Generic(id) => *id,
+                VarCell::Link(_) => unreachable!("resolve 済み"),
+            };
+            map.insert(id, cell.clone());
+            Type::Var(TyVar(id))
+        }
+        InferTy::Con(n, args) => Type::Con(
+            n,
+            args.iter().map(|a| infer_to_type_tracked(a, map)).collect(),
+        ),
+        InferTy::Arrow(f, to) => Type::arrow(
+            infer_to_type_tracked(&f, map),
+            infer_to_type_tracked(&to, map),
+        ),
+        InferTy::Record(fs) => Type::Record(
+            fs.iter()
+                .map(|(n, t)| (n.clone(), infer_to_type_tracked(t, map)))
+                .collect(),
+        ),
+    }
+}
+
+/// `InferTy` に出現する型変数セルの種別を集める。
+fn cell_kinds(t: &InferTy, out: &mut Vec<CellKind>) {
+    match resolve(t) {
+        InferTy::Var(cell) => match &*cell.borrow() {
+            VarCell::Unbound { .. } => out.push(CellKind::Unbound),
+            VarCell::Generic(id) => out.push(CellKind::Generic(*id)),
+            VarCell::Link(_) => unreachable!("resolve 済み"),
+        },
+        InferTy::Con(_, args) => {
+            for a in &args {
+                cell_kinds(a, out);
+            }
+        }
+        InferTy::Arrow(f, to) => {
+            cell_kinds(&f, out);
+            cell_kinds(&to, out);
+        }
+        InferTy::Record(fs) => {
+            for (_, t) in &fs {
+                cell_kinds(t, out);
+            }
+        }
+    }
+}
+
+/// `InferScheme` (推論用) を immutable `Scheme` (公開用) に焼き付ける。
+/// 結果は top-level / let 束縛の確定型なので閉じている前提。
+fn infer_scheme_to_scheme(isc: &InferScheme) -> Scheme {
+    let ty = to_type_raw(&isc.ty);
+    let constraints = isc
+        .constraints
+        .iter()
+        .map(|c| Constraint {
+            class_name: c.class_name.clone(),
+            ty: to_type_raw(&c.ty),
+        })
+        .collect();
+    let vars = isc.vars.iter().map(|id| TyVar(*id)).collect();
+    Scheme {
+        vars,
+        constraints,
+        ty,
+    }
+}
+
 /// `TypeExpr` の span を取り出す helper。
 fn span_of_type_expr(t: &TypeExpr) -> Span {
     match t {
@@ -265,7 +604,7 @@ fn span_of_type_expr(t: &TypeExpr) -> Span {
     }
 }
 
-/// 仮実装: 名前ベースの type variable を `subst_map` で展開する。
+/// 名前ベースの type variable を `subst_map` で展開する (type alias 展開用)。
 fn substitute_named(
     ty: &Type,
     subst_map: &HashMap<String, Type>,
@@ -273,7 +612,6 @@ fn substitute_named(
 ) -> Type {
     match ty {
         Type::Var(v) => {
-            // var_map 経由で名前を引いて、subst_map から取る
             let name = var_map
                 .iter()
                 .find(|(_, vv)| **vv == *v)
@@ -326,7 +664,6 @@ pub fn infer_unit(
     let mut per_module: HashMap<String, HashMap<String, Scheme>> = HashMap::new();
     let mut all_diag: Vec<Diagnostic> = Vec::new();
 
-    // import 解決時に「公開する local 名 → Scheme」が必要。順を追って構築する。
     let mut module_locals: HashMap<String, HashMap<String, Scheme>> = HashMap::new();
 
     for lm in &unit.modules {
@@ -349,7 +686,8 @@ fn infer_one(
 
     // 1. builtins
     for b in builtins.iter() {
-        env = env.extend(b.name, b.scheme.clone());
+        let isc = infer.scheme_to_infer(&b.scheme);
+        env = env.extend(b.name, isc);
     }
 
     // 2. import 由来の scheme を qualified + (exposing) unqualified で展開
@@ -364,18 +702,21 @@ fn infer_one(
         };
         let prefix = imp.alias.clone().unwrap_or_else(|| imp_qname.clone());
         for (k, sc) in imp_schemes {
-            env = env.extend(&qualify_str(&prefix, k), sc.clone());
+            let isc = infer.scheme_to_infer(sc);
+            env = env.extend(&qualify_str(&prefix, k), isc);
         }
         match &imp.exposing {
             Some(Exposing::All(_)) => {
                 for (k, sc) in imp_schemes {
-                    env = env.extend(k, sc.clone());
+                    let isc = infer.scheme_to_infer(sc);
+                    env = env.extend(k, isc);
                 }
             }
             Some(Exposing::Some(items, _)) => {
                 for item in items {
                     if let Some(sc) = imp_schemes.get(&item.name) {
-                        env = env.extend(&item.name, sc.clone());
+                        let isc = infer.scheme_to_infer(sc);
+                        env = env.extend(&item.name, isc);
                     }
                 }
             }
@@ -398,8 +739,7 @@ fn infer_one(
     (out, diag)
 }
 
-/// `infer_module` の中身を抜き出した本体。`env` には builtins と import 由来の
-/// scheme をあらかじめ詰めて渡す。
+/// `infer_module` の中身。`env` には builtins と import 由来の scheme を詰めて渡す。
 fn infer_module_into(
     module: &Module,
     infer: &mut Infer,
@@ -409,12 +749,10 @@ fn infer_module_into(
     let mut env = env_in.clone();
 
     // 2. type alias / type decl / signature を先に収集
-    let mut sig_var_maps: HashMap<String, HashMap<String, TyVar>> = HashMap::new();
     for decl in &module.decls {
         match decl {
             Decl::TypeAlias(a) => {
                 infer.aliases.insert(a.name.clone(), a.clone());
-                // record alias なら record_aliases に登録
                 if let TypeExpr::Record(fields, _) = &a.body {
                     let mut alias_var_map: HashMap<String, TyVar> = HashMap::new();
                     let fs: Vec<(String, Type)> = fields
@@ -430,7 +768,6 @@ fn infer_module_into(
                 }
             }
             Decl::Type(t) => {
-                // 各コンストラクタを「args ->...-> T params」型として登録
                 let param_vars: Vec<TyVar> =
                     t.params.iter().map(|_| infer.var_gen.fresh()).collect();
                 let mut var_map: HashMap<String, TyVar> = t
@@ -450,7 +787,6 @@ fn infer_module_into(
                         .map(|a| infer.ty_of_type_expr(a, &mut var_map, &mut diag))
                         .collect();
                     let ty = Type::arrows(arg_tys, ret_ty.clone());
-                    // param_vars はすべて全称化
                     let scheme = Scheme {
                         vars: param_vars.clone(),
                         constraints: Vec::new(),
@@ -462,7 +798,6 @@ fn infer_module_into(
             Decl::Signature(s) => {
                 let mut var_map: HashMap<String, TyVar> = HashMap::new();
                 let raw_ty = infer.ty_of_type_expr(&s.ty, &mut var_map, &mut diag);
-                // ダミー var を fresh に置き換える
                 let mut name_to_fresh: HashMap<String, TyVar> = HashMap::new();
                 for n in var_map.keys() {
                     name_to_fresh.insert(n.clone(), infer.var_gen.fresh());
@@ -474,29 +809,27 @@ fn infer_module_into(
                     vs
                 };
                 let scheme = Scheme {
-                    vars: vars.clone(),
+                    vars,
                     constraints: Vec::new(),
                     ty: final_ty,
                 };
                 infer.signatures.insert(s.name.clone(), scheme);
-                sig_var_maps.insert(s.name.clone(), name_to_fresh);
             }
             _ => {}
         }
     }
 
-    // 3. コンストラクタを環境に展開
-    for (name, sc) in &infer.ctor_types {
-        env = env.extend(name, sc.clone());
+    // 3. コンストラクタと signature を環境に展開 (InferScheme 化)
+    for (name, sc) in infer.ctor_types.clone() {
+        let isc = infer.scheme_to_infer(&sc);
+        env = env.extend(&name, isc);
     }
-    // signature も環境に (再帰関数を許す: 後で sig を持つ name を再帰で呼ぶため)
-    for (name, sc) in &infer.signatures {
-        env = env.extend(name, sc.clone());
+    for (name, sc) in infer.signatures.clone() {
+        let isc = infer.scheme_to_infer(&sc);
+        env = env.extend(&name, isc);
     }
 
     // 4. value decl の依存解析 → SCC → 葉から順に推論
-    // これにより signature が無い decl でも前方参照・相互再帰が動き、
-    // SCC 内では monotype 共有 → 終了後に generalize するので let-poly が効く。
     let value_decls: Vec<&ValueDecl> = module
         .decls
         .iter()
@@ -507,12 +840,11 @@ fn infer_module_into(
         .collect();
     let decl_names: HashSet<String> = value_decls.iter().map(|v| v.name.clone()).collect();
 
-    // 依存グラフ: name -> body が参照する同モジュール内 value decl 名
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
     for v in &value_decls {
         let used = value_decl_free_names(v);
         let mut deps: Vec<String> = used.into_iter().filter(|n| decl_names.contains(n)).collect();
-        deps.sort(); // 決定的な順序
+        deps.sort();
         graph.insert(v.name.clone(), deps);
     }
 
@@ -520,11 +852,10 @@ fn infer_module_into(
 
     let mut result: HashMap<String, Scheme> = HashMap::new();
     for scc in sccs {
-        infer_value_scc(infer, &mut env, &scc, &graph, &mut diag, &mut result);
+        infer_value_scc(infer, &mut env, &scc, &mut diag, &mut result);
     }
 
-    // 全 SCC を処理し終わった時点で、まだ未解決の制約をすべて判定する。
-    // 型変数のまま残った制約はエラー (型注釈での解消を要求)。
+    // 全 SCC を処理し終えた時点で、まだ未解決の制約をすべて判定する。
     infer.finalize_pending(&mut diag);
 
     *env_in = env;
@@ -534,100 +865,70 @@ fn infer_module_into(
 /// 1 つの SCC を一括で推論する。SCC 内は相互参照可能なので、各メンバを fresh
 /// monotype var (sig 無し) または instantiate された sig 型 (sig 有り) で
 /// 一時 env に bind し、全 body を推論してから unify で整合させる。
-/// 終了後に sig 無しメンバを (SCC 進入前の env に対して) generalize する。
+/// 終了後に sig 無しメンバを level ベースで generalize する。
 fn infer_value_scc(
     infer: &mut Infer,
     env: &mut TypeEnv,
     scc: &[&ValueDecl],
-    graph: &HashMap<String, Vec<String>>,
     diag: &mut Vec<Diagnostic>,
     result: &mut HashMap<String, Scheme>,
 ) {
-    // generalize 時の参照環境は SCC 進入前のもの (SCC メンバ自身を含まない)
-    let env_before = env.clone();
+    infer.enter_level();
 
-    // 各メンバについて: sig 有なら expected = instantiate(sig)、sig 無なら fresh var。
-    // どちらも SCC 内の相互参照に使える monotype として local_env に入れる。
+    // 各メンバ: sig 有なら expected = instantiate(sig)、sig 無なら fresh var。
     let mut local_env = env.clone();
-    let mut member_expected: HashMap<String, Type> = HashMap::new();
+    let mut member_expected: HashMap<String, InferTy> = HashMap::new();
     for m in scc {
         let expected = if let Some(sc) = infer.signatures.get(&m.name).cloned() {
-            let inst = infer.instantiate_with(&sc, m.span, &m.name);
-            // sig 有りは scheme として bind 済みなので、SCC 内では再 instantiate
-            // した monotype を別途持っておけば十分 (env 側は polymorphic のまま)。
-            inst
+            let isc = infer.scheme_to_infer(&sc);
+            infer.instantiate_with(&isc, m.span, &m.name)
         } else {
             let fresh = infer.fresh();
-            local_env = local_env.extend(&m.name, Scheme::mono(fresh.clone()));
+            local_env = local_env.extend(&m.name, InferScheme::mono(fresh.clone()));
             fresh
         };
         member_expected.insert(m.name.clone(), expected);
     }
 
-    // 各 body を推論し、累積 subst を作る。
-    let mut subst = Subst::empty();
+    // 各 body を推論し、expected と単一化 (セルを破壊的に更新)。
     for m in scc {
-        let expected = subst.apply(member_expected.get(&m.name).unwrap());
+        let expected = member_expected.get(&m.name).unwrap().clone();
         let expected_arg = if infer.signatures.contains_key(&m.name) {
             Some(expected.clone())
         } else {
             None
         };
-        // local_env に subst を反映 (sig 無しメンバの fresh var を更新)
-        let env_for_body = apply_subst_to_env(&local_env, &subst);
-        let (ty, s) = match infer_value_decl(
-            infer,
-            &env_for_body,
-            m,
-            expected_arg.as_ref(),
-            diag,
-        ) {
-            Some(r) => r,
+        let ty = match infer_value_decl(infer, &local_env, m, expected_arg.as_ref(), diag) {
+            Some(t) => t,
             None => continue,
         };
-        let composed = subst.compose(&s);
-        let inferred = composed.apply(&ty);
-        let expected_now = composed.apply(&expected);
-        match unify(&inferred, &expected_now) {
-            Ok(s2) => {
-                subst = composed.compose(&s2);
-            }
-            Err(e) => {
-                diag.push(unify_diag(e, m.span, &m.name));
-                subst = composed;
-            }
+        if let Err(e) = unify(&ty, &expected) {
+            diag.push(unify_diag(e, m.span, &m.name));
         }
     }
 
-    // SCC 全体の body 推論が終わったら、subst を pending に適用して solve を試みる。
-    infer.apply_subst_to_pending(&subst);
+    infer.exit_level();
+
+    // 遅延フィールドアクセスを解決 (型が伸びうる) → 制約を solve。
+    resolve_field_obligations(infer, diag);
     solve_constraints(infer, diag);
 
-    // finalize: sig 有 → declared scheme、sig 無 → 解決済み型を env_before で generalize
+    // finalize: sig 有 → 宣言スキーム、sig 無 → level ベースで generalize。
     for m in scc {
-        let resolved = subst.apply(member_expected.get(&m.name).unwrap());
-        let scheme = if let Some(declared) = infer.signatures.get(&m.name).cloned() {
-            Scheme {
-                vars: declared.vars.clone(),
-                constraints: declared
-                    .constraints
-                    .iter()
-                    .map(|c| subst.apply_constraint(c))
-                    .collect(),
-                ty: resolved,
-            }
+        if let Some(declared) = infer.signatures.get(&m.name).cloned() {
+            let isc = infer.scheme_to_infer(&declared);
+            *env = env.extend(&m.name, isc);
+            result.insert(m.name.clone(), declared);
         } else {
-            infer.generalize(&env_before, &resolved)
-        };
-        *env = env.extend(&m.name, scheme.clone());
-        result.insert(m.name.clone(), scheme);
+            let expected = member_expected.get(&m.name).unwrap().clone();
+            let isc = infer.generalize(&expected);
+            let scheme = infer_scheme_to_scheme(&isc);
+            *env = env.extend(&m.name, isc);
+            result.insert(m.name.clone(), scheme);
+        }
     }
-
-    let _ = graph; // 将来 SCC 内自己再帰判定に使うかも
 }
 
-/// 環境内の各 scheme に置換を適用した新しい環境を返す。
-/// scheme の bound vars に subst が触ることは無い前提 (普通は monotype しか subst しない)。
 /// pending の制約を進める。
 /// - 具体型 → ClassCheck::Yes/No に従って derived を pending に / 違反を diag に。
 /// - 型変数のまま → pending に残す (後で finalize_pending か generalize で処理)。
@@ -635,11 +936,17 @@ fn solve_constraints(infer: &mut Infer, diag: &mut Vec<Diagnostic>) {
     let mut keep: Vec<PendingConstraint> = Vec::new();
     let pending = std::mem::take(&mut infer.pending);
     for p in pending {
-        match infer.class_registry.check(&p.constraint.class_name, &p.constraint.ty) {
+        let mut map: HashMap<u32, TyRef> = HashMap::new();
+        let zt = infer_to_type_tracked(&p.constraint.ty, &mut map);
+        match infer.class_registry.check(&p.constraint.class_name, &zt) {
             ClassCheck::Yes { derived } => {
                 for d in derived {
+                    let ity = infer.type_to_infer_via_map(&d.ty, &map);
                     keep.push(PendingConstraint {
-                        constraint: d,
+                        constraint: InferConstraint {
+                            class_name: d.class_name,
+                            ty: ity,
+                        },
                         span: p.span,
                         context: p.context.clone(),
                     });
@@ -650,7 +957,7 @@ fn solve_constraints(infer: &mut Infer, diag: &mut Vec<Diagnostic>) {
                     span: p.span,
                     context: p.context.clone(),
                     class_name: p.constraint.class_name.clone(),
-                    ty: format!("{}", p.constraint.ty),
+                    ty: format!("{zt}"),
                 });
             }
             ClassCheck::Unknown => {
@@ -661,26 +968,39 @@ fn solve_constraints(infer: &mut Infer, diag: &mut Vec<Diagnostic>) {
     infer.pending = keep;
 }
 
-fn apply_subst_to_env(env: &TypeEnv, subst: &Subst) -> TypeEnv {
-    let mut new = TypeEnv::new();
-    for (name, sc) in env.iter() {
-        let new_sc = Scheme {
-            vars: sc.vars.clone(),
-            constraints: sc
-                .constraints
-                .iter()
-                .map(|c| subst.apply_constraint(c))
-                .collect(),
-            ty: subst.apply(&sc.ty),
-        };
-        new = new.extend(name, new_sc);
+/// 遅延していたフィールドアクセスを型確定後に解決する。受け手が record/alias に
+/// 解決されていれば field 型と result を unify する。型変数のまま / record でない
+/// 場合は診断を出す。
+fn resolve_field_obligations(infer: &mut Infer, diag: &mut Vec<Diagnostic>) {
+    for ob in std::mem::take(&mut infer.pending_fields) {
+        match infer.lookup_field(&ob.receiver, &ob.field) {
+            FieldLookup::Found(field_ty) => {
+                if let Err(e) = unify(&field_ty, &ob.result) {
+                    diag.push(unify_diag(e, ob.span, &format!(".{}", ob.field)));
+                }
+            }
+            FieldLookup::NoField => diag.push(Diagnostic::RecordNoField {
+                span: ob.span,
+                field: ob.field,
+            }),
+            FieldLookup::NoFieldAlias(alias) => diag.push(Diagnostic::AliasNoField {
+                span: ob.span,
+                alias,
+                field: ob.field,
+            }),
+            FieldLookup::Unresolved | FieldLookup::NotRecord => {
+                diag.push(Diagnostic::NotARecord {
+                    span: ob.span,
+                    field: ob.field,
+                    ty: format!("{}", to_type_raw(&ob.receiver)),
+                })
+            }
+        }
     }
-    new
 }
 
-/// Tarjan's SCC algorithm。返値はSCCのリスト (各 SCC 内のメンバ順は不定)、
-/// **逆 topological 順** (依存グラフの葉から根の順) で返るので、そのまま
-/// for-each すれば依存先が先に処理される。
+/// Tarjan's SCC algorithm。返値は **逆 topological 順** (依存グラフの葉から根) で
+/// 返るので、そのまま for-each すれば依存先が先に処理される。
 fn tarjan_scc<'a>(
     decls: &[&'a ValueDecl],
     graph: &HashMap<String, Vec<String>>,
@@ -760,7 +1080,8 @@ pub fn infer_module(
     let mut infer = Infer::new();
     let mut env = TypeEnv::new();
     for b in builtins.iter() {
-        env = env.extend(b.name, b.scheme.clone());
+        let isc = infer.scheme_to_infer(&b.scheme);
+        env = env.extend(b.name, isc);
     }
     infer_module_into(module, &mut infer, &mut env)
 }
@@ -805,14 +1126,10 @@ fn unify_diag(err: UnifyError, span: Span, name: &str) -> Diagnostic {
         UnifyError::Mismatch { left, right } => Diagnostic::TypeMismatch {
             span,
             context,
-            left: format!("{left}"),
-            right: format!("{right}"),
+            left,
+            right,
         },
-        UnifyError::InfiniteType { var: _, ty } => Diagnostic::InfiniteType {
-            span,
-            context,
-            ty: format!("{ty}"),
-        },
+        UnifyError::InfiniteType { ty } => Diagnostic::InfiniteType { span, context, ty },
         UnifyError::RecordFieldMismatch {
             left_fields,
             right_fields,
@@ -829,65 +1146,50 @@ fn infer_value_decl(
     infer: &mut Infer,
     env: &TypeEnv,
     v: &ValueDecl,
-    expected: Option<&Type>,
+    expected: Option<&InferTy>,
     diag: &mut Vec<Diagnostic>,
-) -> Option<(Type, Subst)> {
+) -> Option<InferTy> {
     // signature があれば param 型を body 推論前に確定させる (record の field access 等、
     // param 型が分かっていないと推論できない式を body 内で許すため)。無ければ fresh。
     let sig_param_tys = expected
         .map(|t| split_arrows(t, v.params.len()).0)
         .unwrap_or_default();
     let mut local_env = env.clone();
-    let mut param_tys: Vec<Type> = Vec::new();
-    let mut param_subst = Subst::empty();
+    let mut param_tys: Vec<InferTy> = Vec::new();
     for (i, p) in v.params.iter().enumerate() {
-        let pt = sig_param_tys
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| infer.fresh());
+        let pt = sig_param_tys.get(i).cloned().unwrap_or_else(|| infer.fresh());
         param_tys.push(pt.clone());
-        let s = bind_pattern(infer, &mut local_env, p, &pt, diag);
-        param_subst = param_subst.compose(&s);
+        bind_pattern(infer, &mut local_env, p, &pt, diag);
     }
-    let local_env = apply_subst_to_env(&local_env, &param_subst);
-    let (body_ty, subst) = infer_expr(infer, &local_env, &v.body, diag)?;
-    let subst = param_subst.compose(&subst);
+    let body_ty = infer_expr(infer, &local_env, &v.body, diag)?;
     let mut fun_ty = body_ty;
     for pt in param_tys.into_iter().rev() {
-        fun_ty = Type::arrow(subst.apply(&pt), fun_ty);
+        fun_ty = InferTy::arrow(pt, fun_ty);
     }
-    Some((fun_ty, subst))
+    Some(fun_ty)
 }
 
-/// pattern を env に束縛する。返り値は内部の unify で得た累積 Subst。
-/// 呼び出し側はこれを自分の Subst に compose する必要がある (case のように
-/// `expected` が型変数の場合、その解決を伝播させないと scrutinee 側の型が
-/// 取り残される)。
+/// pattern を env に束縛する。単一化はセルを破壊的に更新する。
 fn bind_pattern(
     infer: &mut Infer,
     env: &mut TypeEnv,
     p: &Pattern,
-    expected: &Type,
+    expected: &InferTy,
     diag: &mut Vec<Diagnostic>,
-) -> Subst {
-    let mut subst = Subst::empty();
+) {
     match p {
         Pattern::Var(name, _) => {
-            *env = env.extend(name, Scheme::mono(expected.clone()));
+            *env = env.extend(name, InferScheme::mono(expected.clone()));
         }
         Pattern::Wildcard(_) => {}
         Pattern::Lit(lit, span) => {
-            // リテラルパターンは expected が同型でなければエラー。
-            let lt = lit_type(lit);
-            match unify(&subst.apply(expected), &lt) {
-                Ok(s) => subst = subst.compose(&s),
-                Err(e) => diag.push(unify_diag(e, *span, "<literal pattern>")),
+            if let Err(e) = unify(expected, &lit_type(lit)) {
+                diag.push(unify_diag(e, *span, "<literal pattern>"));
             }
         }
         Pattern::Ctor {
             name, args, span, ..
         } => {
-            // コンストラクタの型を instantiate して、引数型と patterns を再帰束縛
             let sc = match infer.ctor_types.get(name).cloned() {
                 Some(s) => s,
                 None => {
@@ -895,66 +1197,58 @@ fn bind_pattern(
                         span: *span,
                         name: name.clone(),
                     });
-                    return subst;
+                    return;
                 }
             };
-            let inst = infer.instantiate_with(&sc, *span, name);
-            // inst は a1 -> ... -> an -> RetTy の curried 形式
+            let isc = infer.scheme_to_infer(&sc);
+            let inst = infer.instantiate_with(&isc, *span, name);
             let (arg_tys, ret_ty) = split_arrows(&inst, args.len());
-            // ret_ty を expected と unify
-            match unify(&subst.apply(&ret_ty), &subst.apply(expected)) {
-                Ok(s) => subst = subst.compose(&s),
-                Err(e) => diag.push(unify_diag(e, *span, name)),
+            if let Err(e) = unify(&ret_ty, expected) {
+                diag.push(unify_diag(e, *span, name));
             }
             for (sub_p, ty) in args.iter().zip(arg_tys.iter()) {
-                let resolved = subst.apply(ty);
-                let s = bind_pattern(infer, env, sub_p, &resolved, diag);
-                subst = subst.compose(&s);
+                bind_pattern(infer, env, sub_p, ty, diag);
             }
         }
         Pattern::List(items, _) => {
-            // expected は List elem。expected と List a を unify
             let elem = infer.fresh();
-            let list_ty = Type::app("List", vec![elem.clone()]);
-            match unify(&list_ty, &subst.apply(expected)) {
-                Ok(s) => subst = subst.compose(&s),
-                Err(e) => diag.push(unify_diag(e, span_of_pattern(p), "[]")),
+            let list_ty = InferTy::app("List", vec![elem.clone()]);
+            if let Err(e) = unify(&list_ty, expected) {
+                diag.push(unify_diag(e, span_of_pattern(p), "[]"));
             }
             for item in items {
-                let resolved = subst.apply(&elem);
-                let s = bind_pattern(infer, env, item, &resolved, diag);
-                subst = subst.compose(&s);
+                bind_pattern(infer, env, item, &elem, diag);
             }
         }
         Pattern::Cons { head, tail, span } => {
             let elem = infer.fresh();
-            let list_ty = Type::app("List", vec![elem.clone()]);
-            match unify(&list_ty, &subst.apply(expected)) {
-                Ok(s) => subst = subst.compose(&s),
-                Err(e) => diag.push(unify_diag(e, *span, "::")),
+            let list_ty = InferTy::app("List", vec![elem.clone()]);
+            if let Err(e) = unify(&list_ty, expected) {
+                diag.push(unify_diag(e, *span, "::"));
             }
-            let head_ty = subst.apply(&elem);
-            let s = bind_pattern(infer, env, head, &head_ty, diag);
-            subst = subst.compose(&s);
-            let tail_ty = subst.apply(&list_ty);
-            let s = bind_pattern(infer, env, tail, &tail_ty, diag);
-            subst = subst.compose(&s);
+            bind_pattern(infer, env, head, &elem, diag);
+            bind_pattern(infer, env, tail, &list_ty, diag);
         }
         Pattern::Record(names, span) => {
-            // 各 name に対応するフィールド型を expected (record / record alias / 型変数)
-            // から引き出して env に束縛する。
-            let resolved = subst.apply(expected);
-            let fields_opt: Option<Vec<(String, Type)>> = match &resolved {
-                Type::Record(fs) => Some(fs.clone()),
-                Type::Con(alias_name, _) => infer.record_aliases.get(alias_name).cloned(),
-                Type::Var(_) => {
-                    // 各 name に fresh 型を割当てて record として unify する。
-                    let fs: Vec<(String, Type)> =
+            let resolved = resolve(expected);
+            let fields_opt: Option<Vec<(String, InferTy)>> = match &resolved {
+                InferTy::Record(fs) => Some(fs.clone()),
+                InferTy::Con(alias_name, _) => match infer.record_aliases.get(alias_name).cloned() {
+                    Some(fs) => {
+                        let mut out = Vec::new();
+                        for (n, t) in &fs {
+                            out.push((n.clone(), infer.type_to_infer_fresh(t)));
+                        }
+                        Some(out)
+                    }
+                    None => None,
+                },
+                InferTy::Var(_) => {
+                    let fs: Vec<(String, InferTy)> =
                         names.iter().map(|n| (n.clone(), infer.fresh())).collect();
-                    let r_ty = Type::Record(fs.clone());
-                    match unify(&r_ty, &resolved) {
-                        Ok(s) => subst = subst.compose(&s),
-                        Err(e) => diag.push(unify_diag(e, *span, "<record pattern>")),
+                    let r_ty = InferTy::Record(fs.clone());
+                    if let Err(e) = unify(&r_ty, &resolved) {
+                        diag.push(unify_diag(e, *span, "<record pattern>"));
                     }
                     Some(fs)
                 }
@@ -966,16 +1260,15 @@ fn bind_pattern(
                     diag.push(Diagnostic::NotARecord {
                         span: *span,
                         field: names.first().cloned().unwrap_or_default(),
-                        ty: format!("{resolved}"),
+                        ty: format!("{}", to_type_raw(&resolved)),
                     });
-                    return subst;
+                    return;
                 }
             };
             for n in names {
                 match fields.iter().find(|(fname, _)| fname == n) {
                     Some((_, t)) => {
-                        let bound = subst.apply(t);
-                        *env = env.extend(n, Scheme::mono(bound));
+                        *env = env.extend(n, InferScheme::mono(t.clone()));
                     }
                     None => diag.push(Diagnostic::RecordNoField {
                         span: *span,
@@ -985,12 +1278,10 @@ fn bind_pattern(
             }
         }
         Pattern::As { inner, name, .. } => {
-            *env = env.extend(name, Scheme::mono(expected.clone()));
-            let s = bind_pattern(infer, env, inner, expected, diag);
-            subst = subst.compose(&s);
+            *env = env.extend(name, InferScheme::mono(expected.clone()));
+            bind_pattern(infer, env, inner, expected, diag);
         }
     }
-    subst
 }
 
 fn span_of_pattern(p: &Pattern) -> Span {
@@ -1006,35 +1297,41 @@ fn span_of_pattern(p: &Pattern) -> Span {
     }
 }
 
-/// 関数型から先頭 n 個の引数を切り出す。残りは戻り値型。
-fn split_arrows(t: &Type, n: usize) -> (Vec<Type>, Type) {
+/// 関数型から先頭 n 個の引数を切り出す。残りは戻り値型。リンクは辿る。
+fn split_arrows(t: &InferTy, n: usize) -> (Vec<InferTy>, InferTy) {
     let mut args = Vec::new();
-    let mut cur = t.clone();
+    let mut cur = resolve(t);
     for _ in 0..n {
         match cur {
-            Type::Arrow(f, to) => {
-                args.push(*f);
-                cur = *to;
+            InferTy::Arrow(f, to) => {
+                args.push(resolve(&f));
+                cur = resolve(&to);
             }
-            _ => break,
+            other => {
+                cur = other;
+                break;
+            }
         }
     }
     (args, cur)
 }
 
-/// 式の型推論。返り値は (型, 累積置換)。エラーは diag に積んで `None` を返す。
+/// 式の型推論。エラーは diag に積んで `None` を返す。単一化はセルを破壊的に更新する。
 pub fn infer_expr(
     infer: &mut Infer,
     env: &TypeEnv,
     e: &Expr,
     diag: &mut Vec<Diagnostic>,
-) -> Option<(Type, Subst)> {
+) -> Option<InferTy> {
     match e {
-        Expr::Lit(l, _) => Some((lit_type(l), Subst::empty())),
+        Expr::Lit(l, _) => Some(lit_type(l)),
         Expr::Var { module, name, span } => {
             let key = qualify(module.as_ref(), name);
             match env.lookup(&key) {
-                Some(sc) => Some((infer.instantiate_with(sc, *span, &key), Subst::empty())),
+                Some(sc) => {
+                    let sc = sc.clone();
+                    Some(infer.instantiate_with(&sc, *span, &key))
+                }
                 None => {
                     diag.push(Diagnostic::UndefinedVar {
                         span: *span,
@@ -1047,7 +1344,10 @@ pub fn infer_expr(
         Expr::Ctor { module, name, span } => {
             let key = qualify(module.as_ref(), name);
             match env.lookup(&key) {
-                Some(sc) => Some((infer.instantiate_with(sc, *span, &key), Subst::empty())),
+                Some(sc) => {
+                    let sc = sc.clone();
+                    Some(infer.instantiate_with(&sc, *span, &key))
+                }
                 None => {
                     diag.push(Diagnostic::UndefinedCtor {
                         span: *span,
@@ -1058,17 +1358,12 @@ pub fn infer_expr(
             }
         }
         Expr::App { func, arg, span } => {
-            let (f_ty, s1) = infer_expr(infer, env, func, diag)?;
-            let env2 = env.clone();
-            let (a_ty, s2) = infer_expr(infer, &env2, arg, diag)?;
+            let f_ty = infer_expr(infer, env, func, diag)?;
+            let a_ty = infer_expr(infer, env, arg, diag)?;
             let result = infer.fresh();
-            let expected = Type::arrow(a_ty.clone(), result.clone());
-            let f_ty2 = s2.apply(&f_ty);
-            match unify(&f_ty2, &expected) {
-                Ok(s3) => {
-                    let s_all = s1.compose(&s2).compose(&s3);
-                    Some((s_all.apply(&result), s_all))
-                }
+            let expected = InferTy::arrow(a_ty, result.clone());
+            match unify(&f_ty, &expected) {
+                Ok(()) => Some(result),
                 Err(e) => {
                     diag.push(unify_diag(e, *span, "<関数適用>"));
                     None
@@ -1077,39 +1372,31 @@ pub fn infer_expr(
         }
         Expr::Lambda { params, body, .. } => {
             let mut local_env = env.clone();
-            let mut param_tys: Vec<Type> = Vec::new();
-            let mut pat_subst = Subst::empty();
+            let mut param_tys: Vec<InferTy> = Vec::new();
             for p in params {
                 let pt = infer.fresh();
                 param_tys.push(pt.clone());
-                let s = bind_pattern(infer, &mut local_env, p, &pt, diag);
-                pat_subst = pat_subst.compose(&s);
+                bind_pattern(infer, &mut local_env, p, &pt, diag);
             }
-            let local_env = apply_subst_to_env(&local_env, &pat_subst);
-            let (body_ty, s) = infer_expr(infer, &local_env, body, diag)?;
-            let s = pat_subst.compose(&s);
+            let body_ty = infer_expr(infer, &local_env, body, diag)?;
             let mut fun_ty = body_ty;
             for pt in param_tys.into_iter().rev() {
-                fun_ty = Type::arrow(s.apply(&pt), fun_ty);
+                fun_ty = InferTy::arrow(pt, fun_ty);
             }
-            Some((fun_ty, s))
+            Some(fun_ty)
         }
         Expr::Let { bindings, body, .. } => {
-            // 各 binding を順次推論し、env に generalize して追加
+            // 各 binding を順次推論し、generalize して env に追加 (非再帰 let)。
             let mut env_acc = env.clone();
-            let mut subst_acc = Subst::empty();
             for b in bindings {
-                let (ty, s) = match infer_value_decl(infer, &env_acc, b, None, diag) {
-                    Some(r) => r,
-                    None => continue,
-                };
-                let final_ty = s.apply(&ty);
-                let sc = infer.generalize(&env_acc, &final_ty);
-                env_acc = env_acc.extend(&b.name, sc);
-                subst_acc = subst_acc.compose(&s);
+                infer.enter_level();
+                let ty = infer_value_decl(infer, &env_acc, b, None, diag);
+                infer.exit_level();
+                let Some(ty) = ty else { continue };
+                let isc = infer.generalize(&ty);
+                env_acc = env_acc.extend(&b.name, isc);
             }
-            let (body_ty, s_body) = infer_expr(infer, &env_acc, body, diag)?;
-            Some((body_ty, subst_acc.compose(&s_body)))
+            infer_expr(infer, &env_acc, body, diag)
         }
         Expr::If {
             cond,
@@ -1117,29 +1404,18 @@ pub fn infer_expr(
             else_branch,
             span,
         } => {
-            let (c_ty, s1) = infer_expr(infer, env, cond, diag)?;
-            let s_c = match unify(&c_ty, &Type::con("Bool")) {
-                Ok(s) => s,
-                Err(e) => {
-                    diag.push(unify_diag(e, *span, "<if 条件>"));
-                    return None;
-                }
-            };
-            let s = s1.compose(&s_c);
-            let env2 = env.clone();
-            let (t_ty, s2) = infer_expr(infer, &env2, then_branch, diag)?;
-            let s = s.compose(&s2);
-            let (e_ty, s3) = infer_expr(infer, &env2, else_branch, diag)?;
-            let s = s.compose(&s3);
-            let s_branch = match unify(&s.apply(&t_ty), &s.apply(&e_ty)) {
-                Ok(s) => s,
-                Err(err) => {
-                    diag.push(unify_diag(err, *span, "<if 分岐>"));
-                    return None;
-                }
-            };
-            let s = s.compose(&s_branch);
-            Some((s.apply(&t_ty), s))
+            let c_ty = infer_expr(infer, env, cond, diag)?;
+            if let Err(e) = unify(&c_ty, &InferTy::con("Bool")) {
+                diag.push(unify_diag(e, *span, "<if 条件>"));
+                return None;
+            }
+            let t_ty = infer_expr(infer, env, then_branch, diag)?;
+            let e_ty = infer_expr(infer, env, else_branch, diag)?;
+            if let Err(err) = unify(&t_ty, &e_ty) {
+                diag.push(unify_diag(err, *span, "<if 分岐>"));
+                return None;
+            }
+            Some(t_ty)
         }
         Expr::BinOp {
             op,
@@ -1155,119 +1431,98 @@ pub fn infer_expr(
                     context: format!("<{op:?}>"),
                 });
             }
-            let (l_ty, s1) = infer_expr(infer, env, left, diag)?;
-            let s_l = match unify(&l_ty, &op_args.0) {
-                Ok(s) => s,
-                Err(err) => {
-                    diag.push(unify_diag(err, *span, &format!("<{op:?}>")));
-                    return None;
-                }
-            };
-            let s = s1.compose(&s_l);
-            let (r_ty, s2) = infer_expr(infer, env, right, diag)?;
-            let s = s.compose(&s2);
-            let s_r = match unify(&s.apply(&r_ty), &s.apply(&op_args.1)) {
-                Ok(s) => s,
-                Err(err) => {
-                    diag.push(unify_diag(err, *span, &format!("<{op:?}>")));
-                    return None;
-                }
-            };
-            let s = s.compose(&s_r);
-            Some((s.apply(&op_ret), s))
+            let l_ty = infer_expr(infer, env, left, diag)?;
+            if let Err(err) = unify(&l_ty, &op_args.0) {
+                diag.push(unify_diag(err, *span, &format!("<{op:?}>")));
+                return None;
+            }
+            let r_ty = infer_expr(infer, env, right, diag)?;
+            if let Err(err) = unify(&r_ty, &op_args.1) {
+                diag.push(unify_diag(err, *span, &format!("<{op:?}>")));
+                return None;
+            }
+            Some(op_ret)
         }
         Expr::Negate(inner, span) => {
-            // Num a => a -> a
-            let (ty, s) = infer_expr(infer, env, inner, diag)?;
+            let ty = infer_expr(infer, env, inner, diag)?;
             infer.pending.push(PendingConstraint {
-                constraint: Constraint {
+                constraint: InferConstraint {
                     class_name: "Num".to_string(),
-                    ty: s.apply(&ty),
+                    ty: ty.clone(),
                 },
                 span: *span,
                 context: "<negate>".to_string(),
             });
-            Some((s.apply(&ty), s))
+            Some(ty)
         }
         Expr::List(items, _) => {
             let elem = infer.fresh();
-            let mut s = Subst::empty();
             for item in items {
-                let (it_ty, s_it) = infer_expr(infer, env, item, diag)?;
-                s = s.compose(&s_it);
-                match unify(&s.apply(&elem), &s.apply(&it_ty)) {
-                    Ok(s2) => s = s.compose(&s2),
-                    Err(err) => {
-                        diag.push(unify_diag(err, span_of_expr(item), "<list 要素>"));
-                        return None;
-                    }
-                }
-            }
-            Some((Type::app("List", vec![s.apply(&elem)]), s))
-        }
-        Expr::Range { lo, hi, span } => {
-            let (lo_ty, s1) = infer_expr(infer, env, lo, diag)?;
-            let (hi_ty, s2) = infer_expr(infer, env, hi, diag)?;
-            let s = s1.compose(&s2);
-            let s_eq = match unify(&s.apply(&lo_ty), &s.apply(&hi_ty)) {
-                Ok(s) => s,
-                Err(err) => {
-                    diag.push(unify_diag(err, *span, "Range"));
+                let it_ty = infer_expr(infer, env, item, diag)?;
+                if let Err(err) = unify(&elem, &it_ty) {
+                    diag.push(unify_diag(err, span_of_expr(item), "<list 要素>"));
                     return None;
                 }
-            };
-            let s = s.compose(&s_eq);
-            Some((Type::app("Range", vec![s.apply(&lo_ty)]), s))
+            }
+            Some(InferTy::app("List", vec![elem]))
+        }
+        Expr::Range { lo, hi, span } => {
+            let lo_ty = infer_expr(infer, env, lo, diag)?;
+            let hi_ty = infer_expr(infer, env, hi, diag)?;
+            if let Err(err) = unify(&lo_ty, &hi_ty) {
+                diag.push(unify_diag(err, *span, "Range"));
+                return None;
+            }
+            Some(InferTy::app("Range", vec![lo_ty]))
         }
         Expr::Record(fields, _) => {
-            let mut subst = Subst::empty();
-            let mut fs: Vec<(String, Type)> = Vec::new();
+            let mut fs: Vec<(String, InferTy)> = Vec::new();
             for f in fields {
-                let (ty, s) = infer_expr(infer, env, &f.value, diag)?;
-                subst = subst.compose(&s);
+                let ty = infer_expr(infer, env, &f.value, diag)?;
                 fs.push((f.name.clone(), ty));
             }
-            // record literal は anonymous record 型として推論する。
-            Some((Type::Record(fs), subst))
+            Some(InferTy::Record(fs))
         }
         Expr::Field {
             receiver,
             name,
             span,
         } => {
-            let (r_ty, s) = infer_expr(infer, env, receiver, diag)?;
-            let r_ty = s.apply(&r_ty);
-            // r_ty が Record なら field 名で引く
-            match &r_ty {
-                Type::Record(fs) => match fs.iter().find(|(n, _)| n == name) {
-                    Some((_, t)) => Some((t.clone(), s)),
-                    None => {
-                        diag.push(Diagnostic::RecordNoField {
-                            span: *span,
-                            field: name.clone(),
-                        });
-                        None
-                    }
-                },
-                Type::Con(alias_name, _) if infer.record_aliases.contains_key(alias_name) => {
-                    let fields = infer.record_aliases.get(alias_name).unwrap().clone();
-                    match fields.iter().find(|(n, _)| n == name) {
-                        Some((_, t)) => Some((t.clone(), s)),
-                        None => {
-                            diag.push(Diagnostic::AliasNoField {
-                                span: *span,
-                                alias: alias_name.clone(),
-                                field: name.clone(),
-                            });
-                            None
-                        }
-                    }
+            let r_ty = infer_expr(infer, env, receiver, diag)?;
+            match infer.lookup_field(&r_ty, name) {
+                FieldLookup::Found(t) => Some(t),
+                FieldLookup::NoField => {
+                    diag.push(Diagnostic::RecordNoField {
+                        span: *span,
+                        field: name.clone(),
+                    });
+                    None
                 }
-                _ => {
+                FieldLookup::NoFieldAlias(alias) => {
+                    diag.push(Diagnostic::AliasNoField {
+                        span: *span,
+                        alias,
+                        field: name.clone(),
+                    });
+                    None
+                }
+                // 受け手がまだ型変数。`map (\p -> p.x) xs` のように要素型が後で
+                // 決まるケース。解決を SCC 境界に遅延する。
+                FieldLookup::Unresolved => {
+                    let tres = infer.fresh();
+                    infer.pending_fields.push(FieldObligation {
+                        receiver: r_ty,
+                        field: name.clone(),
+                        result: tres.clone(),
+                        span: *span,
+                    });
+                    Some(tres)
+                }
+                FieldLookup::NotRecord => {
                     diag.push(Diagnostic::NotARecord {
                         span: *span,
                         field: name.clone(),
-                        ty: format!("{r_ty}"),
+                        ty: format!("{}", to_type_raw(&r_ty)),
                     });
                     None
                 }
@@ -1278,53 +1533,53 @@ pub fn infer_expr(
             updates,
             span,
         } => {
-            let (b_ty, s_base) = infer_expr(infer, env, base, diag)?;
-            let mut s = s_base;
-            let resolved = s.apply(&b_ty);
+            let b_ty = infer_expr(infer, env, base, diag)?;
+            let resolved = resolve(&b_ty);
             // base が record literal の型か record alias の場合のみフィールド名を引ける。
             // 型変数の場合は updates から再構成。
-            let fields_opt: Option<Vec<(String, Type)>> = match &resolved {
-                Type::Record(fs) => Some(fs.clone()),
-                Type::Con(alias_name, _) => infer.record_aliases.get(alias_name).cloned(),
-                Type::Var(_) => None, // 後で fresh record で unify する
+            let fields_opt: Option<Vec<(String, InferTy)>> = match &resolved {
+                InferTy::Record(fs) => Some(fs.clone()),
+                InferTy::Con(alias_name, _) => {
+                    match infer.record_aliases.get(alias_name).cloned() {
+                        Some(fs) => {
+                            let mut out = Vec::new();
+                            for (n, t) in &fs {
+                                out.push((n.clone(), infer.type_to_infer_fresh(t)));
+                            }
+                            Some(out)
+                        }
+                        None => None,
+                    }
+                }
+                InferTy::Var(_) => None,
                 _ => {
                     diag.push(Diagnostic::NotARecord {
                         span: *span,
-                        field: updates
-                            .first()
-                            .map(|f| f.name.clone())
-                            .unwrap_or_default(),
-                        ty: format!("{resolved}"),
+                        field: updates.first().map(|f| f.name.clone()).unwrap_or_default(),
+                        ty: format!("{}", to_type_raw(&resolved)),
                     });
                     return None;
                 }
             };
-            // updates 側の field 値を推論
-            let mut update_tys: Vec<(String, Type, Span)> = Vec::new();
+            let mut update_tys: Vec<(String, InferTy, Span)> = Vec::new();
             for u in updates {
-                let (u_ty, us) = match infer_expr(infer, env, &u.value, diag) {
-                    Some(r) => r,
+                let u_ty = match infer_expr(infer, env, &u.value, diag) {
+                    Some(t) => t,
                     None => continue,
                 };
-                s = s.compose(&us);
                 update_tys.push((u.name.clone(), u_ty, u.span));
             }
             let fields = match fields_opt {
                 Some(fs) => fs,
                 None => {
-                    // type var の場合: updates の field と fresh で record を組んで unify。
-                    // 不足フィールドは検査不可なので無視 (rank-1 HM の素朴な実装)。
-                    let fs: Vec<(String, Type)> = update_tys
+                    let fs: Vec<(String, InferTy)> = update_tys
                         .iter()
                         .map(|(n, _, _)| (n.clone(), infer.fresh()))
                         .collect();
-                    let r_ty = Type::Record(fs.clone());
-                    match unify(&r_ty, &s.apply(&resolved)) {
-                        Ok(s2) => s = s.compose(&s2),
-                        Err(err) => {
-                            diag.push(unify_diag(err, *span, "<record update>"));
-                            return None;
-                        }
+                    let r_ty = InferTy::Record(fs.clone());
+                    if let Err(err) = unify(&r_ty, &resolved) {
+                        diag.push(unify_diag(err, *span, "<record update>"));
+                        return None;
                     }
                     fs
                 }
@@ -1337,64 +1592,47 @@ pub fn infer_expr(
                     });
                     continue;
                 };
-                let s_u = match unify(&s.apply(u_ty), &s.apply(expected_ty)) {
-                    Ok(s2) => s2,
-                    Err(err) => {
-                        diag.push(unify_diag(err, *u_span, &format!("<update {name}>")));
-                        continue;
-                    }
-                };
-                s = s.compose(&s_u);
+                if let Err(err) = unify(u_ty, expected_ty) {
+                    diag.push(unify_diag(err, *u_span, &format!("<update {name}>")));
+                    continue;
+                }
             }
-            Some((s.apply(&b_ty), s))
+            Some(b_ty)
         }
         Expr::Case {
             scrutinee,
             arms,
             span,
         } => {
-            let (sc_ty, s_sc) = infer_expr(infer, env, scrutinee, diag)?;
-            let mut s = s_sc;
+            let sc_ty = infer_expr(infer, env, scrutinee, diag)?;
             let result = infer.fresh();
             if arms.is_empty() {
                 diag.push(Diagnostic::ParseErrorExpr { span: *span });
                 return None;
             }
             for arm in arms {
-                let mut arm_env = apply_subst_to_env(env, &s);
-                let sc_ty_now = s.apply(&sc_ty);
-                let s_pat = bind_pattern(infer, &mut arm_env, &arm.pattern, &sc_ty_now, diag);
-                s = s.compose(&s_pat);
-                let arm_env = apply_subst_to_env(&arm_env, &s);
+                let mut arm_env = env.clone();
+                bind_pattern(infer, &mut arm_env, &arm.pattern, &sc_ty, diag);
                 if let Some(g) = &arm.guard {
-                    let (g_ty, gs) = match infer_expr(infer, &arm_env, g, diag) {
-                        Some(r) => r,
+                    let g_ty = match infer_expr(infer, &arm_env, g, diag) {
+                        Some(t) => t,
                         None => continue,
                     };
-                    s = s.compose(&gs);
-                    match unify(&s.apply(&g_ty), &Type::con("Bool")) {
-                        Ok(s2) => s = s.compose(&s2),
-                        Err(err) => {
-                            diag.push(unify_diag(err, arm.span, "<case guard>"));
-                            continue;
-                        }
-                    }
-                }
-                let arm_env = apply_subst_to_env(&arm_env, &s);
-                let (b_ty, bs) = match infer_expr(infer, &arm_env, &arm.body, diag) {
-                    Some(r) => r,
-                    None => continue,
-                };
-                s = s.compose(&bs);
-                match unify(&s.apply(&result), &s.apply(&b_ty)) {
-                    Ok(s2) => s = s.compose(&s2),
-                    Err(err) => {
-                        diag.push(unify_diag(err, arm.span, "<case 分岐>"));
+                    if let Err(err) = unify(&g_ty, &InferTy::con("Bool")) {
+                        diag.push(unify_diag(err, arm.span, "<case guard>"));
                         continue;
                     }
                 }
+                let b_ty = match infer_expr(infer, &arm_env, &arm.body, diag) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if let Err(err) = unify(&result, &b_ty) {
+                    diag.push(unify_diag(err, arm.span, "<case 分岐>"));
+                    continue;
+                }
             }
-            Some((s.apply(&result), s))
+            Some(result)
         }
         Expr::Error(span) => {
             diag.push(Diagnostic::ParseErrorExpr { span: *span });
@@ -1403,22 +1641,25 @@ pub fn infer_expr(
     }
 }
 
-fn lit_type(l: &Lit) -> Type {
+fn lit_type(l: &Lit) -> InferTy {
     match l {
-        Lit::Int(_) => Type::con("Int"),
-        Lit::Float(_) => Type::con("Float"),
-        Lit::String(_) => Type::con("String"),
-        Lit::Bool(_) => Type::con("Bool"),
+        Lit::Int(_) => InferTy::con("Int"),
+        Lit::Float(_) => InferTy::con("Float"),
+        Lit::String(_) => InferTy::con("String"),
+        Lit::Bool(_) => InferTy::con("Bool"),
     }
 }
 
-fn binop_type(op: BinOp, infer: &mut Infer) -> ((Type, Type), Type, Vec<Constraint>) {
+fn binop_type(
+    op: BinOp,
+    infer: &mut Infer,
+) -> ((InferTy, InferTy), InferTy, Vec<InferConstraint>) {
     use BinOp::*;
     match op {
         // Num a => a -> a -> a
         Add | Sub | Mul | Div => {
             let v = infer.fresh();
-            let c = Constraint {
+            let c = InferConstraint {
                 class_name: "Num".to_string(),
                 ty: v.clone(),
             };
@@ -1427,31 +1668,31 @@ fn binop_type(op: BinOp, infer: &mut Infer) -> ((Type, Type), Type, Vec<Constrai
         // Eq a => a -> a -> Bool
         Eq | NotEq => {
             let v = infer.fresh();
-            let c = Constraint {
+            let c = InferConstraint {
                 class_name: "Eq".to_string(),
                 ty: v.clone(),
             };
-            ((v.clone(), v.clone()), Type::con("Bool"), vec![c])
+            ((v.clone(), v.clone()), InferTy::con("Bool"), vec![c])
         }
         // Ord a => a -> a -> Bool
         Lt | Le | Gt | Ge => {
             let v = infer.fresh();
-            let c = Constraint {
+            let c = InferConstraint {
                 class_name: "Ord".to_string(),
                 ty: v.clone(),
             };
-            ((v.clone(), v.clone()), Type::con("Bool"), vec![c])
+            ((v.clone(), v.clone()), InferTy::con("Bool"), vec![c])
         }
         And | Or => (
-            (Type::con("Bool"), Type::con("Bool")),
-            Type::con("Bool"),
+            (InferTy::con("Bool"), InferTy::con("Bool")),
+            InferTy::con("Bool"),
             vec![],
         ),
         Cons => {
             let v = infer.fresh();
             (
-                (v.clone(), Type::app("List", vec![v.clone()])),
-                Type::app("List", vec![v]),
+                (v.clone(), InferTy::app("List", vec![v.clone()])),
+                InferTy::app("List", vec![v]),
                 vec![],
             )
         }
@@ -1459,10 +1700,10 @@ fn binop_type(op: BinOp, infer: &mut Infer) -> ((Type, Type), Type, Vec<Constrai
             let v = infer.fresh();
             (
                 (
-                    Type::app("List", vec![v.clone()]),
-                    Type::app("List", vec![v.clone()]),
+                    InferTy::app("List", vec![v.clone()]),
+                    InferTy::app("List", vec![v.clone()]),
                 ),
-                Type::app("List", vec![v]),
+                InferTy::app("List", vec![v]),
                 vec![],
             )
         }
@@ -1472,24 +1713,22 @@ fn binop_type(op: BinOp, infer: &mut Infer) -> ((Type, Type), Type, Vec<Constrai
             let c = infer.fresh();
             (
                 (
-                    Type::arrow(a.clone(), b.clone()),
-                    Type::arrow(b.clone(), c.clone()),
+                    InferTy::arrow(a.clone(), b.clone()),
+                    InferTy::arrow(b.clone(), c.clone()),
                 ),
-                Type::arrow(a, c),
+                InferTy::arrow(a, c),
                 vec![],
             )
         }
         ApplyL => {
-            // f <| x : (a -> b) <| a → b
             let a = infer.fresh();
             let b = infer.fresh();
-            ((Type::arrow(a.clone(), b.clone()), a), b, vec![])
+            ((InferTy::arrow(a.clone(), b.clone()), a), b, vec![])
         }
         ApplyR => {
-            // x |> f : a |> (a -> b) → b
             let a = infer.fresh();
             let b = infer.fresh();
-            ((a.clone(), Type::arrow(a, b.clone())), b, vec![])
+            ((a.clone(), InferTy::arrow(a, b.clone())), b, vec![])
         }
     }
 }
@@ -1569,7 +1808,6 @@ mod tests {
 
     #[test]
     fn let_polymorphism() {
-        // id を let で導入し、2 つの型で使う
         let (schemes, diag) = infer_src("f = let id x = x in id 1.0");
         assert!(diag.is_empty(), "diags: {diag:?}");
         assert_eq!(schemes["f"].ty.to_string(), "Float");
@@ -1580,5 +1818,48 @@ mod tests {
         let (schemes, diag) = infer_src("r = 1.0 .. 10.0");
         assert!(diag.is_empty(), "diags: {diag:?}");
         assert_eq!(schemes["r"].ty.to_string(), "Range Float");
+    }
+
+    // --- Algorithm J 移行の回帰ガード ---
+    // 旧 substitution-passing 実装は App / If / BinOp で「subst を env に適用してから
+    // 次の部分式を推論する」手順を取りこぼしやすかった。in-place 単一化では共有セルが
+    // 自動で更新されるため、これらの伝播は構造的に正しい。
+
+    #[test]
+    fn nested_application_determines_param_type() {
+        // ((\g -> \x -> g (g x)) (\n -> n + 1.0)) 2.0 → Float。
+        // g に渡した関数から param 型 (Float) が決まり、ネスト適用全体に伝播する。
+        let (schemes, diag) = infer_src("f = (\\g -> \\x -> g (g x)) (\\n -> n + 1.0) 2.0");
+        assert!(diag.is_empty(), "diags: {diag:?}");
+        assert_eq!(schemes["f"].ty.to_string(), "Float");
+    }
+
+    #[test]
+    fn let_poly_used_at_two_types() {
+        // let 束縛した id を Bool (条件) と Int (分岐) の両方で使う。
+        let (schemes, diag) =
+            infer_src("f = let id = \\x -> x in if id True then id 3 else id 4");
+        assert!(diag.is_empty(), "diags: {diag:?}");
+        assert_eq!(schemes["f"].ty.to_string(), "Int");
+    }
+
+    #[test]
+    fn if_branches_share_condition_refinement() {
+        // cond で x : Bool と確定した後、then / else でも x は Bool として共有される。
+        let (schemes, diag) = infer_src("g x = if x then x else x");
+        assert!(diag.is_empty(), "diags: {diag:?}");
+        assert_eq!(schemes["g"].ty.to_string(), "Bool -> Bool");
+    }
+
+    #[test]
+    fn derived_constraint_over_polymorphic_var_is_lifted() {
+        // [x] == [x] → Eq (List a) → Eq a に分解され、a が generalize 対象なら
+        // scheme の制約として持ち上げるべき。分解時に変数セルの同一性を失うと
+        // 偽の AmbiguousConstraint になる (回帰防止)。
+        let (schemes, diag) = infer_src("f x = [x] == [x]");
+        assert!(diag.is_empty(), "diags: {diag:?}");
+        assert_eq!(schemes["f"].constraints.len(), 1, "Eq 制約が 1 つ持ち上がるはず");
+        assert_eq!(schemes["f"].constraints[0].class_name, "Eq");
+        assert!(schemes["f"].ty.to_string().ends_with("-> Bool"));
     }
 }
