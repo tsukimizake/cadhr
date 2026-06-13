@@ -4,7 +4,7 @@
 //! - ユーザー定義 ADT の Constructor (`tag` + `args`)
 //! - 関数値 (Closure / Builtin)
 //! - 3D 幾何 (`Shape3D`) は宣言的な `Model3D` ツリーとして保持
-//!   (manifold-rs への evaluate は GUI 側で行う)
+//!   (manifold-csg への evaluate は GUI 側で行う)
 
 use crate::syntax::ast::Pattern;
 use std::cell::RefCell;
@@ -44,7 +44,7 @@ pub enum Value {
         arity: usize,
         args: Vec<Value>,
     },
-    /// 3D 幾何形状 (宣言ツリー)。`manifold_bridge::evaluate` で manifold-rs に橋渡しする。
+    /// 3D 幾何形状 (宣言ツリー)。`manifold_bridge::evaluate` で manifold-csg に橋渡しする。
     Shape3D(Model3D),
     /// 2D 幾何形状 (extrude / revolve の入力)。
     Shape2D(Model2D),
@@ -143,7 +143,7 @@ impl Env {
     }
 }
 
-/// 3D 幾何形状を表す宣言ツリー (manifold-rs に渡す前の中間表現)。
+/// 3D 幾何形状を表す宣言ツリー (manifold-csg に渡す前の中間表現)。
 /// `manifold_bridge::evaluate` で実体化する。
 #[derive(Clone, Debug, PartialEq)]
 pub enum Model3D {
@@ -209,7 +209,7 @@ pub enum Model3D {
     Empty,
 }
 
-/// 2D 形状の宣言ツリー (manifold-rs の polygon ring に変換する前段)。
+/// 2D 形状の宣言ツリー (manifold-csg の CrossSection に変換する前段)。
 #[derive(Clone, Debug, PartialEq)]
 pub enum Model2D {
     /// 単一閉路ポリゴン。先頭点と終点が同じでも違ってもよく、bridge 側で閉じる。

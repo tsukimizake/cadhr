@@ -24,7 +24,6 @@ exclude = [
 iced = { version = "0.14", features = ["advanced", "tokio"] }
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.33"
-manifold-rs = "0.7"
 cadhr-lang = { path = "cadhr-lang" }
 threemf = "0.8"
 serde = { version = "1", features = ["derive"] }

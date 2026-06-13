@@ -1,22 +1,19 @@
-//! `Model3D` (宣言ツリー) → `manifold-rs` の `Manifold` に評価する橋渡し。
+//! `Model3D` (宣言ツリー) → `manifold-csg` の `Manifold` に評価する橋渡し。
 //!
 //! evaluator (`runtime::eval`) は副作用なく `Model3D` を組み立てるだけ。実際の
-//! CSG 計算 / メッシュ生成はここで manifold-rs に投げる。GUI 側はここから
+//! CSG 計算 / メッシュ生成はここで manifold-csg に投げる。GUI 側はここから
 //! `Vertex` / `index` を受け取って iced shader に流す。
 //!
-//! manifold-rs 自体は cargo feature `manifold` の有無で gating する。feature OFF の
+//! manifold-csg 自体は cargo feature `manifold` の有無で gating する。feature OFF の
 //! ビルドではこのモジュール全体が disable される。
 
 #![cfg(feature = "manifold")]
 
 use crate::runtime::value::{Model2D, Model3D, Plane3D};
-use manifold_rs::{Manifold, Mesh};
+use manifold_csg::{CrossSection, Manifold};
 use std::path::{Path as StdPath, PathBuf};
 
-const DEFAULT_SEGMENTS: u32 = 64;
-/// 2D boolean 用に 2D を 3D へ薄く extrude するときの高さ。`THIN > 0` なら manifold-rs が
-/// 動く最小 unit。
-const THIN_EXTRUDE_HEIGHT: f64 = 0.001;
+const DEFAULT_SEGMENTS: i32 = 64;
 
 #[derive(Debug, Clone)]
 pub enum BridgeError {
@@ -42,9 +39,9 @@ pub fn evaluate_with_paths(
 ) -> Result<Manifold, BridgeError> {
     match model {
         Model3D::Empty => Ok(Manifold::empty()),
-        Model3D::Cube { x, y, z } => Ok(Manifold::cube(*x, *y, *z)),
+        Model3D::Cube { x, y, z } => Ok(Manifold::cube(*x, *y, *z, false)),
         Model3D::Sphere(r) => Ok(Manifold::sphere(*r, DEFAULT_SEGMENTS)),
-        Model3D::Cylinder { r, h } => Ok(Manifold::cylinder(*r, *r, *h, DEFAULT_SEGMENTS)),
+        Model3D::Cylinder { r, h } => Ok(Manifold::cylinder(*h, *r, *r, DEFAULT_SEGMENTS, false)),
         Model3D::Tetrahedron => Ok(Manifold::tetrahedron()),
 
         Model3D::Union(a, b) => {
@@ -112,140 +109,72 @@ pub fn bbox_center_3d(
     include_paths: &[PathBuf],
 ) -> Result<(f64, f64, f64), BridgeError> {
     let m = evaluate_with_paths(model, include_paths)?;
-    let mesh = m.to_mesh();
-    let verts = mesh.vertices();
-    let stride = mesh.num_props() as usize;
-    if stride == 0 || verts.is_empty() {
-        return Err(BridgeError::InvalidShape(
-            "bbox_center_3d: 空の Shape3D".to_string(),
-        ));
-    }
-    let mut lo = [f64::INFINITY; 3];
-    let mut hi = [f64::NEG_INFINITY; 3];
-    for chunk in verts.chunks(stride) {
-        for i in 0..3 {
-            let v = chunk[i] as f64;
-            if v < lo[i] {
-                lo[i] = v;
-            }
-            if v > hi[i] {
-                hi[i] = v;
-            }
-        }
-    }
-    Ok((
-        (lo[0] + hi[0]) / 2.0,
-        (lo[1] + hi[1]) / 2.0,
-        (lo[2] + hi[2]) / 2.0,
-    ))
+    let bb = m
+        .bounding_box()
+        .ok_or_else(|| BridgeError::InvalidShape("bbox_center_3d: 空の Shape3D".to_string()))?;
+    let [cx, cy, cz] = bb.center();
+    Ok((cx, cy, cz))
 }
 
 /// Shape2D の AABB 中心を計算。`center2d` builtin の本体。
 pub fn bbox_center_2d(model: &Model2D) -> Result<(f64, f64), BridgeError> {
-    let rings = to_polygon_rings(model)
+    let cs = to_cross_section(model)
+        .filter(|cs| !cs.is_empty())
         .ok_or_else(|| BridgeError::InvalidShape("bbox_center_2d: 空の Shape2D".to_string()))?;
-    bbox_2d(&rings)
-        .ok_or_else(|| BridgeError::InvalidShape("bbox_center_2d: bbox が計算できない".to_string()))
+    let bounds = cs.bounds();
+    let [min_x, min_y] = bounds.min();
+    let [max_x, max_y] = bounds.max();
+    Ok(((min_x + max_x) / 2.0, (min_y + max_y) / 2.0))
 }
 
-/// `Model2D` を平坦な polygon ring 列に変換する。CSG ノードは extrude → 3D boolean →
-/// project で平坦化する (manifold-rs 0.6 が CrossSection を持たない workaround)。
-fn to_polygon_rings(profile: &Model2D) -> Option<Vec<Vec<f64>>> {
+/// `Model2D` を `CrossSection` (Clipper2 ベースの 2D 領域) に評価する。
+/// CSG ノードは manifold-csg のネイティブ 2D boolean をそのまま使う。
+fn to_cross_section(profile: &Model2D) -> Option<CrossSection> {
     match profile {
         Model2D::Polygon(points) if !points.is_empty() => {
-            let mut pairs: Vec<(f64, f64)> = points.clone();
-            ensure_ccw(&mut pairs);
-            let mut ring = Vec::with_capacity(pairs.len() * 2);
-            for (x, y) in pairs {
-                ring.push(x);
-                ring.push(y);
-            }
-            Some(vec![ring])
+            // from_simple_polygon は FillRule::Positive なので CCW を保証する必要がある。
+            let mut pts: Vec<[f64; 2]> = points.iter().map(|&(x, y)| [x, y]).collect();
+            ensure_ccw(&mut pts);
+            Some(CrossSection::from_simple_polygon(&pts))
         }
-        Model2D::Empty2D => None,
-        Model2D::Union2D(a, b) => match (to_polygon_rings(a), to_polygon_rings(b)) {
-            (Some(ra), Some(rb)) => Some(boolean_2d(&ra, &rb, |x, y| x.union(y))),
-            (Some(r), None) | (None, Some(r)) => Some(r),
+        Model2D::Empty2D | Model2D::Polygon(_) => None,
+        Model2D::Union2D(a, b) => match (to_cross_section(a), to_cross_section(b)) {
+            (Some(ca), Some(cb)) => Some(ca.union(&cb)),
+            (Some(c), None) | (None, Some(c)) => Some(c),
             (None, None) => None,
         },
-        Model2D::Diff2D(a, b) => match (to_polygon_rings(a), to_polygon_rings(b)) {
-            (Some(ra), Some(rb)) => Some(boolean_2d(&ra, &rb, |x, y| x.difference(y))),
-            (Some(r), None) => Some(r),
+        Model2D::Diff2D(a, b) => match (to_cross_section(a), to_cross_section(b)) {
+            (Some(ca), Some(cb)) => Some(ca.difference(&cb)),
+            (Some(c), None) => Some(c),
             _ => None,
         },
-        Model2D::Intersect2D(a, b) => match (to_polygon_rings(a), to_polygon_rings(b)) {
-            (Some(ra), Some(rb)) => Some(boolean_2d(&ra, &rb, |x, y| x.intersection(y))),
+        Model2D::Intersect2D(a, b) => match (to_cross_section(a), to_cross_section(b)) {
+            (Some(ca), Some(cb)) => Some(ca.intersection(&cb)),
             _ => None,
         },
         Model2D::Translate2D { shape, src, dst } => {
-            let rings = to_polygon_rings(shape)?;
-            let dx = dst.0 - src.0;
-            let dy = dst.1 - src.1;
-            let shifted: Vec<Vec<f64>> = rings
-                .into_iter()
-                .map(|ring| {
-                    ring.chunks_exact(2)
-                        .flat_map(|c| vec![c[0] + dx, c[1] + dy])
-                        .collect()
-                })
-                .collect();
-            Some(shifted)
-        }
-        Model2D::Polygon(_) => None,
-    }
-}
-
-fn boolean_2d(
-    rings_a: &[Vec<f64>],
-    rings_b: &[Vec<f64>],
-    op: impl FnOnce(&Manifold, &Manifold) -> Manifold,
-) -> Vec<Vec<f64>> {
-    let refs_a: Vec<&[f64]> = rings_a.iter().map(|r| r.as_slice()).collect();
-    let refs_b: Vec<&[f64]> = rings_b.iter().map(|r| r.as_slice()).collect();
-    let ma = Manifold::extrude(&refs_a, THIN_EXTRUDE_HEIGHT, 0, 0.0, 1.0, 1.0);
-    let mb = Manifold::extrude(&refs_b, THIN_EXTRUDE_HEIGHT, 0, 0.0, 1.0, 1.0);
-    let result = op(&ma, &mb);
-    let polygons = result.project();
-    let mut rings = Vec::with_capacity(polygons.size());
-    for i in 0..polygons.size() {
-        rings.push(polygons.get_as_slice(i).to_vec());
-    }
-    rings
-}
-
-fn bbox_2d(rings: &[Vec<f64>]) -> Option<(f64, f64)> {
-    let mut min_x = f64::INFINITY;
-    let mut max_x = f64::NEG_INFINITY;
-    let mut min_y = f64::INFINITY;
-    let mut max_y = f64::NEG_INFINITY;
-    for ring in rings {
-        for c in ring.chunks_exact(2) {
-            min_x = min_x.min(c[0]);
-            max_x = max_x.max(c[0]);
-            min_y = min_y.min(c[1]);
-            max_y = max_y.max(c[1]);
+            let cs = to_cross_section(shape)?;
+            Some(cs.translate(dst.0 - src.0, dst.1 - src.1))
         }
     }
-    if min_x.is_infinite() {
-        None
-    } else {
-        Some(((min_x + max_x) / 2.0, (min_y + max_y) / 2.0))
-    }
 }
 
-fn prep_rings(rings: Vec<Vec<f64>>, plane: Plane3D) -> Vec<Vec<f64>> {
+/// extrude/revolve 前の平面合わせ。XZ 押し出しは Y 反転 + ensure_ccw が必要
+/// (apply_plane_rotation の rotate(-90,0,0) との辻褄合わせ)。
+fn prep_cross_section(cs: CrossSection, plane: Plane3D) -> CrossSection {
     if plane != Plane3D::XZ {
-        return rings;
+        return cs;
     }
-    // XZ 押し出しは Y 反転 + ensure_ccw が必要 (rotate(-90,0,0) との辻褄合わせ)
-    rings
+    let flipped: Vec<Vec<[f64; 2]>> = cs
+        .to_polygons()
         .into_iter()
         .map(|ring| {
-            let mut pairs: Vec<(f64, f64)> = ring.chunks_exact(2).map(|c| (c[0], -c[1])).collect();
-            ensure_ccw(&mut pairs);
-            pairs.into_iter().flat_map(|(x, y)| vec![x, y]).collect()
+            let mut pts: Vec<[f64; 2]> = ring.into_iter().map(|[x, y]| [x, -y]).collect();
+            ensure_ccw(&mut pts);
+            pts
         })
-        .collect()
+        .collect();
+    CrossSection::from_polygons(&flipped)
 }
 
 fn apply_plane_rotation(m: Manifold, plane: Plane3D) -> Manifold {
@@ -260,17 +189,16 @@ fn extrude_polygon(
     profile: &Model2D,
     plane: Plane3D,
     height: f64,
-    n_div: u32,
+    slices: u32,
     twist: f64,
     sx: f64,
     sy: f64,
 ) -> Result<Manifold, BridgeError> {
-    let rings = match to_polygon_rings(profile) {
-        Some(r) if !r.is_empty() => prep_rings(r, plane),
+    let cs = match to_cross_section(profile) {
+        Some(cs) if !cs.is_empty() => prep_cross_section(cs, plane),
         _ => return Ok(Manifold::empty()),
     };
-    let refs: Vec<&[f64]> = rings.iter().map(|r| r.as_slice()).collect();
-    let m = Manifold::extrude(&refs, height, n_div, twist, sx, sy);
+    let m = Manifold::extrude_with_options(&cs, height, slices as i32, twist, sx, sy);
     Ok(apply_plane_rotation(m, plane))
 }
 
@@ -279,12 +207,11 @@ fn revolve_polygon(
     plane: Plane3D,
     degrees: f64,
 ) -> Result<Manifold, BridgeError> {
-    let rings = match to_polygon_rings(profile) {
-        Some(r) if !r.is_empty() => prep_rings(r, plane),
+    let cs = match to_cross_section(profile) {
+        Some(cs) if !cs.is_empty() => prep_cross_section(cs, plane),
         _ => return Ok(Manifold::empty()),
     };
-    let refs: Vec<&[f64]> = rings.iter().map(|r| r.as_slice()).collect();
-    let m = Manifold::revolve(&refs, DEFAULT_SEGMENTS, degrees);
+    let m = Manifold::revolve(&cs, DEFAULT_SEGMENTS, degrees);
     Ok(apply_plane_rotation(m, plane))
 }
 
@@ -315,8 +242,8 @@ fn load_stl(path: &str, include_paths: &[PathBuf]) -> Result<Manifold, BridgeErr
         .iter()
         .flat_map(|f| f.vertices.iter().map(|&i| i as u32))
         .collect();
-    let mesh = Mesh::new(&verts, &indices);
-    Ok(Manifold::from_mesh(mesh))
+    Manifold::from_mesh_f32(&verts, 3, &indices)
+        .map_err(|e| BridgeError::Stl(format!("{}: manifold 化失敗: {e}", resolved.display())))
 }
 
 fn sweep_polygon(
@@ -324,22 +251,20 @@ fn sweep_polygon(
     plane: Plane3D,
     path: &[(f64, f64, f64)],
 ) -> Result<Manifold, BridgeError> {
-    let rings = to_polygon_rings(profile)
+    let cs = to_cross_section(profile)
+        .filter(|cs| !cs.is_empty())
         .ok_or_else(|| BridgeError::InvalidShape("sweep_extrude: profile が空".to_string()))?;
-    if rings.is_empty() {
-        return Ok(Manifold::empty());
-    }
-    let profile_pairs = flat_to_pairs(&rings[0]);
+    let contours = cs.to_polygons();
+    let first = contours
+        .first()
+        .ok_or_else(|| BridgeError::InvalidShape("sweep_extrude: profile が空".to_string()))?;
+    let profile_pairs: Vec<(f64, f64)> = first.iter().map(|&[x, y]| (x, y)).collect();
     // path 3D → XZ 平面投影 (sweep.rs 互換)。XY/YZ も将来対応可能だが、まず XZ パスのみ。
     let path_xz: Vec<(f64, f64)> = path.iter().map(|p| (p.0, p.2)).collect();
     let (verts, indices) = sweep_mesh(&profile_pairs, &path_xz)?;
-    let mesh = Mesh::new(&verts, &indices);
-    let m = Manifold::from_mesh(mesh);
+    let m = Manifold::from_mesh_f32(&verts, 3, &indices)
+        .map_err(|e| BridgeError::InvalidShape(format!("sweep_extrude: manifold 化失敗: {e}")))?;
     Ok(apply_plane_rotation(m, plane))
-}
-
-fn flat_to_pairs(flat: &[f64]) -> Vec<(f64, f64)> {
-    flat.chunks_exact(2).map(|c| (c[0], c[1])).collect()
 }
 
 /// 2D path に沿った sweep extrude。`profile` は閉路ポリゴンの (x, y) ペア列。
@@ -434,14 +359,14 @@ fn ring_center(vertices: &[f32], base_offset_floats: usize, n_profile: usize) ->
     ((sx / n) as f32, (sy / n) as f32, (sz / n) as f32)
 }
 
-fn ensure_ccw(points: &mut Vec<(f64, f64)>) {
+fn ensure_ccw(points: &mut Vec<[f64; 2]>) {
     if points.len() < 3 {
         return;
     }
     let mut signed_area = 0.0;
     for i in 0..points.len() {
-        let (x1, y1) = points[i];
-        let (x2, y2) = points[(i + 1) % points.len()];
+        let [x1, y1] = points[i];
+        let [x2, y2] = points[(i + 1) % points.len()];
         signed_area += x1 * y2 - x2 * y1;
     }
     if signed_area < 0.0 {
@@ -460,8 +385,8 @@ pub fn to_mesh_arrays_with_paths(
 ) -> Result<MeshArrays, BridgeError> {
     let manifold = evaluate_with_paths(model, include_paths)?;
     let with_normals = manifold.calculate_normals(0, 30.0);
-    let mesh = with_normals.to_mesh();
-    Ok(MeshArrays::from_mesh(&mesh))
+    let (verts, num_props, indices) = with_normals.to_mesh_f32();
+    Ok(MeshArrays::from_mesh_data(&verts, num_props, &indices))
 }
 
 /// GUI に渡しやすい平坦化したメッシュ表現。
@@ -472,24 +397,24 @@ pub struct MeshArrays {
 }
 
 impl MeshArrays {
-    fn from_mesh(mesh: &Mesh) -> Self {
-        let verts_flat = mesh.vertices();
-        let num_props = mesh.num_props() as usize;
-        let n_vertices = verts_flat.len() / num_props;
+    /// `vert_props` は頂点ごとに `num_props` 個の f32 (先頭 3 つが位置、`num_props >= 6` なら
+    /// 4..6 が法線) が並んだ平坦バッファ。
+    fn from_mesh_data(vert_props: &[f32], num_props: usize, indices: &[u32]) -> Self {
+        let n_vertices = if num_props == 0 {
+            0
+        } else {
+            vert_props.len() / num_props
+        };
         let mut positions = Vec::with_capacity(n_vertices);
         let mut normals = Vec::with_capacity(n_vertices);
         for i in 0..n_vertices {
             let base = i * num_props;
-            positions.push([
-                verts_flat[base] as f32,
-                verts_flat[base + 1] as f32,
-                verts_flat[base + 2] as f32,
-            ]);
+            positions.push([vert_props[base], vert_props[base + 1], vert_props[base + 2]]);
             if num_props >= 6 {
                 normals.push([
-                    verts_flat[base + 3] as f32,
-                    verts_flat[base + 4] as f32,
-                    verts_flat[base + 5] as f32,
+                    vert_props[base + 3],
+                    vert_props[base + 4],
+                    vert_props[base + 5],
                 ]);
             } else {
                 normals.push([0.0, 0.0, 1.0]);
@@ -498,7 +423,7 @@ impl MeshArrays {
         Self {
             positions,
             normals,
-            indices: mesh.indices().to_vec(),
+            indices: indices.to_vec(),
         }
     }
 
@@ -510,26 +435,10 @@ impl MeshArrays {
 /// 評価済み `Manifold` の AABB を返す。`center3d` builtin の実装で使う。
 pub fn bbox_of(model: &Model3D) -> Option<((f64, f64, f64), (f64, f64, f64))> {
     let manifold = evaluate(model).ok()?;
-    let mesh = manifold.to_mesh();
-    let verts = mesh.vertices();
-    let stride = mesh.num_props() as usize;
-    if stride == 0 || verts.is_empty() {
-        return None;
-    }
-    let mut lo = [f64::INFINITY; 3];
-    let mut hi = [f64::NEG_INFINITY; 3];
-    for chunk in verts.chunks(stride) {
-        for i in 0..3 {
-            let v = chunk[i] as f64;
-            if v < lo[i] {
-                lo[i] = v;
-            }
-            if v > hi[i] {
-                hi[i] = v;
-            }
-        }
-    }
-    Some(((lo[0], lo[1], lo[2]), (hi[0], hi[1], hi[2])))
+    let bb = manifold.bounding_box()?;
+    let [min_x, min_y, min_z] = bb.min();
+    let [max_x, max_y, max_z] = bb.max();
+    Some(((min_x, min_y, min_z), (max_x, max_y, max_z)))
 }
 
 #[cfg(test)]

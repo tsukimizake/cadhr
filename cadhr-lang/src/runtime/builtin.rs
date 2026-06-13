@@ -1,7 +1,7 @@
 //! builtin 関数の評価実装。
 //!
 //! `sema::builtin::registry()` で型シグネチャを定義しているのと対応する形で、各
-//! 関数の実行時挙動をここに登録する。manifold-rs 呼び出しは行わず、宣言的な
+//! 関数の実行時挙動をここに登録する。manifold-csg 呼び出しは行わず、宣言的な
 //! `Model3D` を組み立てて `manifold_bridge::evaluate` に渡す。
 
 use crate::runtime::value::{Model2D, Model3D, Plane3D, Value};

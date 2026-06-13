@@ -184,8 +184,7 @@ pub fn run_collision_job(params: CollisionJobParams) -> EvalJobResult {
             Ok(m) => m,
             Err(_) => continue,
         };
-        let mesh = mi.to_mesh();
-        if mesh.vertices().is_empty() {
+        if mi.is_empty() {
             continue;
         }
         for j in (i + 1)..n {
@@ -193,8 +192,7 @@ pub fn run_collision_job(params: CollisionJobParams) -> EvalJobResult {
             let inter = Model3D::Intersect(Box::new(models[i].clone()), Box::new(models[j].clone()));
             // 空かどうか確認: evaluate して vertex 数チェック
             if let Ok(m) = evaluate_with_paths(&inter, &params.search_paths) {
-                let mesh = m.to_mesh();
-                if !mesh.vertices().is_empty() {
+                if !m.is_empty() {
                     collisions.push(inter);
                     bom.push(format!("part #{i} ⊗ part #{j}: collision"));
                 }
