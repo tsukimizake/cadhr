@@ -154,6 +154,50 @@ impl Infer {
         }
     }
 
+    /// sig を **skolem 定数** で instantiate する。各量化変数を「自分自身としか
+    /// 単一化しない固有の型定数」(`$skN`) に置き換える。body 検査で skolem が具体型や
+    /// 別の skolem に縛られると単一化が失敗し、「signature が一般的すぎる」
+    /// (`f : a -> a` なのに body が `a` を Int に固定する等) を検出できる。
+    /// 現状 signature は制約 (`Num a =>`) を持てないので、skolem に課されるクラスは
+    /// 常に空 = poly 変数への class メソッド使用は型エラーになる (それが正しい)。
+    fn skolemize(&mut self, sc: &InferScheme) -> InferTy {
+        let mut map: HashMap<u32, InferTy> = HashMap::new();
+        self.skolem_walk(&sc.ty, &mut map)
+    }
+
+    fn skolem_walk(&mut self, t: &InferTy, map: &mut HashMap<u32, InferTy>) -> InferTy {
+        match resolve(t) {
+            InferTy::Var(cell) => {
+                let gid = match &*cell.borrow() {
+                    VarCell::Generic(id) => Some(*id),
+                    _ => None,
+                };
+                match gid {
+                    Some(id) => {
+                        if let Some(sk) = map.get(&id) {
+                            return sk.clone();
+                        }
+                        let sk = InferTy::con(&format!("$sk{}", self.var_gen.fresh().0));
+                        map.insert(id, sk.clone());
+                        sk
+                    }
+                    None => InferTy::Var(cell),
+                }
+            }
+            InferTy::Con(n, args) => {
+                InferTy::Con(n, args.iter().map(|a| self.skolem_walk(a, map)).collect())
+            }
+            InferTy::Arrow(f, to) => {
+                InferTy::arrow(self.skolem_walk(&f, map), self.skolem_walk(&to, map))
+            }
+            InferTy::Record(fs) => InferTy::Record(
+                fs.iter()
+                    .map(|(n, t)| (n.clone(), self.skolem_walk(t, map)))
+                    .collect(),
+            ),
+        }
+    }
+
     /// 型 ty の generalize: `level > current_level` の未束縛変数を Generic 化して
     /// 全称化する。pending のうち、generalize 対象の変数だけで構成される制約を
     /// scheme.constraints へ「持ち上げ」、それ以外は pending に残す。
@@ -594,6 +638,78 @@ fn infer_scheme_to_scheme(isc: &InferScheme) -> Scheme {
     }
 }
 
+/// scheme の量化変数を出現順に `0,1,2,..` へリナンバーする (LSP hover 等の表示用)。
+/// 推論で割り当てた生の id (`t47` 等) は見づらいので正規化する。
+fn normalize_scheme(sc: &Scheme) -> Scheme {
+    let quant: HashSet<u32> = sc.vars.iter().map(|v| v.0).collect();
+    let mut remap: HashMap<u32, u32> = HashMap::new();
+    assign_order(&sc.ty, &quant, &mut remap);
+    for c in &sc.constraints {
+        assign_order(&c.ty, &quant, &mut remap);
+    }
+    let ty = remap_type(&sc.ty, &remap);
+    let constraints = sc
+        .constraints
+        .iter()
+        .map(|c| Constraint {
+            class_name: c.class_name.clone(),
+            ty: remap_type(&c.ty, &remap),
+        })
+        .collect();
+    let mut vars: Vec<TyVar> = sc
+        .vars
+        .iter()
+        .map(|v| TyVar(*remap.get(&v.0).unwrap_or(&v.0)))
+        .collect();
+    vars.sort();
+    Scheme {
+        vars,
+        constraints,
+        ty,
+    }
+}
+
+/// 量化変数を初出順に `remap` へ登録する。
+fn assign_order(t: &Type, quant: &HashSet<u32>, remap: &mut HashMap<u32, u32>) {
+    match t {
+        Type::Var(TyVar(id)) => {
+            if quant.contains(id) && !remap.contains_key(id) {
+                let n = remap.len() as u32;
+                remap.insert(*id, n);
+            }
+        }
+        Type::Con(_, args) => {
+            for a in args {
+                assign_order(a, quant, remap);
+            }
+        }
+        Type::Arrow(f, to) => {
+            assign_order(f, quant, remap);
+            assign_order(to, quant, remap);
+        }
+        Type::Record(fs) => {
+            for (_, t) in fs {
+                assign_order(t, quant, remap);
+            }
+        }
+    }
+}
+
+fn remap_type(t: &Type, remap: &HashMap<u32, u32>) -> Type {
+    match t {
+        Type::Var(TyVar(id)) => Type::Var(TyVar(*remap.get(id).unwrap_or(id))),
+        Type::Con(n, args) => {
+            Type::Con(n.clone(), args.iter().map(|a| remap_type(a, remap)).collect())
+        }
+        Type::Arrow(f, to) => Type::arrow(remap_type(f, remap), remap_type(to, remap)),
+        Type::Record(fs) => Type::Record(
+            fs.iter()
+                .map(|(n, t)| (n.clone(), remap_type(t, remap)))
+                .collect(),
+        ),
+    }
+}
+
 /// `TypeExpr` の span を取り出す helper。
 fn span_of_type_expr(t: &TypeExpr) -> Span {
     match t {
@@ -880,8 +996,9 @@ fn infer_value_scc(
     let mut member_expected: HashMap<String, InferTy> = HashMap::new();
     for m in scc {
         let expected = if let Some(sc) = infer.signatures.get(&m.name).cloned() {
+            // body 検査では sig を skolem 化し、sig が body より一般的すぎる場合を検出。
             let isc = infer.scheme_to_infer(&sc);
-            infer.instantiate_with(&isc, m.span, &m.name)
+            infer.skolemize(&isc)
         } else {
             let fresh = infer.fresh();
             local_env = local_env.extend(&m.name, InferScheme::mono(fresh.clone()));
@@ -918,13 +1035,13 @@ fn infer_value_scc(
         if let Some(declared) = infer.signatures.get(&m.name).cloned() {
             let isc = infer.scheme_to_infer(&declared);
             *env = env.extend(&m.name, isc);
-            result.insert(m.name.clone(), declared);
+            result.insert(m.name.clone(), normalize_scheme(&declared));
         } else {
             let expected = member_expected.get(&m.name).unwrap().clone();
             let isc = infer.generalize(&expected);
             let scheme = infer_scheme_to_scheme(&isc);
             *env = env.extend(&m.name, isc);
-            result.insert(m.name.clone(), scheme);
+            result.insert(m.name.clone(), normalize_scheme(&scheme));
         }
     }
 }
@@ -1849,6 +1966,23 @@ mod tests {
         let (schemes, diag) = infer_src("g x = if x then x else x");
         assert!(diag.is_empty(), "diags: {diag:?}");
         assert_eq!(schemes["g"].ty.to_string(), "Bool -> Bool");
+    }
+
+    #[test]
+    fn signature_too_general_is_rejected() {
+        // sig は a -> a と主張するが body は Num a を要求 → 一般的すぎる。
+        // skolem 化により a が縛られると検出される。
+        let (_schemes, diag) = infer_src("f : a -> a\nf x = x + 1");
+        assert!(!diag.is_empty(), "sig-too-general はエラーになるべき");
+    }
+
+    #[test]
+    fn genuinely_polymorphic_signature_accepted_and_normalized() {
+        // 真に多相な sig は通り、量化変数は 0 始まりに正規化される。
+        let (schemes, diag) = infer_src("id : a -> a\nid x = x");
+        assert!(diag.is_empty(), "diags: {diag:?}");
+        assert_eq!(schemes["id"].vars.len(), 1);
+        assert_eq!(schemes["id"].ty.to_string(), "t0 -> t0");
     }
 
     #[test]
