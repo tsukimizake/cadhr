@@ -85,7 +85,7 @@ pub struct BindingSignature {
     pub params: Vec<BindingParam>,
 }
 
-/// binding の 1 引数。同名の `slider` decl があれば `range` がセットされる。
+/// binding の 1 引数。`slider <binding>.<param>` decl があれば `range` がセットされる。
 #[derive(Clone, Debug)]
 pub struct BindingParam {
     pub name: String,
@@ -236,7 +236,10 @@ fn collect_params(v: &syntax::ast::ValueDecl, sliders: &[SliderDecl]) -> Vec<Bin
             _ => None,
         })
         .map(|name| {
-            let range = sliders.iter().find(|s| s.name == name).cloned();
+            let range = sliders
+                .iter()
+                .find(|s| s.binding == v.name && s.param == name)
+                .cloned();
             BindingParam { name, range }
         })
         .collect()
@@ -385,13 +388,35 @@ mod tests {
 
     #[test]
     fn slider_default_used() {
-        let src = "main n = cube 1.0 1.0 1.0\nslider n = 6.0 .. 80.0";
+        let src = "main n = cube 1.0 1.0 1.0\nslider main.n = 6.0 .. 80.0";
         let prog = compile(src).expect("compile");
         let sig = prog.binding_signature("main").expect("main signature");
         assert_eq!(sig.params.len(), 1);
         assert!(sig.params[0].range.is_some());
         let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
         assert_eq!(out.models.len(), 1);
+    }
+
+    #[test]
+    fn slider_range_scoped_to_binding() {
+        // 同名引数 `length` を持つ 2 binding。slider は binding ごとに別範囲を付与する。
+        let src = "\
+main length = cube 10.0 10.0 length
+honi length = sphere length
+slider main.length = 6.0 .. 80.0
+slider honi.length = 1.0 .. 10.0
+";
+        let prog = compile(src).expect("compile");
+        let main_range = prog.binding_signature("main").unwrap().params[0]
+            .range
+            .clone()
+            .expect("main.length range");
+        let honi_range = prog.binding_signature("honi").unwrap().params[0]
+            .range
+            .clone()
+            .expect("honi.length range");
+        assert_eq!((main_range.lo, main_range.hi), (6.0, 80.0));
+        assert_eq!((honi_range.lo, honi_range.hi), (1.0, 10.0));
     }
 
     #[test]

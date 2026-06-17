@@ -43,7 +43,7 @@ impl std::fmt::Display for AddKind {
 }
 
 const DEFAULT_EDITOR_TEXT: &str =
-    "main length =\n    cube 10.0 10.0 length\n\nslider length = 6.0 .. 80.0\n";
+    "main length =\n    cube 10.0 10.0 length\n\nslider main.length = 6.0 .. 80.0\n";
 
 trait DialogHandler {
     fn open_session(&self) -> Task<Msg>;

@@ -25,7 +25,8 @@ fn gear_train_runs_with_explicit_theta() {
 fn slider_is_extracted() {
     let prog = compile(SRC).expect("compile");
     assert_eq!(prog.sliders.len(), 1);
-    assert_eq!(prog.sliders[0].name, "t1");
+    assert_eq!(prog.sliders[0].binding, "main");
+    assert_eq!(prog.sliders[0].param, "t1");
     assert_eq!(prog.sliders[0].lo, 0.0);
     assert_eq!(prog.sliders[0].hi, 360.0);
 }

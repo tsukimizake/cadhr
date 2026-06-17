@@ -732,14 +732,21 @@ pub fn decl_parser<'tokens, 'src: 'tokens>()
             })
         });
 
-    // `slider name = expr`
+    // `slider binding.param = expr` (binding 修飾必須だが、未修飾もパースして
+    // 意味解析でエラー報告するため `.param` は省略可にしておく)
     let slider = just(Token::Slider)
         .ignore_then(lower_ident())
+        .then(just(Token::Dot).ignore_then(lower_ident()).or_not())
         .then_ignore(just(Token::Eq))
         .then(expr.clone())
-        .map_with(|(name, body), e| {
+        .map_with(|((head, tail), body), e| {
+            let (binding, param) = match tail {
+                Some(p) => (Some(head), p),
+                None => (None, head),
+            };
             Decl::Slider(SliderDecl {
-                name,
+                binding,
+                param,
                 body,
                 span: dspan(e.span()),
             })
@@ -984,10 +991,11 @@ mod tests {
 
     #[test]
     fn slider_decl() {
-        let m = parse_ok("slider length = 6.0 .. 80.0");
+        let m = parse_ok("slider main.length = 6.0 .. 80.0");
         match &m.decls[0] {
             Decl::Slider(s) => {
-                assert_eq!(s.name, "length");
+                assert_eq!(s.binding.as_deref(), Some("main"));
+                assert_eq!(s.param, "length");
                 match &s.body {
                     Expr::Range { lo, hi, .. } => {
                         assert!(matches!(**lo, Expr::Lit(Lit::Float(_), _)));
@@ -1136,7 +1144,7 @@ main length =
     let bolt = cube 10 10 length in
     { models = [bolt], bom = [], controls = [] }
 
-slider length = 6.0 .. 80.0
+slider main.length = 6.0 .. 80.0
 ";
         let m = parse_ok(src);
         assert!(m.header.is_some());

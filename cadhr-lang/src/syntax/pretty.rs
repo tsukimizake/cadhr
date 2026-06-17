@@ -143,7 +143,11 @@ fn pretty_decl(d: &Decl, buf: &mut String) {
         }
         Decl::Slider(s) => {
             buf.push_str("slider ");
-            buf.push_str(&s.name);
+            if let Some(binding) = &s.binding {
+                buf.push_str(binding);
+                buf.push('.');
+            }
+            buf.push_str(&s.param);
             buf.push_str(" = ");
             pretty_expr(&s.body, 0, buf);
         }
@@ -587,7 +591,7 @@ mod tests {
 
     #[test]
     fn rt_slider() {
-        round_trip("slider length = 6.0 .. 80.0");
+        round_trip("slider main.length = 6.0 .. 80.0");
     }
 
     #[test]
@@ -658,7 +662,7 @@ main length =
     let bolt = cube 10 10 length in
     { models = [bolt], bom = [], controls = [] }
 
-slider length = 6.0 .. 80.0
+slider main.length = 6.0 .. 80.0
 ";
         round_trip(src);
     }

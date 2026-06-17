@@ -9,4 +9,4 @@ main x =
     in
     { models = [shape], bom = [], controls = [] }
 
-slider x = 0.0 .. 50.0
+slider main.x = 0.0 .. 50.0

@@ -50,4 +50,4 @@ main t1 =
     , controls = []
     }
 
-slider t1 = 0.0 .. 360.0
+slider main.t1 = 0.0 .. 360.0

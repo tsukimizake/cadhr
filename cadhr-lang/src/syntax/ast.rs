@@ -77,7 +77,7 @@ pub enum Decl {
     Type(TypeDecl),
     /// `type alias R = { f : T }`
     TypeAlias(TypeAliasDecl),
-    /// `slider name = expr`
+    /// `slider binding.param = expr`
     Slider(SliderDecl),
 }
 
@@ -122,7 +122,10 @@ pub struct TypeAliasDecl {
 
 #[derive(Clone, Debug)]
 pub struct SliderDecl {
-    pub name: String,
+    /// `slider binding.param = ...` の binding 名。未修飾 `slider param = ...` なら
+    /// `None` (パースは通すが `extract_sliders` がエラー報告する)。
+    pub binding: Option<String>,
+    pub param: String,
     pub body: Expr,
     pub span: Span,
 }

@@ -198,6 +198,17 @@ pub enum Diagnostic {
         name: String,
         related: Vec<RelatedInfo>,
     },
+    /// `slider param = ...` のように binding 修飾が無い (修飾必須)。
+    SliderUnqualified {
+        span: Span,
+        param: String,
+    },
+    /// `slider binding.param` の binding/param が実在しない (warning)。
+    SliderUnknownTarget {
+        span: Span,
+        binding: String,
+        param: String,
+    },
 
     // ---- 網羅性 (warning) ----
     NonExhaustiveAllGuarded {
@@ -250,6 +261,8 @@ impl Diagnostic {
             | AmbiguousConstraint { span, .. }
             | SliderNotRange { span, .. }
             | SliderNotConst { span, .. }
+            | SliderUnqualified { span, .. }
+            | SliderUnknownTarget { span, .. }
             | NonExhaustiveAllGuarded { span }
             | NonExhaustiveMissing { span, .. }
             | Runtime { span, .. } => *span,
@@ -259,7 +272,8 @@ impl Diagnostic {
     pub fn severity(&self) -> Severity {
         match self {
             Diagnostic::NonExhaustiveAllGuarded { .. }
-            | Diagnostic::NonExhaustiveMissing { .. } => Severity::Warning,
+            | Diagnostic::NonExhaustiveMissing { .. }
+            | Diagnostic::SliderUnknownTarget { .. } => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -355,6 +369,12 @@ impl Diagnostic {
             }
             SliderNotConst { name, .. } => format!(
                 "slider `{name}`: 右辺をコンパイル時に評価できません (main の引数や別 slider に依存している可能性)"
+            ),
+            SliderUnqualified { param, .. } => format!(
+                "slider は binding 修飾が必須です: `slider {param}` ではなく `slider <binding>.{param}` と書いてください"
+            ),
+            SliderUnknownTarget { binding, param, .. } => format!(
+                "slider `{binding}.{param}`: binding `{binding}` に引数 `{param}` がありません"
             ),
             NonExhaustiveAllGuarded { .. } => {
                 "case が非網羅です: 全ての arm に guard があり catch-all が無い".to_string()
