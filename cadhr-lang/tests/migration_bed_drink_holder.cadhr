@@ -19,6 +19,6 @@ main =
         cut_shape = cut slit w h
             |> translate3d (p3 0.0 0.0 0.0) (p3 ((x - slit) / 2.0) 0.0 0.0)
         hole_shape = hole w 80.0
-        shape = diff3d (diff3d base cut_shape) hole_shape
+        shape = base |> diff3d cut_shape |> diff3d hole_shape
     in
     { models = [shape], bom = [], controls = [] }

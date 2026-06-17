@@ -9,6 +9,6 @@ main =
             |> translate3d (p3 0.0 0.0 0.0) (p3 10.0 0.0 0.0)
         cut2 = cube (42.2 + cablecut) 30.0 20.0
             |> translate3d (p3 0.0 0.0 0.0) (p3 (10.0 - cablecut) 20.0 0.0)
-        shape = diff3d (diff3d base cut1) cut2
+        shape = base |> diff3d cut1 |> diff3d cut2
     in
     { models = [shape], bom = [], controls = [] }

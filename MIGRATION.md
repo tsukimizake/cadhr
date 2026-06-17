@@ -45,7 +45,7 @@
 | 旧 (Prolog) | 新 (Elm-like) |
 |------------|---------------|
 | `a + b` (3D union) | `union3d a b` |
-| `a - b` (3D diff) | `diff3d a b` |
+| `a - b` (3D diff) | `a \|> diff3d b` |
 | `a * b` (3D intersect) | `intersect3d a b` |
 | `cube(X, Y, Z)` | `cube X Y Z` |
 | `translate(p3(0,0,0), p3(X,Y,Z), S)` | `S \|> translate3d (p3 0.0 0.0 0.0) (p3 X Y Z)` |

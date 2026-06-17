@@ -130,7 +130,7 @@ pub fn registry() -> BuiltinRegistry {
         "diff3d",
         vec![shape3d(), shape3d()],
         shape3d(),
-        "3D 形状の差",
+        "3D 形状の差 (`base |> diff3d cut` = base - cut)",
     ));
     let r = r.add(mono(
         "intersect3d",
@@ -305,6 +305,16 @@ pub fn registry() -> BuiltinRegistry {
         "名前付き 2D control point。GUI ドラッグで上書き可能",
     ));
 
+    // -- Debug.log : forall a. String -> a -> a (Elm 互換)
+    let dbg_a = g.fresh();
+    let r = r.add(poly(
+        "Debug.log",
+        vec![dbg_a],
+        vec![string(), Type::Var(dbg_a)],
+        Type::Var(dbg_a),
+        "ラベル文字列と値を stderr に出力し、値をそのまま返す (Elm 互換)",
+    ));
+
     // -- Bezier 曲線サンプリング
     // List Point2D を返すので polygon の入力にそのまま渡せる:
     //   polygon ([p2 0 0] ++ bezier_quad (p2 0 0) (p2 5 10) (p2 10 0) 20)
@@ -379,5 +389,15 @@ mod tests {
         // forall a. Range a -> Range a -> Range a
         let s = inter.scheme.to_string();
         assert!(s.contains("Range") && s.contains("->"));
+    }
+
+    #[test]
+    fn debug_log_is_polymorphic_identity() {
+        let r = registry();
+        let dbg = r.get("Debug.log").unwrap();
+        assert_eq!(dbg.scheme.vars.len(), 1);
+        // forall a. String -> a -> a
+        let s = dbg.scheme.to_string();
+        assert!(s.contains("String") && s.contains("-> t1 -> t1"));
     }
 }

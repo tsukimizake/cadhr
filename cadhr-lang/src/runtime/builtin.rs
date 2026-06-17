@@ -185,9 +185,10 @@ pub fn registry() -> BuiltinEvalRegistry {
             )))
         })
         .add("diff3d", 2, |args| {
+            // `s |> diff3d cut` = s - cut。pipe で渡される base を第 2 引数に置く。
             Ok(Value::Shape3D(Model3D::Diff(
-                Box::new(as_shape3d(&args[0])?),
                 Box::new(as_shape3d(&args[1])?),
+                Box::new(as_shape3d(&args[0])?),
             )))
         })
         .add("intersect3d", 2, |args| {
@@ -447,8 +448,14 @@ pub fn registry() -> BuiltinEvalRegistry {
             RECORDED_CONTROLS.with(|r| r.borrow_mut().push((name, current)));
             Ok(point2d_value(current[0], current[1]))
         })
-        // -- Bezier サンプリング
-        .add("bezier_quad", 4, |args| {
+    // -- Debug.log : String -> a -> a (Elm 互換。stderr に出力して値をそのまま返す)
+    .add("Debug.log", 2, |args| {
+        let tag = as_string(&args[0]).unwrap_or_else(|_| format!("{}", args[0]));
+        eprintln!("[Debug.log] {tag}: {}", args[1]);
+        Ok(args[1].clone())
+    })
+    // -- Bezier サンプリング
+    .add("bezier_quad", 4, |args| {
             let p0 = as_point2d(&args[0])?;
             let c = as_point2d(&args[1])?;
             let p1 = as_point2d(&args[2])?;
