@@ -259,63 +259,94 @@ fn sweep_polygon(
         .first()
         .ok_or_else(|| BridgeError::InvalidShape("sweep_extrude: profile が空".to_string()))?;
     let profile_pairs: Vec<(f64, f64)> = first.iter().map(|&[x, y]| (x, y)).collect();
-    // path 3D → XZ 平面投影 (sweep.rs 互換)。XY/YZ も将来対応可能だが、まず XZ パスのみ。
-    let path_xz: Vec<(f64, f64)> = path.iter().map(|p| (p.0, p.2)).collect();
-    let (verts, indices) = sweep_mesh(&profile_pairs, &path_xz)?;
+    let (verts, indices) = sweep_mesh(&profile_pairs, path)?;
     let m = Manifold::from_mesh_f32(&verts, 3, &indices)
         .map_err(|e| BridgeError::InvalidShape(format!("sweep_extrude: manifold 化失敗: {e}")))?;
     Ok(apply_plane_rotation(m, plane))
 }
 
-/// 2D path に沿った sweep extrude。`profile` は閉路ポリゴンの (x, y) ペア列。
-/// `path` 2D を XZ 平面上の 3D 曲線 (px, 0, pz) として解釈する。
+/// 3D path に沿った sweep extrude。`profile` は XY 平面上の閉路ポリゴンの (x, y) ペア列で、
+/// 各 path 点で構築する rotation minimizing frame の (N, B) 平面に展開する。
+///
+/// フレームの定義:
+///   - T (tangent): path の進行方向
+///   - N: profile.x が向く軸 (初期は reference up = world Z から T 直交成分を取る。
+///        T が Z にほぼ平行なときは world Y にフォールバック)
+///   - B = N × T: profile.y が向く軸 (これを使うと start cap (center, j, j_next) /
+///                end cap (center, j_next, j) の winding が outward 向きになる)
+///   - 2 点目以降の N は前点 N を `T_prev → T_cur` の最小回転で並進輸送して求める
 fn sweep_mesh(
     profile: &[(f64, f64)],
-    path: &[(f64, f64)],
+    path: &[(f64, f64, f64)],
 ) -> Result<(Vec<f32>, Vec<u32>), BridgeError> {
     let n_profile = profile.len();
-    let n_path = path.len();
     if n_profile < 3 {
         return Err(BridgeError::InvalidShape(
             "sweep_extrude: profile 頂点 < 3".to_string(),
         ));
     }
+    // 連続する重複点を除去 (退化したセグメントで tangent 計算が壊れるのを防ぐ)
+    let mut clean: Vec<[f64; 3]> = Vec::with_capacity(path.len());
+    for p in path {
+        let v = [p.0, p.1, p.2];
+        if let Some(last) = clean.last() {
+            let dx = v[0] - last[0];
+            let dy = v[1] - last[1];
+            let dz = v[2] - last[2];
+            if dx * dx + dy * dy + dz * dz < 1e-24 {
+                continue;
+            }
+        }
+        clean.push(v);
+    }
+    let n_path = clean.len();
     if n_path < 2 {
         return Err(BridgeError::InvalidShape(
-            "sweep_extrude: path 頂点 < 2".to_string(),
+            "sweep_extrude: 退化を除いた path 頂点が 2 個未満".to_string(),
         ));
     }
-    let mut vertices: Vec<f32> = Vec::with_capacity(n_path * n_profile * 3 + 6);
+    // 各 path 点での tangent (端点は forward/backward、内点は centered diff)
+    let mut tangents: Vec<[f64; 3]> = Vec::with_capacity(n_path);
     for i in 0..n_path {
-        let (tx, ty) = if i == 0 {
-            (path[1].0 - path[0].0, path[1].1 - path[0].1)
+        let (a, b) = if i == 0 {
+            (clean[0], clean[1])
         } else if i == n_path - 1 {
-            (path[i].0 - path[i - 1].0, path[i].1 - path[i - 1].1)
+            (clean[i - 1], clean[i])
         } else {
-            (path[i + 1].0 - path[i - 1].0, path[i + 1].1 - path[i - 1].1)
+            (clean[i - 1], clean[i + 1])
         };
-        let len = (tx * tx + ty * ty).sqrt();
-        if len < 1e-12 {
-            continue;
-        }
-        let (tx, ty) = (tx / len, ty / len);
-        let (nx, ny) = (-ty, tx);
-        let px = path[i].0;
-        let pz = path[i].1;
+        tangents.push(normalize3([b[0] - a[0], b[1] - a[1], b[2] - a[2]]));
+    }
+    // 初期フレーム + parallel transport
+    let (n0, b0) = initial_frame(tangents[0]);
+    let mut frames: Vec<([f64; 3], [f64; 3])> = Vec::with_capacity(n_path);
+    frames.push((n0, b0));
+    for i in 1..n_path {
+        let (n_prev, _) = frames[i - 1];
+        let n_cur = parallel_transport(tangents[i - 1], tangents[i], n_prev);
+        // 数値誤差で N が T 直交から少しずれるので再直交化
+        let dot_nt = dot3(n_cur, tangents[i]);
+        let n_cur = normalize3([
+            n_cur[0] - dot_nt * tangents[i][0],
+            n_cur[1] - dot_nt * tangents[i][1],
+            n_cur[2] - dot_nt * tangents[i][2],
+        ]);
+        let b_cur = cross3(n_cur, tangents[i]);
+        frames.push((n_cur, b_cur));
+    }
+    // 頂点生成
+    let mut vertices: Vec<f32> = Vec::with_capacity((n_path * n_profile + 2) * 3);
+    for i in 0..n_path {
+        let p = clean[i];
+        let (n, b) = frames[i];
         for &(lx, ly) in profile {
-            vertices.push((px + lx * nx) as f32);
-            vertices.push(ly as f32);
-            vertices.push((pz + lx * ny) as f32);
+            vertices.push((p[0] + lx * n[0] + ly * b[0]) as f32);
+            vertices.push((p[1] + lx * n[1] + ly * b[1]) as f32);
+            vertices.push((p[2] + lx * n[2] + ly * b[2]) as f32);
         }
     }
-    let n_rings = vertices.len() / 3 / n_profile;
-    if n_rings < 2 {
-        return Err(BridgeError::InvalidShape(
-            "sweep_extrude: path 退化".to_string(),
-        ));
-    }
-    let mut indices: Vec<u32> = Vec::with_capacity((n_rings - 1) * n_profile * 6);
-    for i in 0..(n_rings - 1) {
+    let mut indices: Vec<u32> = Vec::with_capacity((n_path - 1) * n_profile * 6);
+    for i in 0..(n_path - 1) {
         for j in 0..n_profile {
             let j_next = (j + 1) % n_profile;
             let c0 = (i * n_profile + j) as u32;
@@ -335,14 +366,86 @@ fn sweep_mesh(
     }
     // end cap
     let end_center_idx = (vertices.len() / 3) as u32;
-    let base = ((n_rings - 1) * n_profile) as u32;
-    let (cx, cy, cz) = ring_center(&vertices, ((n_rings - 1) * n_profile) * 3, n_profile);
+    let base = ((n_path - 1) * n_profile) as u32;
+    let (cx, cy, cz) = ring_center(&vertices, ((n_path - 1) * n_profile) * 3, n_profile);
     vertices.extend_from_slice(&[cx, cy, cz]);
     for j in 0..n_profile as u32 {
         let j_next = (j + 1) % n_profile as u32;
         indices.extend_from_slice(&[end_center_idx, base + j_next, base + j]);
     }
     Ok((vertices, indices))
+}
+
+/// 初期フレーム (N, B)。reference up = world Z を tangent に直交化したものを N とする。
+/// tangent が Z にほぼ平行なときだけ world Y にフォールバックする。
+/// B = N × T で右手系の cap winding を outward 向きに固定する。
+fn initial_frame(t: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let ref_up = if t[2].abs() > 0.95 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    let d = dot3(ref_up, t);
+    let n = normalize3([
+        ref_up[0] - d * t[0],
+        ref_up[1] - d * t[1],
+        ref_up[2] - d * t[2],
+    ]);
+    let b = cross3(n, t);
+    (n, b)
+}
+
+/// Rodrigues の公式で `t_prev → t_cur` を回す最小回転を `n_prev` に適用する。
+/// tangent が変わらない (sin_theta ≈ 0) 場合は n をそのまま返す。
+fn parallel_transport(
+    t_prev: [f64; 3],
+    t_cur: [f64; 3],
+    n_prev: [f64; 3],
+) -> [f64; 3] {
+    let axis_raw = cross3(t_prev, t_cur);
+    let sin_theta = norm3(axis_raw);
+    let cos_theta = dot3(t_prev, t_cur);
+    if sin_theta < 1e-9 {
+        return n_prev;
+    }
+    let axis = [
+        axis_raw[0] / sin_theta,
+        axis_raw[1] / sin_theta,
+        axis_raw[2] / sin_theta,
+    ];
+    let cav = cross3(axis, n_prev);
+    let dav = dot3(axis, n_prev);
+    let one_minus_cos = 1.0 - cos_theta;
+    [
+        n_prev[0] * cos_theta + cav[0] * sin_theta + axis[0] * dav * one_minus_cos,
+        n_prev[1] * cos_theta + cav[1] * sin_theta + axis[1] * dav * one_minus_cos,
+        n_prev[2] * cos_theta + cav[2] * sin_theta + axis[2] * dav * one_minus_cos,
+    ]
+}
+
+fn normalize3(v: [f64; 3]) -> [f64; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len < 1e-12 {
+        [0.0, 0.0, 0.0]
+    } else {
+        [v[0] / len, v[1] / len, v[2] / len]
+    }
+}
+
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn norm3(v: [f64; 3]) -> f64 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
 }
 
 fn ring_center(vertices: &[f32], base_offset_floats: usize, n_profile: usize) -> (f32, f32, f32) {

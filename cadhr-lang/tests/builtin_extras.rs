@@ -123,7 +123,7 @@ fn center2d_with_translate2d_centers_polygon() {
 
 #[test]
 fn sweep_extrude_basic() {
-    // 円形 profile を直線 path 沿いに sweep。最小限の動作確認。
+    // 円形 profile を +Z 方向の直線 path 沿いに sweep。最小限の動作確認。
     let src = "main = sweep_extrude_xy [p3 0.0 0.0 0.0, p3 0.0 0.0 100.0] (circle 5.0)";
     let out = compile_run(src);
     let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
@@ -133,6 +133,44 @@ fn sweep_extrude_basic() {
         mesh.positions.len(),
         mesh.indices.len()
     );
+}
+
+#[test]
+fn sweep_extrude_follows_3d_path() {
+    // 3D path (0,0,0) → (0,10,0) → (10,10,10) を 1 mm 円で sweep。
+    // sweep mesh が全 3 軸方向 (X, Y, Z) で path 端点 (10,10,10) 近くまで届くことで、
+    // 単一平面への退化なしに 3D 追従していることを確認する。
+    let src = "main = sweep_extrude_xy [p3 0.0 0.0 0.0, p3 0.0 10.0 0.0, p3 10.0 10.0 10.0] (circle 1.0)";
+    let out = compile_run(src);
+    let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
+    assert!(!mesh.is_empty());
+    let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut min_z, mut max_z) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
+    for p in &mesh.positions {
+        min_x = min_x.min(p[0]);
+        max_x = max_x.max(p[0]);
+        min_y = min_y.min(p[1]);
+        max_y = max_y.max(p[1]);
+        min_z = min_z.min(p[2]);
+        max_z = max_z.max(p[2]);
+    }
+    // path は (0,0,0) から (10,10,10) まで届くので、circle の半径 1 を考慮しても
+    // X / Y / Z すべてで 9 を超えるはず。
+    assert!(
+        max_y > 9.0,
+        "Y should reach near 10 along path bend: max_y={max_y}"
+    );
+    assert!(
+        max_z > 9.0,
+        "Z should reach near 10 along path bend: max_z={max_z}"
+    );
+    assert!(
+        max_x > 9.0,
+        "X should reach near 10 along path bend: max_x={max_x}"
+    );
+    // 全体 bbox が原点近傍から始まること
+    assert!(min_x < 1.0 && min_y < 1.0 && min_z < 1.0);
 }
 
 #[test]
