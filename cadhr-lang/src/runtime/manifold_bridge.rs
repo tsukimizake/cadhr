@@ -305,17 +305,49 @@ fn sweep_mesh(
             "sweep_extrude: 退化を除いた path 頂点が 2 個未満".to_string(),
         ));
     }
-    // 各 path 点での tangent (端点は forward/backward、内点は centered diff)
+    // 各 path 点での tangent。
+    //   - 端点: 隣接 segment の単位方向
+    //   - 内点: incoming/outgoing **単位** tangent の和を正規化 (miter 角の二等分線)
+    //
+    // 内点で centered diff (P_{i+1}-P_{i-1}) を使うと、segment の長さに依存して
+    // 真の bisector からズレ、cross-section が片側 segment の法線平面に整合せず
+    // side wall がねじれた潰れた楕円状に見えてしまうため、bisector を採用する。
     let mut tangents: Vec<[f64; 3]> = Vec::with_capacity(n_path);
     for i in 0..n_path {
-        let (a, b) = if i == 0 {
-            (clean[0], clean[1])
+        let t = if i == 0 {
+            normalize3([
+                clean[1][0] - clean[0][0],
+                clean[1][1] - clean[0][1],
+                clean[1][2] - clean[0][2],
+            ])
         } else if i == n_path - 1 {
-            (clean[i - 1], clean[i])
+            normalize3([
+                clean[i][0] - clean[i - 1][0],
+                clean[i][1] - clean[i - 1][1],
+                clean[i][2] - clean[i - 1][2],
+            ])
         } else {
-            (clean[i - 1], clean[i + 1])
+            let t_in = normalize3([
+                clean[i][0] - clean[i - 1][0],
+                clean[i][1] - clean[i - 1][1],
+                clean[i][2] - clean[i - 1][2],
+            ]);
+            let t_out = normalize3([
+                clean[i + 1][0] - clean[i][0],
+                clean[i + 1][1] - clean[i][1],
+                clean[i + 1][2] - clean[i][2],
+            ]);
+            let sum = [t_in[0] + t_out[0], t_in[1] + t_out[1], t_in[2] + t_out[2]];
+            if norm3(sum) < 1e-9 {
+                // 180° fold-back: bisector が決まらない。仕様未定なので panic させる。
+                // TODO: 180° fold-back の解釈 (二点間で path を切る? error にする?) を決める。
+                panic!(
+                    "sweep_extrude: path 点 {i} で 180° 折り返しが発生し miter bisector が計算できない",
+                );
+            }
+            normalize3(sum)
         };
-        tangents.push(normalize3([b[0] - a[0], b[1] - a[1], b[2] - a[2]]));
+        tangents.push(t);
     }
     // 初期フレーム + parallel transport
     let (n0, b0) = initial_frame(tangents[0]);
