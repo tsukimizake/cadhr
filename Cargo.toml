@@ -21,7 +21,7 @@ exclude = [
 ]
 
 [dependencies]
-iced = { version = "0.14", features = ["advanced", "tokio"] }
+iced = { version = "0.14", features = ["advanced", "tokio", "canvas"] }
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.33"
 cadhr-lang = { path = "cadhr-lang" }

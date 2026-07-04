@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use cadhr_lang::{BindingSignature, CompiledProgram, Span};
-use iced::widget::{column, combo_box, container, row, scrollable, shader, slider, text, text_input};
+use iced::widget::{column, combo_box, container, row, shader, slider, text, text_input};
 use iced::{Element, Fill, Length};
 
 use crate::interpreter::{EvalJobParams, EvalJobResult};
@@ -15,6 +15,7 @@ use crate::preview::Scene;
 use crate::preview::pipeline::Vertex;
 use crate::session::SessionPreview;
 use crate::ui::parts;
+use crate::ui::workspace::WorkspaceEvent;
 
 pub struct Preview {
     pub id: u64,
@@ -140,6 +141,60 @@ impl Preview {
     /// を維持する。
     pub fn refresh_candidates(&mut self, names: &[String]) {
         self.target_state = combo_box::State::new(names.to_vec());
+    }
+
+    /// preview 内で完結する状態遷移を適用し、Model レベルの後処理を返す。
+    pub fn update(&mut self, msg: PreviewMsg) -> WorkspaceEvent {
+        match msg {
+            PreviewMsg::SceneIgnored => WorkspaceEvent::None,
+            PreviewMsg::Close => WorkspaceEvent::Close,
+            PreviewMsg::MoveUp => WorkspaceEvent::MoveUp,
+            PreviewMsg::MoveDown => WorkspaceEvent::MoveDown,
+            PreviewMsg::Minimize => {
+                self.minimized = !self.minimized;
+                WorkspaceEvent::Edited
+            }
+            PreviewMsg::ToggleViewCenter => {
+                self.view_at_object_center = !self.view_at_object_center;
+                self.scene.view_at_object_center = self.view_at_object_center;
+                WorkspaceEvent::Edited
+            }
+            PreviewMsg::SelectControlPoint(i) => {
+                self.selected_cp = Some(i);
+                WorkspaceEvent::EvalNeeded { edited: false }
+            }
+            PreviewMsg::ControlPointEdited(name, axis, value_str) => {
+                let Ok(v) = value_str.parse::<f64>() else {
+                    return WorkspaceEvent::None;
+                };
+                // 既存値がなければ control_points から default を引いて初期化
+                let entry = self.control_overrides.entry(name.clone()).or_insert_with(|| {
+                    self.control_points
+                        .iter()
+                        .find(|(n, _)| n == &name)
+                        .map(|(_, pos)| *pos)
+                        .unwrap_or([0.0, 0.0, 0.0])
+                });
+                if axis < 3 {
+                    entry[axis] = v;
+                }
+                WorkspaceEvent::EvalNeeded { edited: true }
+            }
+            PreviewMsg::Export3MF => WorkspaceEvent::ExportRequested(
+                crate::export::vertices_to_threemf(&self.last_vertices, &self.last_indices),
+            ),
+            PreviewMsg::TargetChanged(new_target) => {
+                if self.target == new_target {
+                    return WorkspaceEvent::None;
+                }
+                self.target = new_target;
+                WorkspaceEvent::TargetChanged
+            }
+            PreviewMsg::ArgChanged(name, v) => {
+                self.slider_values.insert(name, v);
+                WorkspaceEvent::EvalNeeded { edited: true }
+            }
+        }
     }
 }
 
@@ -307,21 +362,3 @@ fn numeric_input<'a>(name: String, axis: usize, value: f64) -> Element<'a, Previ
         .into()
 }
 
-pub fn list_view<'a>(
-    previews: &'a [Preview],
-    candidate_signatures: &'a [BindingSignature],
-) -> Element<'a, (u64, PreviewMsg)> {
-    if previews.is_empty() {
-        return text("No previews. Press \"Add\" to create one.").into();
-    }
-    let total = previews.len();
-    let items: Vec<Element<'a, (u64, PreviewMsg)>> = previews
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let id = p.id;
-            view(p, i, total, candidate_signatures).map(move |m| (id, m))
-        })
-        .collect();
-    scrollable(column(items).spacing(8)).height(Fill).into()
-}

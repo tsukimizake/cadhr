@@ -15,7 +15,9 @@ use iced::widget::{
 use iced::{Element, Fill, Length, Subscription, Task};
 use interpreter::{CollisionJobParams, CompileJobParams, CompileJobResult, EvalJobResult};
 use ui::parts;
-use ui::preview::{Preview, PreviewMsg};
+use ui::preview::Preview;
+use ui::sketch::Sketch;
+use ui::workspace::{Workspace, WorkspaceEvent, WorkspaceMsg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneKind {
@@ -27,10 +29,11 @@ enum PaneKind {
 enum AddKind {
     Preview,
     Collision,
+    Sketch,
 }
 
 impl AddKind {
-    const ALL: [AddKind; 2] = [AddKind::Preview, AddKind::Collision];
+    const ALL: [AddKind; 3] = [AddKind::Preview, AddKind::Collision, AddKind::Sketch];
 }
 
 impl std::fmt::Display for AddKind {
@@ -38,6 +41,7 @@ impl std::fmt::Display for AddKind {
         match self {
             AddKind::Preview => write!(f, "Preview"),
             AddKind::Collision => write!(f, "Collision Check"),
+            AddKind::Sketch => write!(f, "2D Sketch"),
         }
     }
 }
@@ -47,11 +51,8 @@ const DEFAULT_EDITOR_TEXT: &str =
 
 trait DialogHandler {
     fn open_session(&self) -> Task<Msg>;
-    fn save_session_as(
-        &self,
-        editor_text: String,
-        previews: Vec<session::SessionPreview>,
-    ) -> Task<Msg>;
+    fn save_session_as(&self, editor_text: String, previews: session::SessionPreviews)
+    -> Task<Msg>;
     fn export_3mf(&self, suggested_name: String, data: Vec<u8>) -> Task<Msg>;
 }
 
@@ -73,7 +74,7 @@ impl DialogHandler for RfdDialogs {
         )
     }
 
-    fn save_session_as(&self, text: String, previews: Vec<session::SessionPreview>) -> Task<Msg> {
+    fn save_session_as(&self, text: String, previews: session::SessionPreviews) -> Task<Msg> {
         Task::perform(
             async move {
                 let handle = rfd::AsyncFileDialog::new()
@@ -122,9 +123,8 @@ fn main() -> iced::Result {
 
 struct Model {
     editor: text_editor::Content,
-    /// 複数プレビュー。順序のみで「主」は無く、各 preview が自分の target binding を持つ。
-    previews: Vec<Preview>,
-    next_preview_id: u64,
+    workspaces: Vec<Workspace>,
+    next_workspace_id: u64,
     program: Option<CompiledProgram>,
     /// `previewable_bindings()` のキャッシュ。compile 完了時に更新。
     candidates: Vec<BindingSignature>,
@@ -148,10 +148,11 @@ enum Msg {
     UpdatePreviews,
     CompileDone(CompileJobResult),
     EvalDone(u64, EvalJobResult),
-    Preview(u64, PreviewMsg),
+    Workspace(u64, WorkspaceMsg),
 
     AddPreview,
     AddCollisionCheck,
+    AddSketch,
 
     NewSession,
     OpenSession,
@@ -179,8 +180,8 @@ fn init() -> (Model, Task<Msg>) {
 
     let mut model = Model {
         editor: text_editor::Content::with_text(DEFAULT_EDITOR_TEXT),
-        previews: vec![Preview::new(0)],
-        next_preview_id: 1,
+        workspaces: vec![Workspace::Preview(Preview::new(0))],
+        next_workspace_id: 1,
         program: None,
         candidates: Vec::new(),
         candidate_names: Vec::new(),
@@ -199,18 +200,55 @@ fn init() -> (Model, Task<Msg>) {
         if let Some((db, previews)) = session::load_session(&path) {
             model.editor = text_editor::Content::with_text(&db);
             model.current_file_path = Some(path);
-            if !previews.previews.is_empty() {
-                model.previews = previews
-                    .previews
-                    .iter()
-                    .map(Preview::from_session)
-                    .collect();
-                model.next_preview_id = model.previews.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+            let workspaces = workspaces_from_session(&previews);
+            if !workspaces.is_empty() {
+                model.next_workspace_id =
+                    workspaces.iter().map(Workspace::id).max().unwrap_or(0) + 1;
+                model.workspaces = workspaces;
             }
         }
     }
     let task = spawn_compile_job(&model);
     (model, task)
+}
+
+/// session の previews / sketches を `order` でマージして workspace リストに戻す。
+fn workspaces_from_session(sp: &session::SessionPreviews) -> Vec<Workspace> {
+    let mut workspaces: Vec<(usize, Workspace)> = sp
+        .previews
+        .iter()
+        .map(|p| (p.order, Workspace::Preview(Preview::from_session(p))))
+        .chain(
+            sp.sketches
+                .iter()
+                .map(|s| (s.order, Workspace::Sketch(Sketch::from_session(s)))),
+        )
+        .collect();
+    workspaces.sort_by_key(|(order, _)| *order);
+    workspaces.into_iter().map(|(_, w)| w).collect()
+}
+
+fn preview_mut(model: &mut Model, id: u64) -> Option<&mut Preview> {
+    model
+        .workspaces
+        .iter_mut()
+        .find(|w| w.id() == id)?
+        .as_preview_mut()
+}
+
+fn move_workspace(model: &mut Model, id: u64, up: bool) {
+    let Some(i) = model.workspaces.iter().position(|w| w.id() == id) else {
+        return;
+    };
+    let j = if up {
+        i.checked_sub(1)
+    } else {
+        (i + 1 < model.workspaces.len()).then_some(i + 1)
+    };
+    if let Some(j) = j {
+        model.workspaces.swap(i, j);
+        model.unsaved = true;
+    }
 }
 
 fn base_name(model: &Model) -> String {
@@ -253,7 +291,12 @@ fn spawn_eval_for(model: &Model, preview_id: u64) -> Task<Msg> {
     let Some(prog) = model.program.clone() else {
         return Task::none();
     };
-    let Some(p) = model.previews.iter().find(|p| p.id == preview_id) else {
+    let Some(p) = model
+        .workspaces
+        .iter()
+        .find(|w| w.id() == preview_id)
+        .and_then(Workspace::as_preview)
+    else {
         return Task::none();
     };
     if p.is_collision {
@@ -285,27 +328,35 @@ fn spawn_eval_for(model: &Model, preview_id: u64) -> Task<Msg> {
 
 fn spawn_eval_all(model: &Model) -> Task<Msg> {
     let tasks: Vec<Task<Msg>> = model
-        .previews
+        .workspaces
         .iter()
+        .filter_map(Workspace::as_preview)
         .map(|p| spawn_eval_for(model, p.id))
         .collect();
     Task::batch(tasks)
 }
 
-fn collect_session_previews(model: &Model) -> Vec<session::SessionPreview> {
-    model
-        .previews
-        .iter()
-        .enumerate()
-        .map(|(i, p)| p.to_session(i))
-        .collect()
+fn collect_session(model: &Model) -> session::SessionPreviews {
+    let mut previews = Vec::new();
+    let mut sketches = Vec::new();
+    for (i, w) in model.workspaces.iter().enumerate() {
+        match w {
+            Workspace::Preview(p) => previews.push(p.to_session(i)),
+            Workspace::Sketch(s) => sketches.push(s.to_session(i)),
+        }
+    }
+    session::SessionPreviews { previews, sketches }
 }
 
 /// 各 preview について現在の target binding の signature を引き、未登録 param
 /// に slider 中央値 (range 無しなら 0.0) を populate する。
 fn apply_signature_defaults(model: &mut Model) {
     let Some(prog) = &model.program else { return };
-    for p in &mut model.previews {
+    for p in model
+        .workspaces
+        .iter_mut()
+        .filter_map(Workspace::as_preview_mut)
+    {
         let target = if p.is_collision { "main" } else { &p.target };
         let Some(sig) = prog.binding_signature(target) else {
             continue;
@@ -316,16 +367,18 @@ fn apply_signature_defaults(model: &mut Model) {
                 .as_ref()
                 .map(|r| (r.lo + r.hi) / 2.0)
                 .unwrap_or(0.0);
-            p.slider_values
-                .entry(param.name.clone())
-                .or_insert(default);
+            p.slider_values.entry(param.name.clone()).or_insert(default);
         }
     }
 }
 
 /// candidate 一覧が変わったとき、各 preview の combo_box state を更新する。
 fn refresh_preview_candidates(model: &mut Model) {
-    for p in &mut model.previews {
+    for p in model
+        .workspaces
+        .iter_mut()
+        .filter_map(Workspace::as_preview_mut)
+    {
         p.refresh_candidates(&model.candidate_names);
     }
 }
@@ -348,8 +401,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                 diagnostics,
             } => {
                 model.candidates = program.previewable_bindings();
-                model.candidate_names =
-                    model.candidates.iter().map(|b| b.name.clone()).collect();
+                model.candidate_names = model.candidates.iter().map(|b| b.name.clone()).collect();
                 model.program = Some(program);
                 model.error_message.clear();
                 model.error_span = None;
@@ -370,131 +422,83 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             }
         },
         Msg::EvalDone(pid, result) => {
-            if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
+            if let Some(p) = preview_mut(model, pid) {
                 p.apply_eval_result(result);
             }
             Task::none()
         }
-        Msg::Preview(pid, pm) => match pm {
-            PreviewMsg::Close => {
-                model.previews.retain(|p| p.id != pid);
-                model.unsaved = true;
-                Task::none()
-            }
-            PreviewMsg::MoveUp => {
-                if let Some(i) = model.previews.iter().position(|p| p.id == pid) {
-                    if i > 0 {
-                        model.previews.swap(i - 1, i);
+        Msg::Workspace(id, wm) => {
+            let Some(w) = model.workspaces.iter_mut().find(|w| w.id() == id) else {
+                return Task::none();
+            };
+            match w.update(wm) {
+                WorkspaceEvent::None => Task::none(),
+                WorkspaceEvent::Edited => {
+                    model.unsaved = true;
+                    Task::none()
+                }
+                WorkspaceEvent::EvalNeeded { edited } => {
+                    if edited {
                         model.unsaved = true;
                     }
+                    spawn_eval_for(model, id)
                 }
-                Task::none()
-            }
-            PreviewMsg::MoveDown => {
-                if let Some(i) = model.previews.iter().position(|p| p.id == pid) {
-                    if i + 1 < model.previews.len() {
-                        model.previews.swap(i, i + 1);
-                        model.unsaved = true;
-                    }
-                }
-                Task::none()
-            }
-            PreviewMsg::Minimize => {
-                if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
-                    p.minimized = !p.minimized;
+                WorkspaceEvent::TargetChanged => {
                     model.unsaved = true;
+                    apply_signature_defaults(model);
+                    spawn_eval_for(model, id)
                 }
-                Task::none()
-            }
-            PreviewMsg::SceneIgnored => Task::none(),
-            PreviewMsg::ToggleViewCenter => {
-                if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
-                    p.view_at_object_center = !p.view_at_object_center;
-                    p.scene.view_at_object_center = p.view_at_object_center;
-                    model.unsaved = true;
-                }
-                Task::none()
-            }
-            PreviewMsg::SelectControlPoint(i) => {
-                if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
-                    p.selected_cp = Some(i);
-                }
-                spawn_eval_for(model, pid)
-            }
-            PreviewMsg::ControlPointEdited(name, axis, value_str) => {
-                let v = match value_str.parse::<f64>() {
-                    Ok(v) => v,
-                    Err(_) => return Task::none(),
-                };
-                if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
-                    // 既存値がなければ control_points から default を引いて初期化
-                    let entry = p.control_overrides.entry(name.clone()).or_insert_with(|| {
-                        p.control_points
-                            .iter()
-                            .find(|(n, _)| n == &name)
-                            .map(|(_, pos)| *pos)
-                            .unwrap_or([0.0, 0.0, 0.0])
-                    });
-                    if axis < 3 {
-                        entry[axis] = v;
-                    }
-                    model.unsaved = true;
-                    return spawn_eval_for(model, pid);
-                }
-                Task::none()
-            }
-            PreviewMsg::Export3MF => {
-                let Some(p) = model.previews.iter().find(|p| p.id == pid) else {
-                    return Task::none();
-                };
-                let Some(data) = export::vertices_to_threemf(&p.last_vertices, &p.last_indices)
-                else {
+                WorkspaceEvent::ExportRequested(None) => {
                     model.error_message = "Nothing to export".to_string();
-                    return Task::none();
-                };
-                let suggested = format!("{}_{pid}.3mf", base_name(model));
-                model.dialogs.export_3mf(suggested, data)
-            }
-            PreviewMsg::TargetChanged(new_target) => {
-                if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
-                    if p.target == new_target {
-                        return Task::none();
-                    }
-                    p.target = new_target;
-                    model.unsaved = true;
+                    Task::none()
                 }
-                apply_signature_defaults(model);
-                spawn_eval_for(model, pid)
-            }
-            PreviewMsg::ArgChanged(name, v) => {
-                if let Some(p) = model.previews.iter_mut().find(|p| p.id == pid) {
-                    p.slider_values.insert(name, v);
-                    model.unsaved = true;
-                    return spawn_eval_for(model, pid);
+                WorkspaceEvent::ExportRequested(Some(data)) => {
+                    let suggested = format!("{}_{id}.3mf", base_name(model));
+                    model.dialogs.export_3mf(suggested, data)
                 }
-                Task::none()
+                WorkspaceEvent::CopyRequested(code) => iced::clipboard::write(code),
+                WorkspaceEvent::Close => {
+                    model.workspaces.retain(|w| w.id() != id);
+                    model.unsaved = true;
+                    Task::none()
+                }
+                WorkspaceEvent::MoveUp => {
+                    move_workspace(model, id, true);
+                    Task::none()
+                }
+                WorkspaceEvent::MoveDown => {
+                    move_workspace(model, id, false);
+                    Task::none()
+                }
             }
-        },
+        }
 
         Msg::AddPreview => {
-            let id = model.next_preview_id;
-            model.next_preview_id += 1;
+            let id = model.next_workspace_id;
+            model.next_workspace_id += 1;
             let mut p = Preview::new(id);
             p.refresh_candidates(&model.candidate_names);
-            model.previews.push(p);
+            model.workspaces.push(Workspace::Preview(p));
             apply_signature_defaults(model);
             model.unsaved = true;
             spawn_eval_for(model, id)
         }
         Msg::AddCollisionCheck => {
-            let id = model.next_preview_id;
-            model.next_preview_id += 1;
+            let id = model.next_workspace_id;
+            model.next_workspace_id += 1;
             let mut p = Preview::new_collision(id);
             p.refresh_candidates(&model.candidate_names);
-            model.previews.push(p);
+            model.workspaces.push(Workspace::Preview(p));
             apply_signature_defaults(model);
             model.unsaved = true;
             spawn_eval_for(model, id)
+        }
+        Msg::AddSketch => {
+            let id = model.next_workspace_id;
+            model.next_workspace_id += 1;
+            model.workspaces.push(Workspace::Sketch(Sketch::new(id)));
+            model.unsaved = true;
+            Task::none()
         }
 
         Msg::NewSession => {
@@ -504,8 +508,8 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             model.error_span = None;
             model.last_modified = None;
             model.unsaved = false;
-            model.previews = vec![Preview::new(0)];
-            model.next_preview_id = 1;
+            model.workspaces = vec![Workspace::Preview(Preview::new(0))];
+            model.next_workspace_id = 1;
             spawn_compile_job(model)
         }
         Msg::OpenSession => model.dialogs.open_session(),
@@ -517,17 +521,14 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                 model.error_span = None;
                 model.last_modified = None;
                 model.unsaved = false;
-                if previews.previews.is_empty() {
-                    model.previews = vec![Preview::new(0)];
-                    model.next_preview_id = 1;
+                let workspaces = workspaces_from_session(&previews);
+                if workspaces.is_empty() {
+                    model.workspaces = vec![Workspace::Preview(Preview::new(0))];
+                    model.next_workspace_id = 1;
                 } else {
-                    model.previews = previews
-                        .previews
-                        .iter()
-                        .map(Preview::from_session)
-                        .collect();
-                    model.next_preview_id =
-                        model.previews.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+                    model.next_workspace_id =
+                        workspaces.iter().map(Workspace::id).max().unwrap_or(0) + 1;
+                    model.workspaces = workspaces;
                 }
                 session::save_last_session_path(&path);
                 return spawn_compile_job(model);
@@ -538,7 +539,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             if let Some(ref path) = model.current_file_path {
                 let path = path.clone();
                 let text = model.editor.text();
-                let previews = collect_session_previews(model);
+                let previews = collect_session(model);
                 Task::perform(
                     async move { session::save_session(&path, &text, &previews).map(|()| path) },
                     Msg::SessionSaved,
@@ -549,7 +550,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
         }
         Msg::SaveSessionAs => {
             let text = model.editor.text();
-            let previews = collect_session_previews(model);
+            let previews = collect_session(model);
             model.dialogs.save_session_as(text, previews)
         }
         Msg::SessionSaved(result) => {
@@ -592,7 +593,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             if model.panes.maximized().is_some() {
                 model.panes.restore();
             } else {
-                // エディタを隠したいので Preview ペインを最大化する
+                // エディタを隠してPreviewペインを最大化する
                 let preview_pane = model
                     .panes
                     .iter()
@@ -652,6 +653,7 @@ fn view(model: &Model) -> Element<'_, Msg> {
         pick_list(&AddKind::ALL[..], None::<AddKind>, |kind| match kind {
             AddKind::Preview => Msg::AddPreview,
             AddKind::Collision => Msg::AddCollisionCheck,
+            AddKind::Sketch => Msg::AddSketch,
         })
         .placeholder("+ Add Workspace"),
         parts::dark_button("Update").on_press(Msg::UpdatePreviews),
@@ -684,13 +686,12 @@ fn view(model: &Model) -> Element<'_, Msg> {
                 pane_grid::Content::new(editor)
             }
             PaneKind::Preview => {
-                // 各 preview が自分の binding signature に合わせた引数 slider を持つ
-                // (main 用の共有 slider パネルは廃止)。
-                let previews_view: Element<'_, Msg> =
-                    ui::preview::list_view(&model.previews, &model.candidates)
-                        .map(|(id, pm)| Msg::Preview(id, pm));
+                // 各 preview が自分の binding signature に合わせた引数 slider を持つ。
+                let workspaces_view: Element<'_, Msg> =
+                    ui::workspace::list_view(&model.workspaces, &model.candidates)
+                        .map(|(id, wm)| Msg::Workspace(id, wm));
 
-                pane_grid::Content::new(previews_view)
+                pane_grid::Content::new(workspaces_view)
             }
         }
     })

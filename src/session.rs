@@ -38,15 +38,37 @@ pub struct SessionPreview {
     pub is_collision: bool,
 }
 
+fn default_zoom() -> f32 {
+    20.0
+}
+
+/// 2D sketch workspace の永続化。座標はすべて格子交点スナップ済みの整数
+/// (grid 単位)。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SessionSketch {
+    pub sketch_id: u64,
+    #[serde(default)]
+    pub order: usize,
+    #[serde(default)]
+    pub minimized: bool,
+    /// 1 grid 単位あたりのピクセル数。
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
+    #[serde(default)]
+    pub shapes: Vec<crate::ui::sketch::SketchShape>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SessionPreviews {
     pub previews: Vec<SessionPreview>,
+    #[serde(default)]
+    pub sketches: Vec<SessionSketch>,
 }
 
 pub fn save_session(
     dir: &Path,
     editor_text: &str,
-    previews: &[SessionPreview],
+    session: &SessionPreviews,
 ) -> Result<(), String> {
     let _ = std::fs::remove_file(dir);
     std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create directory: {e}"))?;
@@ -55,9 +77,6 @@ pub fn save_session(
     std::fs::write(&db_path, editor_text)
         .map_err(|e| format!("Failed to save db file: {e}"))?;
 
-    let session = SessionPreviews {
-        previews: previews.to_vec(),
-    };
     let json = serde_json::to_string_pretty(&session)
         .map_err(|e| format!("Failed to serialize: {e}"))?;
     let previews_path = dir.join("previews.json");
