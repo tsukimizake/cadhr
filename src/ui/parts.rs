@@ -1,7 +1,18 @@
 use iced::keyboard;
 use iced::widget::button::{self, Status};
+use iced::widget::container;
 use iced::widget::text_editor::{Binding, KeyPress};
 use iced::{Background, Border, Color, Shadow};
+
+/// sketch キャンバスと 3D preview 共通のキャンバス背景色。
+pub const CANVAS_BACKGROUND: Color = Color::from_rgb(0.12, 0.12, 0.14);
+
+pub fn canvas_background_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(CANVAS_BACKGROUND)),
+        ..container::Style::default()
+    }
+}
 
 pub fn dark_button_style(_theme: &iced::Theme, status: Status) -> button::Style {
     let bg = Color::from_rgb(0.24, 0.24, 0.26);

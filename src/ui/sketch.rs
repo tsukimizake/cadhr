@@ -537,7 +537,6 @@ pub enum SketchMsg {
     CopyCode,
 }
 
-const BACKGROUND: Color = Color::from_rgb(0.12, 0.12, 0.14);
 const GRID: Color = Color::from_rgb(0.22, 0.22, 0.25);
 const AXIS: Color = Color::from_rgb(0.38, 0.38, 0.44);
 const LINE: Color = Color::from_rgb(0.55, 0.85, 0.55);
@@ -654,7 +653,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
         let zoom = self.sketch.zoom;
         let base = self.sketch.cache.draw(renderer, bounds.size(), |frame| {
             let size = frame.size();
-            frame.fill_rectangle(Point::ORIGIN, size, BACKGROUND);
+            frame.fill_rectangle(Point::ORIGIN, size, parts::CANVAS_BACKGROUND);
 
             // 低ズーム時はグリッド線を間引く (スナップ自体は常に 1 grid 単位)
             let step = [1, 5, 10, 50]

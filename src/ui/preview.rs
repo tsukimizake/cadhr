@@ -272,7 +272,11 @@ pub fn view<'a>(
         .width(Fill)
         .height(Length::Fixed(220.0))
         .into();
-    let preview_widget: Element<'a, PreviewMsg> = widget.map(|_| PreviewMsg::SceneIgnored);
+    // shader は下地の上に描くため、背景色は container で敷く
+    let preview_widget: Element<'a, PreviewMsg> =
+        container(widget.map(|_| PreviewMsg::SceneIgnored))
+            .style(parts::canvas_background_style)
+            .into();
 
     let mut col = column![header, preview_widget].spacing(4);
 
