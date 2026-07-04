@@ -49,6 +49,8 @@ pub enum WorkspaceEvent {
     TargetChanged,
     /// 3MF export 要求。None はエクスポート対象なし。
     ExportRequested(Option<Vec<u8>>),
+    /// クリップボード書き込み要求 (edge select スニペットなど)。
+    ClipboardWrite(String),
     /// Sketch: エディタ本文の書き換えを要する操作 (main.rs が適用する)。
     SketchEdit(SketchEdit),
     Close,

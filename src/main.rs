@@ -692,6 +692,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                     move_workspace(model, id, false);
                     Task::none()
                 }
+                WorkspaceEvent::ClipboardWrite(snippet) => iced::clipboard::write::<Msg>(snippet),
             }
         }
 

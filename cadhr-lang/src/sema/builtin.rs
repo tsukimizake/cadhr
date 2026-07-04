@@ -151,6 +151,12 @@ pub fn type_registry() -> &'static [BuiltinType] {
             alias_body: None,
             doc: "区間。`intersect` で 2 つの Range の積を取れる",
         },
+        BuiltinType {
+            name: "Edge",
+            params: NONE,
+            alias_body: None,
+            doc: "Shape3D 上の 1 辺 (両端点 + 隣接 2 面法線)。`edgeNearPoint` で拾い `chamfer` に渡す",
+        },
     ]
 }
 
@@ -212,6 +218,7 @@ pub fn registry() -> BuiltinRegistry {
     };
     let plane = || Type::con("Plane");
     let string = || Type::con("String");
+    let edge = || Type::con("Edge");
     let range_of = |t: Type| Type::app("Range", vec![t]);
 
     // -- Range 集合演算 (intersect : Range a -> Range a -> Range a)
@@ -473,6 +480,26 @@ pub fn registry() -> BuiltinRegistry {
         "3D 点",
     ));
     let r = r.add(mono("p2", vec![float(), float()], point2d(), "2D 点"));
+
+    // -- Edge selection & chamfer
+    //
+    // `edgeNearPoint hit shape` は shape の manifold を評価して sharp edge を洗い出し、
+    // hit_point に一番近い辺の情報 (2 端点 + 2 面の外向き法線) を Edge 値として返す。
+    // GUI (preview) は edge select モードのクリックで hit point を拾って
+    // `edgeNearPoint (p3 x y z) shape` を生成する。
+    let r = r.add(mono(
+        "edgeNearPoint",
+        vec![point3d(), shape3d()],
+        edge(),
+        "hit_point に一番近い shape の sharp edge を返す。`shape |> edgeNearPoint (p3 x y z)` で使う",
+    ));
+    // `chamfer size edge shape` は edge を 45° cutting prism で削り、chamfer 加工した shape を返す。
+    let r = r.add(mono(
+        "chamfer",
+        vec![float(), edge(), shape3d()],
+        shape3d(),
+        "指定した Edge を 45° の chamfer size で削る (`shape |> chamfer size edge`)",
+    ));
 
     // -- I/O
     let r = r.add(mono(

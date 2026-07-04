@@ -39,6 +39,11 @@ pub struct Preview {
     /// 直近の eval で得た mesh。3MF export 用 (Scene の mesh は control point の sphere が混入する)。
     pub last_vertices: Vec<Vertex>,
     pub last_indices: Vec<u32>,
+    /// Edge select モード ON の間、クリックは raycast → 直近のヒット点で
+    /// `edgeNearPoint (p3 x y z)` を生成しクリップボードにコピーする。
+    pub edge_select_mode: bool,
+    /// 直近の edge select クリックで生成したスニペット。UI 表示用。
+    pub last_edge_snippet: Option<String>,
 }
 
 impl Preview {
@@ -59,6 +64,8 @@ impl Preview {
             selected_cp: None,
             last_vertices: Vec::new(),
             last_indices: Vec::new(),
+            edge_select_mode: false,
+            last_edge_snippet: None,
         }
     }
 
@@ -154,7 +161,41 @@ impl Preview {
                 self.scene.zoom_by(delta);
                 WorkspaceEvent::None
             }
-            PreviewMsg::Scene(SceneMessage::Clicked { .. }) => WorkspaceEvent::None,
+            PreviewMsg::Scene(SceneMessage::Clicked { u, v, aspect }) => {
+                if !self.edge_select_mode {
+                    return WorkspaceEvent::None;
+                }
+                // Edge select モード中のクリックは Shape mesh へレイキャスト → ヒット点で
+                // `edgeNearPoint (p3 x y z)` を生成し、クリップボードにコピーする。
+                let base_dist = self.scene.base_camera_distance();
+                let view_center = self.scene.view_center();
+                let (origin, dir) = crate::preview::generate_ray_from_uv(
+                    u,
+                    v,
+                    &self.scene.camera,
+                    base_dist,
+                    aspect,
+                    view_center,
+                );
+                self.edge_select_mode = false;
+                match crate::preview::ray_mesh_intersect(
+                    &origin,
+                    &dir,
+                    &self.last_vertices,
+                    &self.last_indices,
+                ) {
+                    Some([x, y, z]) => {
+                        let snippet = format!("edgeNearPoint (p3 {x:.3} {y:.3} {z:.3})");
+                        self.last_edge_snippet = Some(snippet.clone());
+                        WorkspaceEvent::ClipboardWrite(snippet)
+                    }
+                    None => {
+                        self.last_edge_snippet =
+                            Some("(no hit — メッシュ上をクリックしてください)".to_string());
+                        WorkspaceEvent::None
+                    }
+                }
+            }
             PreviewMsg::Close => WorkspaceEvent::Close,
             PreviewMsg::MoveUp => WorkspaceEvent::MoveUp,
             PreviewMsg::MoveDown => WorkspaceEvent::MoveDown,
@@ -202,6 +243,10 @@ impl Preview {
                 self.slider_values.insert(name, v);
                 WorkspaceEvent::EvalNeeded { edited: true }
             }
+            PreviewMsg::ToggleEdgeSelectMode => {
+                self.edge_select_mode = !self.edge_select_mode;
+                WorkspaceEvent::None
+            }
         }
     }
 }
@@ -222,6 +267,8 @@ pub enum PreviewMsg {
     TargetChanged(String),
     /// preview 固有の引数 slider/text 値変更 (引数名、新値)。
     ArgChanged(String, f64),
+    /// Edge select モードを toggle。
+    ToggleEdgeSelectMode,
 }
 
 pub fn view<'a>(
@@ -270,6 +317,17 @@ pub fn view<'a>(
     if !p.is_collision && !p.last_vertices.is_empty() {
         header = header.push(parts::dark_button("Export 3MF").on_press(PreviewMsg::Export3MF));
     }
+    // Edge select mode トグル (collision preview では意味がないので出さない)。
+    if !p.is_collision {
+        let edge_btn_label = if p.edge_select_mode {
+            "Edge Select ON"
+        } else {
+            "Edge Select"
+        };
+        header = header.push(
+            parts::dark_button(edge_btn_label).on_press(PreviewMsg::ToggleEdgeSelectMode),
+        );
+    }
     let header = header.push(parts::dark_button("×").on_press(PreviewMsg::Close));
 
     if p.minimized {
@@ -286,6 +344,15 @@ pub fn view<'a>(
         .into();
 
     let mut col = column![header, preview_widget].spacing(4);
+
+    // 直近生成した edgeNearPoint スニペットを表示 (クリップボードに既にコピー済み)。
+    if let Some(snippet) = &p.last_edge_snippet {
+        col = col.push(
+            text(format!("edge snippet (copied): {snippet}"))
+                .color(iced::Color::from_rgb(0.6, 0.9, 0.6))
+                .size(12),
+        );
+    }
 
     // collision 以外は当該 binding の引数 widget を出す
     if !p.is_collision {

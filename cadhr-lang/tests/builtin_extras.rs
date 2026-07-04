@@ -234,6 +234,54 @@ fn sweep_extrude_follows_3d_path() {
 }
 
 #[test]
+fn chamfer_edge_of_cube_reduces_bbox_max() {
+    // 10 mm cube (原点角) の (10,10,z) 辺を size 2 で chamfer する。
+    // chamfer 済みなら X=10, Y=10 の辺の (10,10) コーナー付近が削れているので、
+    // z を任意に固定した z=5 断面で X=10 かつ Y=10 の頂点は存在しない。
+    // bbox は変わらないが、辺付近の内側 (x=10-ε, y=10) や (x=10, y=10-ε) が
+    // chamfer face の一部として残ることを最低限テストする。
+    let src = "main =
+    let
+        c = cube 10.0 10.0 10.0
+        e = c |> edgeNearPoint (p3 10.0 10.0 5.0)
+    in
+    c |> chamfer 2.0 e
+";
+    let out = compile_run(src);
+    let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
+    assert!(!mesh.is_empty(), "chamfer 結果メッシュが空");
+    // (10, 10, *) の辺そのものが残っていないことを確認する。
+    // つまり (x, y) が両方 10.0 に近い頂点は無いはず (対角側の (0,0,z) 辺は残るが、
+    // (10,10,z) 側だけを見る)。
+    let mut has_untouched_corner_edge = false;
+    for p in &mesh.positions {
+        if (p[0] - 10.0).abs() < 1e-3 && (p[1] - 10.0).abs() < 1e-3 {
+            has_untouched_corner_edge = true;
+        }
+    }
+    assert!(
+        !has_untouched_corner_edge,
+        "(10, 10, *) の頂点が chamfer 後も残っている: mesh={:?}",
+        mesh.positions
+    );
+}
+
+#[test]
+fn edge_near_point_returns_edge_opaque() {
+    // edgeNearPoint 単独。edge 値を評価しつつ shape をそのまま返せることの smoke test
+    // (`_ = ...` の未サポート回避で、実際に edge を使わない場合は body から edge を参照しない)。
+    let src = "main =
+    let
+        c = cube 5.0 5.0 5.0
+        e = c |> edgeNearPoint (p3 5.0 5.0 2.5)
+    in
+    c |> chamfer 0.5 e
+";
+    let out = compile_run(src);
+    assert_eq!(out.models.len(), 1);
+}
+
+#[test]
 fn control3d_passes_point_through_default() {
     let src = "main = cube 1.0 1.0 1.0 |> translate3d (p3 0.0 0.0 0.0) (control3d \"pos\" (p3 5.0 0.0 0.0))";
     let out = compile_run(src);
