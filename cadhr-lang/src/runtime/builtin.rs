@@ -288,12 +288,13 @@ pub fn registry() -> BuiltinEvalRegistry {
         // place / linear_extrude (Shape2D を Shape3D に変換 — 当面 opaque で
         // データを保持するだけ)
         .add("place", 2, |args| {
+            // `s |> place plane`: payload は (shape, plane) の順で保持
             Ok(Value::Opaque(
                 "PlacedShape2D".to_string(),
-                vec![args[0].clone(), args[1].clone()],
+                vec![args[1].clone(), args[0].clone()],
             ))
         })
-        .add("linear_extrude", 2, |args| match &args[0] {
+        .add("linear_extrude", 2, |args| match &args[1] {
             Value::Opaque(tag, _) if tag == "PlacedShape2D" => {
                 // `place` 経由は当面 Empty 返却。`extrude_xy` / `_yz` / `_xz` を使う。
                 Ok(Value::Shape3D(Model3D::Empty))
@@ -338,9 +339,10 @@ pub fn registry() -> BuiltinEvalRegistry {
             )))
         })
         .add("diff2d", 2, |args| {
+            // `s |> diff2d cut` = s - cut。pipe で渡される base を第 2 引数に置く。
             Ok(Value::Shape2D(Model2D::Diff2D(
-                Box::new(as_shape2d(&args[0])?),
                 Box::new(as_shape2d(&args[1])?),
+                Box::new(as_shape2d(&args[0])?),
             )))
         })
         .add("intersect2d", 2, |args| {

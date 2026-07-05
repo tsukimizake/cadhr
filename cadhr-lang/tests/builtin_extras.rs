@@ -48,11 +48,28 @@ fn diff2d_extruded() {
                 outer = polygon [p2 0.0 0.0, p2 8.0 0.0, p2 8.0 8.0, p2 0.0 8.0]
                 hole = polygon [p2 2.0 2.0, p2 6.0 2.0, p2 6.0 6.0, p2 2.0 6.0]
             in
-            extrude_xy 1.0 (diff2d outer hole)
+            extrude_xy 1.0 (outer |> diff2d hole)
     ";
     let out = compile_run(src);
     let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
     assert!(!mesh.is_empty());
+}
+
+#[test]
+fn diff2d_extruded_xz_keeps_hole() {
+    // XZ 押し出しの Y 反転で穴 contour の巻き向きが壊れないことの回帰テスト
+    let src = "
+        main =
+            let
+                outer = polygon [p2 0.0 0.0, p2 8.0 0.0, p2 8.0 8.0, p2 0.0 8.0]
+                hole = polygon [p2 2.0 2.0, p2 6.0 2.0, p2 6.0 6.0, p2 2.0 6.0]
+            in
+            extrude_xz 1.0 (outer |> diff2d hole)
+    ";
+    let out = compile_run(src);
+    let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
+    // 穴なしの箱は 12 三角形 (36 indices)。穴があれば必ずそれより多い。
+    assert!(mesh.indices.len() > 36, "hole was lost: {} indices", mesh.indices.len());
 }
 
 #[test]

@@ -1096,7 +1096,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let src = format!(
-            "main =\n    let\n        shape =\n{indented}\n    in\n    {{ models = [extrude_xy 1.0 (diff2d shape.poly1 shape.circ1), extrude_xy 1.0 (shape.poly2 |> translate2d shape.pt1 (p2 0.0 0.0))], bom = [], controls = [] }}\n"
+            "main =\n    let\n        shape =\n{indented}\n    in\n    {{ models = [extrude_xy 1.0 (shape.poly1 |> diff2d shape.circ1), extrude_xy 1.0 (shape.poly2 |> translate2d shape.pt1 (p2 0.0 0.0))], bom = [], controls = [] }}\n"
         );
         cadhr_lang::compile(&src).unwrap_or_else(|e| panic!("generated code failed: {e:?}"));
     }

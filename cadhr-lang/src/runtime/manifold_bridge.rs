@@ -167,8 +167,10 @@ fn to_cross_section(profile: &Model2D) -> Option<CrossSection> {
     }
 }
 
-/// extrude/revolve 前の平面合わせ。XZ 押し出しは Y 反転 + ensure_ccw が必要
+/// extrude/revolve 前の平面合わせ。XZ 押し出しは Y 反転が必要
 /// (apply_plane_rotation の rotate(-90,0,0) との辻褄合わせ)。
+/// Y 反転で全 ring の巻き向きが反転するので、点順を reverse して
+/// outer=CCW / 穴=CW の区分を復元する (from_polygons は FillRule::Positive)。
 fn prep_cross_section(cs: CrossSection, plane: Plane3D) -> CrossSection {
     if plane != Plane3D::XZ {
         return cs;
@@ -178,7 +180,7 @@ fn prep_cross_section(cs: CrossSection, plane: Plane3D) -> CrossSection {
         .into_iter()
         .map(|ring| {
             let mut pts: Vec<[f64; 2]> = ring.into_iter().map(|[x, y]| [x, -y]).collect();
-            ensure_ccw(&mut pts);
+            pts.reverse();
             pts
         })
         .collect();

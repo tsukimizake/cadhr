@@ -288,15 +288,15 @@ pub fn registry() -> BuiltinRegistry {
     // -- Place + extrude
     let r = r.add(mono(
         "place",
-        vec![shape2d(), plane()],
+        vec![plane(), shape2d()],
         placed2d(),
-        "2D 形状を 3D 平面に貼り付け",
+        "2D 形状を 3D 平面に貼り付け (`s |> place plane`)",
     ));
     let r = r.add(mono(
         "linear_extrude",
-        vec![placed2d(), float()],
+        vec![float(), placed2d()],
         shape3d(),
-        "貼り付け 2D 形状を平面法線方向に押し出し",
+        "貼り付け 2D 形状を平面法線方向に押し出し (`placed |> linear_extrude h`)",
     ));
 
     // -- 2D ポリゴン + 平面別 extrude (簡略 API)
@@ -344,7 +344,7 @@ pub fn registry() -> BuiltinRegistry {
         "diff2d",
         vec![shape2d(), shape2d()],
         shape2d(),
-        "2D 形状の差 (左 - 右)",
+        "2D 形状の差 (`base |> diff2d cut` = base - cut)",
     ));
     let r = r.add(mono(
         "intersect2d",
