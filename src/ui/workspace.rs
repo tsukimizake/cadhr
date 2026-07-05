@@ -22,13 +22,6 @@ impl Workspace {
         }
     }
 
-    pub fn as_preview(&self) -> Option<&Preview> {
-        match self {
-            Workspace::Preview(p) => Some(p),
-            Workspace::Sketch(_) => None,
-        }
-    }
-
     pub fn as_preview_mut(&mut self) -> Option<&mut Preview> {
         match self {
             Workspace::Preview(p) => Some(p),

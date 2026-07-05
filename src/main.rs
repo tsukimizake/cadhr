@@ -13,7 +13,10 @@ use iced::widget::{
     column, container, pane_grid, pick_list, row, scrollable, text, text_editor, toggler,
 };
 use iced::{Element, Fill, Length, Subscription, Task};
-use interpreter::{CollisionJobParams, CompileJobParams, CompileJobResult, EvalJobResult};
+use interpreter::{
+    CollisionJobParams, CompileJobParams, CompileJobResult, Eval2DJobParams, Eval2DJobResult,
+    EvalJobResult,
+};
 use ui::parts;
 use ui::preview::Preview;
 use ui::sketch::Sketch;
@@ -130,6 +133,8 @@ struct Model {
     candidates: Vec<BindingSignature>,
     /// combo_box の選択肢用キャッシュ (= `candidates.iter().map(|b| b.name).collect()`)。
     candidate_names: Vec<String>,
+    /// sketch の target 候補 (戻り型 Shape2D の binding 名)。compile 完了時に更新。
+    shape2d_candidate_names: Vec<String>,
     error_message: String,
     error_span: Option<Span>,
     diagnostics: Vec<String>,
@@ -148,6 +153,7 @@ enum Msg {
     UpdatePreviews,
     CompileDone(CompileJobResult),
     EvalDone(u64, EvalJobResult),
+    Eval2DDone(u64, Eval2DJobResult),
     Workspace(u64, WorkspaceMsg),
 
     AddPreview,
@@ -185,6 +191,7 @@ fn init() -> (Model, Task<Msg>) {
         program: None,
         candidates: Vec::new(),
         candidate_names: Vec::new(),
+        shape2d_candidate_names: Vec::new(),
         error_message: String::new(),
         error_span: None,
         diagnostics: Vec::new(),
@@ -234,6 +241,13 @@ fn preview_mut(model: &mut Model, id: u64) -> Option<&mut Preview> {
         .iter_mut()
         .find(|w| w.id() == id)?
         .as_preview_mut()
+}
+
+fn sketch_mut(model: &mut Model, id: u64) -> Option<&mut Sketch> {
+    match model.workspaces.iter_mut().find(|w| w.id() == id)? {
+        Workspace::Sketch(s) => Some(s),
+        Workspace::Preview(_) => None,
+    }
 }
 
 fn move_workspace(model: &mut Model, id: u64, up: bool) {
@@ -287,42 +301,56 @@ fn spawn_compile_job(model: &Model) -> Task<Msg> {
     )
 }
 
-fn spawn_eval_for(model: &Model, preview_id: u64) -> Task<Msg> {
+fn spawn_eval_for(model: &Model, workspace_id: u64) -> Task<Msg> {
     let Some(prog) = model.program.clone() else {
         return Task::none();
     };
-    let Some(p) = model
-        .workspaces
-        .iter()
-        .find(|w| w.id() == preview_id)
-        .and_then(Workspace::as_preview)
-    else {
-        return Task::none();
-    };
-    if p.is_collision {
-        let params = CollisionJobParams {
-            program: prog,
-            slider_values: p.slider_values.clone(),
-            search_paths: search_paths(model),
-        };
-        Task::perform(
-            async move {
-                std::thread::spawn(move || interpreter::run_collision_job(params))
-                    .join()
-                    .expect("eval worker panicked")
-            },
-            move |r| Msg::EvalDone(preview_id, r),
-        )
-    } else {
-        let params = p.build_eval_params(&prog, search_paths(model));
-        Task::perform(
-            async move {
-                std::thread::spawn(move || interpreter::run_eval_job(params))
-                    .join()
-                    .expect("eval worker panicked")
-            },
-            move |r| Msg::EvalDone(preview_id, r),
-        )
+    match model.workspaces.iter().find(|w| w.id() == workspace_id) {
+        Some(Workspace::Preview(p)) if p.is_collision => {
+            let params = CollisionJobParams {
+                program: prog,
+                slider_values: p.slider_values.clone(),
+                search_paths: search_paths(model),
+            };
+            Task::perform(
+                async move {
+                    std::thread::spawn(move || interpreter::run_collision_job(params))
+                        .join()
+                        .expect("eval worker panicked")
+                },
+                move |r| Msg::EvalDone(workspace_id, r),
+            )
+        }
+        Some(Workspace::Preview(p)) => {
+            let params = p.build_eval_params(&prog, search_paths(model));
+            Task::perform(
+                async move {
+                    std::thread::spawn(move || interpreter::run_eval_job(params))
+                        .join()
+                        .expect("eval worker panicked")
+                },
+                move |r| Msg::EvalDone(workspace_id, r),
+            )
+        }
+        Some(Workspace::Sketch(s)) => {
+            if s.target.is_empty() {
+                return Task::none();
+            }
+            let params = Eval2DJobParams {
+                program: prog,
+                search_paths: search_paths(model),
+                target: s.target.clone(),
+            };
+            Task::perform(
+                async move {
+                    std::thread::spawn(move || interpreter::run_eval2d_job(params))
+                        .join()
+                        .expect("eval worker panicked")
+                },
+                move |r| Msg::Eval2DDone(workspace_id, r),
+            )
+        }
+        None => Task::none(),
     }
 }
 
@@ -330,8 +358,7 @@ fn spawn_eval_all(model: &Model) -> Task<Msg> {
     let tasks: Vec<Task<Msg>> = model
         .workspaces
         .iter()
-        .filter_map(Workspace::as_preview)
-        .map(|p| spawn_eval_for(model, p.id))
+        .map(|w| spawn_eval_for(model, w.id()))
         .collect();
     Task::batch(tasks)
 }
@@ -372,14 +399,13 @@ fn apply_signature_defaults(model: &mut Model) {
     }
 }
 
-/// candidate 一覧が変わったとき、各 preview の combo_box state を更新する。
-fn refresh_preview_candidates(model: &mut Model) {
-    for p in model
-        .workspaces
-        .iter_mut()
-        .filter_map(Workspace::as_preview_mut)
-    {
-        p.refresh_candidates(&model.candidate_names);
+/// candidate 一覧が変わったとき、各 workspace の combo_box state を更新する。
+fn refresh_workspace_candidates(model: &mut Model) {
+    for w in &mut model.workspaces {
+        match w {
+            Workspace::Preview(p) => p.refresh_candidates(&model.candidate_names),
+            Workspace::Sketch(s) => s.refresh_candidates(&model.shape2d_candidate_names),
+        }
     }
 }
 
@@ -402,11 +428,16 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             } => {
                 model.candidates = program.previewable_bindings();
                 model.candidate_names = model.candidates.iter().map(|b| b.name.clone()).collect();
+                model.shape2d_candidate_names = program
+                    .shape2d_bindings()
+                    .into_iter()
+                    .map(|b| b.name)
+                    .collect();
                 model.program = Some(program);
                 model.error_message.clear();
                 model.error_span = None;
                 model.diagnostics = diagnostics;
-                refresh_preview_candidates(model);
+                refresh_workspace_candidates(model);
                 apply_signature_defaults(model);
                 spawn_eval_all(model)
             }
@@ -424,6 +455,12 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
         Msg::EvalDone(pid, result) => {
             if let Some(p) = preview_mut(model, pid) {
                 p.apply_eval_result(result);
+            }
+            Task::none()
+        }
+        Msg::Eval2DDone(id, result) => {
+            if let Some(s) = sketch_mut(model, id) {
+                s.apply_eval2d_result(result);
             }
             Task::none()
         }
@@ -496,7 +533,9 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
         Msg::AddSketch => {
             let id = model.next_workspace_id;
             model.next_workspace_id += 1;
-            model.workspaces.push(Workspace::Sketch(Sketch::new(id)));
+            let mut s = Sketch::new(id);
+            s.refresh_candidates(&model.shape2d_candidate_names);
+            model.workspaces.push(Workspace::Sketch(s));
             model.unsaved = true;
             Task::none()
         }

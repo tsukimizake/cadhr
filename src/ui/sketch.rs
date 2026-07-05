@@ -5,10 +5,11 @@
 //! 描いた図形から `polygon` / `circle` / `p2` のコードを生成してコピーできる。
 
 use iced::widget::canvas::{self, Path, Stroke};
-use iced::widget::{canvas as canvas_widget, column, container, row, slider, text};
+use iced::widget::{canvas as canvas_widget, column, combo_box, container, row, slider, text};
 use iced::{Color, Element, Fill, Length, Point, Rectangle, Renderer, Size, Theme, mouse};
 use serde::{Deserialize, Serialize};
 
+use crate::interpreter::Eval2DJobResult;
 use crate::session::SessionSketch;
 use crate::ui::parts;
 use crate::ui::workspace::WorkspaceEvent;
@@ -26,37 +27,15 @@ pub enum Tool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SketchShape {
     /// 描画順の線分リスト。codegen 時にチェーン連結して polygon にする。
-    Polygon {
-        lines: Vec<[GridPoint; 2]>,
-        /// true なら加算した幾何から diff2d で引く。
-        #[serde(default)]
-        subtract: bool,
-    },
-    Circle {
-        center: GridPoint,
-        radius: i32,
-        #[serde(default)]
-        subtract: bool,
-    },
+    Polygon { lines: Vec<[GridPoint; 2]> },
+    Circle { center: GridPoint, radius: i32 },
     /// 幾何には参加せず、`p2` の let 束縛だけを生成する参照点。
     Point(GridPoint),
 }
 
 impl SketchShape {
     fn empty_polygon() -> Self {
-        SketchShape::Polygon {
-            lines: Vec::new(),
-            subtract: false,
-        }
-    }
-
-    fn is_subtract(&self) -> bool {
-        match self {
-            SketchShape::Polygon { subtract, .. } | SketchShape::Circle { subtract, .. } => {
-                *subtract
-            }
-            SketchShape::Point(_) => false,
-        }
+        SketchShape::Polygon { lines: Vec::new() }
     }
 }
 
@@ -71,6 +50,13 @@ pub struct Sketch {
     pub active: usize,
     /// 現在の入力ツール (セッションに保存しない UI 状態)。
     pub tool: Tool,
+    /// 参照表示する Shape2D binding の名前。空なら紐付けなし。
+    pub target: String,
+    /// combo_box widget の内部状態。candidate 一覧が変わった時に作り直す。
+    pub target_state: combo_box::State<String>,
+    /// target binding の評価結果 (輪郭 polygon 群、grid 単位)。
+    pub ref_contours: Vec<Vec<[f32; 2]>>,
+    pub ref_error: Option<String>,
     /// グリッド + 確定済み図形のキャッシュ。描画内容が変わる操作で clear する。
     cache: canvas::Cache,
 }
@@ -84,6 +70,10 @@ impl Sketch {
             shapes: vec![SketchShape::empty_polygon()],
             active: 0,
             tool: Tool::Line,
+            target: String::new(),
+            target_state: combo_box::State::new(Vec::new()),
+            ref_contours: Vec::new(),
+            ref_error: None,
             cache: canvas::Cache::new(),
         }
     }
@@ -92,6 +82,7 @@ impl Sketch {
         let mut s = Self::new(ss.sketch_id);
         s.minimized = ss.minimized;
         s.zoom = ss.zoom;
+        s.target = ss.target.clone();
         if !ss.shapes.is_empty() {
             s.shapes = ss.shapes.clone();
         }
@@ -104,18 +95,36 @@ impl Sketch {
             order,
             minimized: self.minimized,
             zoom: self.zoom,
+            target: self.target.clone(),
             shapes: self.shapes.clone(),
         }
+    }
+
+    /// Shape2D candidate 一覧が変わった時に呼ぶ。
+    pub fn refresh_candidates(&mut self, names: &[String]) {
+        self.target_state = combo_box::State::new(names.to_vec());
+    }
+
+    pub fn apply_eval2d_result(&mut self, result: Eval2DJobResult) {
+        match result {
+            Eval2DJobResult::Success { contours } => {
+                self.ref_contours = contours;
+                self.ref_error = None;
+            }
+            Eval2DJobResult::Error { message } => {
+                self.ref_error = Some(message);
+            }
+        }
+        self.cache.clear();
     }
 
     /// アクティブが Polygon ならそこへ追記、そうでなければ新規 Polygon を起こす。
     pub fn add_line(&mut self, a: GridPoint, b: GridPoint) {
         match &mut self.shapes[self.active] {
-            SketchShape::Polygon { lines, .. } => lines.push([a, b]),
+            SketchShape::Polygon { lines } => lines.push([a, b]),
             _ => {
                 self.shapes.push(SketchShape::Polygon {
                     lines: vec![[a, b]],
-                    subtract: false,
                 });
                 self.active = self.shapes.len() - 1;
             }
@@ -160,11 +169,7 @@ impl Sketch {
             }
             // 円と点は active を変えずリスト末尾に追加する
             SketchMsg::CircleAdded(center, radius) => {
-                self.shapes.push(SketchShape::Circle {
-                    center,
-                    radius,
-                    subtract: false,
-                });
+                self.shapes.push(SketchShape::Circle { center, radius });
                 self.cache.clear();
                 WorkspaceEvent::Edited
             }
@@ -180,7 +185,7 @@ impl Sketch {
             }
             SketchMsg::Undo => {
                 match &mut self.shapes[self.active] {
-                    SketchShape::Polygon { lines, .. } => {
+                    SketchShape::Polygon { lines } => {
                         lines.pop();
                     }
                     _ => self.remove_shape(self.active),
@@ -189,7 +194,7 @@ impl Sketch {
                 WorkspaceEvent::Edited
             }
             SketchMsg::Clear => {
-                if let SketchShape::Polygon { lines, .. } = &mut self.shapes[self.active] {
+                if let SketchShape::Polygon { lines } = &mut self.shapes[self.active] {
                     lines.clear();
                     self.cache.clear();
                 }
@@ -199,16 +204,6 @@ impl Sketch {
                 self.shapes.push(SketchShape::empty_polygon());
                 self.active = self.shapes.len() - 1;
                 self.cache.clear();
-                WorkspaceEvent::Edited
-            }
-            SketchMsg::ToggleSubtract(i) => {
-                if let Some(
-                    SketchShape::Polygon { subtract, .. } | SketchShape::Circle { subtract, .. },
-                ) = self.shapes.get_mut(i)
-                {
-                    *subtract = !*subtract;
-                    self.cache.clear();
-                }
                 WorkspaceEvent::Edited
             }
             // 選択はセッションに保存しない UI 状態なので unsaved 化しない
@@ -225,16 +220,27 @@ impl Sketch {
             }
             SketchMsg::CopyShape(i) => WorkspaceEvent::CopyRequested(self.shape_code_at(i)),
             SketchMsg::CopyCode => WorkspaceEvent::CopyRequested(self.code()),
+            SketchMsg::TargetChanged(new_target) => {
+                if self.target == new_target {
+                    return WorkspaceEvent::None;
+                }
+                self.target = new_target;
+                if self.target.is_empty() {
+                    self.ref_contours.clear();
+                    self.ref_error = None;
+                    self.cache.clear();
+                }
+                WorkspaceEvent::TargetChanged
+            }
         }
     }
 
-    /// 指定 shape 単体のコード (座標の let くくり出しはその shape 内で閉じる。
-    /// subtract フラグは単体コピーでは無視する)。
+    /// 指定 shape 単体のコード (座標の let くくり出しはその shape 内で閉じる)。
     pub fn shape_code_at(&self, idx: usize) -> String {
         match self.shapes.get(idx) {
             None => String::new(),
-            Some(SketchShape::Polygon { lines, .. }) => single_polygon_code(&chain_points(lines)),
-            Some(SketchShape::Circle { center, radius, .. }) => {
+            Some(SketchShape::Polygon { lines }) => single_polygon_code(&chain_points(lines)),
+            Some(SketchShape::Circle { center, radius }) => {
                 circle_expr(*center, *radius, &[], &[])
             }
             Some(SketchShape::Point(p)) => {
@@ -243,34 +249,29 @@ impl Sketch {
         }
     }
 
-    /// 全 shape の結合コード。加算の幾何 (polygon / circle) は union2d で畳み、
-    /// subtract の幾何はその結果から diff2d で引く。点は `p2` の let 束縛として並べる。
-    /// 座標の let くくり出しは全 shape 横断。
-    /// 幾何が無く点だけの場合は、貼り付け先の let に入れる想定で束縛行だけを出す。
+    /// 全 shape の結合コード。item (polygon / circle / point) が 1 つならその式、
+    /// 複数なら let で名前に束縛して `{ poly1 = poly1, ..., pt1 = pt1 }` の record
+    /// で返す (組み合わせは利用側コードに委ねる)。座標の let くくり出しは全 shape 横断。
     pub fn code(&self) -> String {
         enum Geom {
             Poly(Vec<GridPoint>),
             Circ { center: GridPoint, radius: i32 },
         }
-        let mut geoms: Vec<(String, Geom, bool)> = Vec::new();
+        let mut geoms: Vec<(String, Geom)> = Vec::new();
         let mut points: Vec<(String, GridPoint)> = Vec::new();
         let (mut poly_n, mut circ_n, mut pt_n) = (0, 0, 0);
         for shape in &self.shapes {
             match shape {
-                SketchShape::Polygon { lines, subtract } => {
+                SketchShape::Polygon { lines } => {
                     // 空 polygon も番号を消費し、panel 行のラベルと名前を一致させる
                     poly_n += 1;
                     let chain = chain_points(lines);
                     if chain.is_empty() {
                         continue;
                     }
-                    geoms.push((format!("poly{poly_n}"), Geom::Poly(chain), *subtract));
+                    geoms.push((format!("poly{poly_n}"), Geom::Poly(chain)));
                 }
-                SketchShape::Circle {
-                    center,
-                    radius,
-                    subtract,
-                } => {
+                SketchShape::Circle { center, radius } => {
                     circ_n += 1;
                     geoms.push((
                         format!("circ{circ_n}"),
@@ -278,7 +279,6 @@ impl Sketch {
                             center: *center,
                             radius: *radius,
                         },
-                        *subtract,
                     ));
                 }
                 SketchShape::Point(p) => {
@@ -292,7 +292,7 @@ impl Sketch {
         }
 
         let mut pool: Vec<GridPoint> = Vec::new();
-        for (_, g, _) in &geoms {
+        for (_, g) in &geoms {
             match g {
                 Geom::Poly(chain) => pool.extend(chain.iter().copied()),
                 Geom::Circ { center, .. } => pool.push(*center),
@@ -302,71 +302,46 @@ impl Sketch {
         let x_vars = shared_coord_vars(pool.iter().map(|p| p[0]), "x");
         let y_vars = shared_coord_vars(pool.iter().map(|p| p[1]), "y");
 
-        let geom_exprs: Vec<(String, String, bool)> = geoms
+        let geom_exprs: Vec<(String, String)> = geoms
             .iter()
-            .map(|(name, g, subtract)| {
+            .map(|(name, g)| {
                 let expr = match g {
                     Geom::Poly(chain) => polygon_expr(chain, &x_vars, &y_vars),
                     Geom::Circ { center, radius } => {
                         circle_expr(*center, *radius, &x_vars, &y_vars)
                     }
                 };
-                (name.clone(), expr, *subtract)
+                (name.clone(), expr)
             })
             .collect();
-        let point_bindings: Vec<String> = points
+        let point_exprs: Vec<(String, String)> = points
             .iter()
             .map(|(name, p)| {
-                format!(
-                    "{name} = p2 {} {}",
-                    coord_term(p[0], &x_vars),
-                    coord_term(p[1], &y_vars)
+                (
+                    name.clone(),
+                    format!(
+                        "p2 {} {}",
+                        coord_term(p[0], &x_vars),
+                        coord_term(p[1], &y_vars)
+                    ),
                 )
             })
             .collect();
+        let items: Vec<(String, String)> =
+            geom_exprs.into_iter().chain(point_exprs).collect();
 
-        if geom_exprs.is_empty() {
-            let mut out = String::new();
-            for (v, name) in x_vars.iter().chain(y_vars.iter()) {
-                out.push_str(&format!("{name} = {}\n", fmt_coord(*v)));
-            }
-            for b in &point_bindings {
-                out.push_str(b);
-                out.push('\n');
-            }
-            return out.trim_end().to_string();
-        }
-
-        let adds: Vec<&String> = geom_exprs
-            .iter()
-            .filter(|(_, _, sub)| !sub)
-            .map(|(name, _, _)| name)
-            .collect();
-        let subs: Vec<&String> = geom_exprs
-            .iter()
-            .filter(|(_, _, sub)| *sub)
-            .map(|(name, _, _)| name)
-            .collect();
-        // 全部 subtract なら引く相手がいないので加算として扱う
-        let (adds, subs) = if adds.is_empty() {
-            (subs, Vec::new())
+        let body = if items.len() == 1 {
+            items[0].1.clone()
         } else {
-            (adds, subs)
+            let fields = items
+                .iter()
+                .map(|(name, _)| format!("{name} = {name}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{ {fields} }}")
         };
-
-        let body = if geom_exprs.len() == 1 {
-            geom_exprs[0].1.clone()
-        } else if subs.is_empty() {
-            union_fold(&adds)
-        } else {
-            format!(
-                "diff2d {} {}",
-                paren_if_compound(union_fold(&adds)),
-                paren_if_compound(union_fold(&subs))
-            )
-        };
-        let needs_geom_bindings = geom_exprs.len() > 1;
-        if x_vars.is_empty() && y_vars.is_empty() && !needs_geom_bindings && points.is_empty() {
+        let needs_item_bindings = items.len() > 1;
+        if x_vars.is_empty() && y_vars.is_empty() && !needs_item_bindings {
             return body;
         }
 
@@ -374,15 +349,10 @@ impl Sketch {
         for (v, name) in x_vars.iter().chain(y_vars.iter()) {
             out.push_str(&format!("    {name} = {}\n", fmt_coord(*v)));
         }
-        if needs_geom_bindings {
-            for (name, expr, _) in &geom_exprs {
+        if needs_item_bindings {
+            for (name, expr) in &items {
                 out.push_str(&format!("    {name} = {expr}\n"));
             }
-        }
-        for b in &point_bindings {
-            out.push_str("    ");
-            out.push_str(b);
-            out.push('\n');
         }
         out.push_str("in\n");
         out.push_str(&body);
@@ -404,25 +374,6 @@ fn chain_points(lines: &[[GridPoint; 2]]) -> Vec<GridPoint> {
         pts.pop();
     }
     pts
-}
-
-fn union_fold(names: &[&String]) -> String {
-    if names.len() == 1 {
-        return names[0].clone();
-    }
-    let mut expr = format!("union2d {} {}", names[0], names[1]);
-    for name in &names[2..] {
-        expr = format!("union2d ({expr}) {name}");
-    }
-    expr
-}
-
-fn paren_if_compound(expr: String) -> String {
-    if expr.contains(' ') {
-        format!("({expr})")
-    } else {
-        expr
-    }
 }
 
 fn coord_term(v: i32, vars: &[(i32, String)]) -> String {
@@ -529,12 +480,12 @@ pub enum SketchMsg {
     AddPolygon,
     SelectShape(usize),
     RemoveShape(usize),
-    /// 指定 shape の加算/減算 (diff2d) を切り替える。
-    ToggleSubtract(usize),
     /// 指定 shape 単体のコードをコピー。
     CopyShape(usize),
     /// 全 shape の結合コードをコピー。
     CopyCode,
+    /// 参照表示する Shape2D binding 名が変わった。
+    TargetChanged(String),
 }
 
 const GRID: Color = Color::from_rgb(0.22, 0.22, 0.25);
@@ -543,18 +494,20 @@ const LINE: Color = Color::from_rgb(0.55, 0.85, 0.55);
 const VERTEX: Color = Color::from_rgb(0.75, 0.95, 0.75);
 const INACTIVE_LINE: Color = Color::from_rgb(0.35, 0.5, 0.35);
 const INACTIVE_VERTEX: Color = Color::from_rgb(0.45, 0.58, 0.45);
-const SUBTRACT_LINE: Color = Color::from_rgb(0.9, 0.5, 0.5);
-const SUBTRACT_VERTEX: Color = Color::from_rgb(1.0, 0.65, 0.65);
-const SUBTRACT_INACTIVE_LINE: Color = Color::from_rgb(0.55, 0.35, 0.35);
-const SUBTRACT_INACTIVE_VERTEX: Color = Color::from_rgb(0.65, 0.45, 0.45);
 const DRAG_PREVIEW: Color = Color::from_rgba(0.55, 0.85, 0.55, 0.5);
 const SNAP_INDICATOR: Color = Color::from_rgba(0.95, 0.85, 0.4, 0.8);
+/// target binding の評価結果 (参照輪郭) の色。
+const REF_LINE: Color = Color::from_rgba(0.45, 0.65, 0.95, 0.9);
 
 /// キャンバスの中心が world 原点。y は上向き (screen y と反転)。
 fn to_screen(zoom: f32, size: Size, p: GridPoint) -> Point {
+    to_screen_f(zoom, size, [p[0] as f32, p[1] as f32])
+}
+
+fn to_screen_f(zoom: f32, size: Size, p: [f32; 2]) -> Point {
     Point::new(
-        size.width / 2.0 + p[0] as f32 * zoom,
-        size.height / 2.0 - p[1] as f32 * zoom,
+        size.width / 2.0 + p[0] * zoom,
+        size.height / 2.0 - p[1] * zoom,
     )
 }
 
@@ -679,16 +632,29 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                 );
             }
 
+            // target binding の評価結果を参照レイヤーとして下に描く
+            for contour in &self.sketch.ref_contours {
+                if contour.len() < 2 {
+                    continue;
+                }
+                let path = Path::new(|b| {
+                    b.move_to(to_screen_f(zoom, size, contour[0]));
+                    for p in &contour[1..] {
+                        b.line_to(to_screen_f(zoom, size, *p));
+                    }
+                    b.close();
+                });
+                frame.stroke(&path, Stroke::default().with_width(1.5).with_color(REF_LINE));
+            }
+
             for (si, shape) in self.sketch.shapes.iter().enumerate() {
-                let (line_color, vertex_color) =
-                    match (si == self.sketch.active, shape.is_subtract()) {
-                        (true, false) => (LINE, VERTEX),
-                        (false, false) => (INACTIVE_LINE, INACTIVE_VERTEX),
-                        (true, true) => (SUBTRACT_LINE, SUBTRACT_VERTEX),
-                        (false, true) => (SUBTRACT_INACTIVE_LINE, SUBTRACT_INACTIVE_VERTEX),
-                    };
+                let (line_color, vertex_color) = if si == self.sketch.active {
+                    (LINE, VERTEX)
+                } else {
+                    (INACTIVE_LINE, INACTIVE_VERTEX)
+                };
                 match shape {
-                    SketchShape::Polygon { lines, .. } => {
+                    SketchShape::Polygon { lines } => {
                         for [a, b] in lines {
                             let pa = to_screen(zoom, size, *a);
                             let pb = to_screen(zoom, size, *b);
@@ -700,7 +666,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                             frame.fill(&Path::circle(pb, 3.0), vertex_color);
                         }
                     }
-                    SketchShape::Circle { center, radius, .. } => {
+                    SketchShape::Circle { center, radius } => {
                         let c = to_screen(zoom, size, *center);
                         frame.stroke(
                             &Path::circle(c, *radius as f32 * zoom),
@@ -778,11 +744,22 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
 
 pub fn view<'a>(s: &'a Sketch, index: usize, total: usize) -> Element<'a, SketchMsg> {
     let label = format!("sketch #{} ({}/{})", s.id, index + 1, total);
+    // Shape2D binding を選ぶと評価結果が参照輪郭としてキャンバスに出る
+    let target_cb = combo_box(
+        &s.target_state,
+        "Shape2D binding",
+        Some(&s.target),
+        SketchMsg::TargetChanged,
+    )
+    .on_input(SketchMsg::TargetChanged)
+    .width(Length::Fixed(140.0))
+    .size(13.0);
     let header = row![
         parts::dark_button("↑").on_press(SketchMsg::MoveUp),
         parts::dark_button("↓").on_press(SketchMsg::MoveDown),
         parts::dark_button(if s.minimized { "▶" } else { "▼" }).on_press(SketchMsg::Minimize),
         text(label),
+        target_cb,
         parts::dark_button(if s.tool == Tool::Line { "[Line]" } else { "Line" })
             .on_press(SketchMsg::SetTool(Tool::Line)),
         parts::dark_button(if s.tool == Tool::Circle { "[Circle]" } else { "Circle" })
@@ -816,14 +793,14 @@ pub fn view<'a>(s: &'a Sketch, index: usize, total: usize) -> Element<'a, Sketch
     for (i, shape) in s.shapes.iter().enumerate() {
         // ラベルは codegen の束縛名と揃える
         let (label, has_content) = match shape {
-            SketchShape::Polygon { lines, .. } => {
+            SketchShape::Polygon { lines } => {
                 poly_n += 1;
                 (
                     format!("poly{poly_n} ({} lines)", lines.len()),
                     !lines.is_empty(),
                 )
             }
-            SketchShape::Circle { center, radius, .. } => {
+            SketchShape::Circle { center, radius } => {
                 circ_n += 1;
                 (
                     format!("circ{circ_n} (r={radius} @ ({}, {}))", center[0], center[1]),
@@ -841,12 +818,6 @@ pub fn view<'a>(s: &'a Sketch, index: usize, total: usize) -> Element<'a, Sketch
             text(label),
         ]
         .spacing(4);
-        if !matches!(shape, SketchShape::Point(_)) {
-            r = r.push(
-                parts::dark_button(if shape.is_subtract() { "−" } else { "+" })
-                    .on_press(SketchMsg::ToggleSubtract(i)),
-            );
-        }
         if has_content {
             r = r.push(parts::dark_button("Copy").on_press(SketchMsg::CopyShape(i)));
         }
@@ -875,9 +846,13 @@ pub fn view<'a>(s: &'a Sketch, index: usize, total: usize) -> Element<'a, Sketch
         .into()
     };
 
-    container(column![header, canvas_el, shape_list, zoom_row, code_row].spacing(4))
-        .padding(4)
-        .into()
+    let mut col = column![header, canvas_el, shape_list, zoom_row, code_row].spacing(4);
+    if let Some(err) = &s.ref_error {
+        col = col.push(
+            text(format!("error: {err}")).color(iced::Color::from_rgb(1.0, 0.4, 0.4)),
+        );
+    }
+    container(col).padding(4).into()
 }
 
 #[cfg(test)]
@@ -894,7 +869,7 @@ mod tests {
 
     fn poly_lines(s: &Sketch, i: usize) -> &Vec<[GridPoint; 2]> {
         match &s.shapes[i] {
-            SketchShape::Polygon { lines, .. } => lines,
+            SketchShape::Polygon { lines } => lines,
             other => panic!("expected polygon at {i}, got {other:?}"),
         }
     }
@@ -956,19 +931,19 @@ mod tests {
     }
 
     #[test]
-    fn multiple_polygons_are_let_bound_and_unioned() {
+    fn multiple_polygons_are_let_bound_into_record() {
         let mut s = sketch_with(&[[[0, 0], [4, 0]], [[4, 0], [0, 4]]]);
         s.update(SketchMsg::AddPolygon);
         s.add_line([10, 0], [14, 0]);
         s.add_line([14, 0], [10, 4]);
         assert_eq!(
             s.code(),
-            "let\n    x1 = 0.0\n    x2 = 10.0\n    y1 = 0.0\n    y2 = 4.0\n    poly1 = polygon [p2 x1 y1, p2 4.0 y1, p2 x1 y2]\n    poly2 = polygon [p2 x2 y1, p2 14.0 y1, p2 x2 y2]\nin\nunion2d poly1 poly2"
+            "let\n    x1 = 0.0\n    x2 = 10.0\n    y1 = 0.0\n    y2 = 4.0\n    poly1 = polygon [p2 x1 y1, p2 4.0 y1, p2 x1 y2]\n    poly2 = polygon [p2 x2 y1, p2 14.0 y1, p2 x2 y2]\nin\n{ poly1 = poly1, poly2 = poly2 }"
         );
     }
 
     #[test]
-    fn three_polygons_fold_with_union2d() {
+    fn three_shapes_form_a_record() {
         let mut s = sketch_with(&[[[0, 0], [1, 1]]]);
         s.update(SketchMsg::AddPolygon);
         s.add_line([2, 2], [3, 3]);
@@ -976,7 +951,7 @@ mod tests {
         s.add_line([4, 4], [5, 5]);
         assert!(
             s.code()
-                .ends_with("in\nunion2d (union2d poly1 poly2) poly3")
+                .ends_with("in\n{ poly1 = poly1, poly2 = poly2, poly3 = poly3 }")
         );
     }
 
@@ -1033,30 +1008,40 @@ mod tests {
     }
 
     #[test]
-    fn circle_and_polygon_union_with_shared_coords() {
+    fn circle_and_polygon_form_a_record_with_shared_coords() {
         let mut s = sketch_with(&[[[0, 0], [4, 0]], [[4, 0], [0, 4]]]);
         s.update(SketchMsg::CircleAdded([4, 4], 2));
         assert_eq!(
             s.code(),
-            "let\n    x1 = 0.0\n    x2 = 4.0\n    y1 = 0.0\n    y2 = 4.0\n    poly1 = polygon [p2 x1 y1, p2 x2 y1, p2 x1 y2]\n    circ1 = circle 2.0 |> translate2d (p2 0.0 0.0) (p2 x2 y2)\nin\nunion2d poly1 circ1"
+            "let\n    x1 = 0.0\n    x2 = 4.0\n    y1 = 0.0\n    y2 = 4.0\n    poly1 = polygon [p2 x1 y1, p2 x2 y1, p2 x1 y2]\n    circ1 = circle 2.0 |> translate2d (p2 0.0 0.0) (p2 x2 y2)\nin\n{ poly1 = poly1, circ1 = circ1 }"
         );
     }
 
     #[test]
-    fn points_only_emit_bare_bindings() {
+    fn single_point_is_bare_p2() {
         let mut s = Sketch::new(0);
         s.update(SketchMsg::PointAdded([3, 4]));
-        s.update(SketchMsg::PointAdded([3, 8]));
-        assert_eq!(s.code(), "x1 = 3.0\npt1 = p2 x1 4.0\npt2 = p2 x1 8.0");
+        assert_eq!(s.code(), "p2 3.0 4.0");
     }
 
     #[test]
-    fn point_with_geometry_is_let_bound() {
+    fn points_form_a_record() {
+        let mut s = Sketch::new(0);
+        s.update(SketchMsg::PointAdded([3, 4]));
+        s.update(SketchMsg::PointAdded([3, 8]));
+        assert_eq!(
+            s.code(),
+            "let\n    x1 = 3.0\n    pt1 = p2 x1 4.0\n    pt2 = p2 x1 8.0\nin\n{ pt1 = pt1, pt2 = pt2 }"
+        );
+    }
+
+    #[test]
+    fn point_with_geometry_becomes_record_field() {
         let mut s = sketch_with(&[[[0, 0], [5, 0]]]);
         s.update(SketchMsg::PointAdded([5, 5]));
         assert_eq!(
             s.code(),
-            "let\n    x1 = 5.0\n    y1 = 0.0\n    pt1 = p2 x1 5.0\nin\npolygon [p2 0.0 y1, p2 x1 y1]"
+            "let\n    x1 = 5.0\n    y1 = 0.0\n    poly1 = polygon [p2 0.0 y1, p2 x1 y1]\n    pt1 = p2 x1 5.0\nin\n{ poly1 = poly1, pt1 = pt1 }"
         );
     }
 
@@ -1082,40 +1067,6 @@ mod tests {
     }
 
     #[test]
-    fn subtract_shape_generates_diff2d() {
-        let mut s = sketch_with(&[[[0, 0], [4, 0]], [[4, 0], [0, 4]]]);
-        s.update(SketchMsg::CircleAdded([1, 1], 1));
-        s.update(SketchMsg::ToggleSubtract(1));
-        assert_eq!(
-            s.code(),
-            "let\n    x1 = 0.0\n    y1 = 0.0\n    poly1 = polygon [p2 x1 y1, p2 4.0 y1, p2 x1 4.0]\n    circ1 = circle 1.0 |> translate2d (p2 0.0 0.0) (p2 1.0 1.0)\nin\ndiff2d poly1 circ1"
-        );
-    }
-
-    #[test]
-    fn multiple_adds_and_subs_fold_before_diff2d() {
-        let mut s = sketch_with(&[[[0, 0], [1, 2]]]);
-        s.update(SketchMsg::AddPolygon);
-        s.add_line([10, 0], [11, 2]);
-        s.update(SketchMsg::CircleAdded([20, 20], 1));
-        s.update(SketchMsg::CircleAdded([30, 30], 1));
-        s.update(SketchMsg::ToggleSubtract(2));
-        s.update(SketchMsg::ToggleSubtract(3));
-        assert!(
-            s.code()
-                .ends_with("in\ndiff2d (union2d poly1 poly2) (union2d circ1 circ2)")
-        );
-    }
-
-    #[test]
-    fn lone_subtract_is_treated_as_add() {
-        let mut s = Sketch::new(0);
-        s.update(SketchMsg::CircleAdded([0, 0], 2));
-        s.update(SketchMsg::ToggleSubtract(1));
-        assert_eq!(s.code(), "circle 2.0");
-    }
-
-    #[test]
     fn grid_distance_rounds_to_nearest_int() {
         assert_eq!(grid_distance([0, 0], [3, 4]), 5);
         assert_eq!(grid_distance([0, 0], [1, 1]), 1); // sqrt(2) ≈ 1.41 → 1
@@ -1124,8 +1075,9 @@ mod tests {
 
     #[test]
     fn generated_code_compiles_as_cadhr_lang() {
-        // let 括り出し (負数 RHS 含む)・複数 polygon・circle・point・diff2d を通る形で、
-        // 貼り付け時と同様に binding body としてインデントして埋め込む。
+        // let 括り出し (負数 RHS 含む)・複数 polygon・circle・point・record 返しを
+        // 通る形で、貼り付け時と同様に binding body としてインデントして埋め込む。
+        // record の各 field は利用側で diff2d などに組めることを確認する。
         let mut s = sketch_with(&[
             [[-1, 0], [2, 0]],
             [[2, 0], [2, 3]],
@@ -1137,8 +1089,6 @@ mod tests {
         s.add_line([8, 0], [5, 3]);
         s.update(SketchMsg::CircleAdded([-1, 3], 2));
         s.update(SketchMsg::PointAdded([2, 3]));
-        s.update(SketchMsg::CircleAdded([0, 1], 1));
-        s.update(SketchMsg::ToggleSubtract(4));
         let indented = s
             .code()
             .lines()
@@ -1146,7 +1096,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let src = format!(
-            "main =\n    let\n        shape =\n{indented}\n    in\n    {{ models = [extrude_xy 1.0 shape], bom = [], controls = [] }}\n"
+            "main =\n    let\n        shape =\n{indented}\n    in\n    {{ models = [extrude_xy 1.0 (diff2d shape.poly1 shape.circ1), extrude_xy 1.0 (shape.poly2 |> translate2d shape.pt1 (p2 0.0 0.0))], bom = [], controls = [] }}\n"
         );
         cadhr_lang::compile(&src).unwrap_or_else(|e| panic!("generated code failed: {e:?}"));
     }

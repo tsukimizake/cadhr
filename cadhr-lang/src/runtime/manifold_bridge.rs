@@ -127,6 +127,14 @@ pub fn bbox_center_2d(model: &Model2D) -> Result<(f64, f64), BridgeError> {
     Ok(((min_x + max_x) / 2.0, (min_y + max_y) / 2.0))
 }
 
+/// `Model2D` を評価して輪郭 polygon 群を返す。穴は別 contour (逆巻き) として
+/// 含まれる。空形状は空 Vec。GUI の 2D sketch が参照表示に使う。
+pub fn shape2d_contours(profile: &Model2D) -> Vec<Vec<[f64; 2]>> {
+    to_cross_section(profile)
+        .map(|cs| cs.to_polygons())
+        .unwrap_or_default()
+}
+
 /// `Model2D` を `CrossSection` (Clipper2 ベースの 2D 領域) に評価する。
 /// CSG ノードは manifold-csg のネイティブ 2D boolean をそのまま使う。
 fn to_cross_section(profile: &Model2D) -> Option<CrossSection> {

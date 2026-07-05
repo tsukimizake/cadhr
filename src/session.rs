@@ -54,6 +54,9 @@ pub struct SessionSketch {
     /// 1 grid 単位あたりのピクセル数。
     #[serde(default = "default_zoom")]
     pub zoom: f32,
+    /// 参照表示する Shape2D binding の名前。空なら紐付けなし。
+    #[serde(default)]
+    pub target: String,
     #[serde(default)]
     pub shapes: Vec<crate::ui::sketch::SketchShape>,
 }

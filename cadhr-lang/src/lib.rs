@@ -159,6 +159,16 @@ impl CompiledProgram {
     /// レンダリング可能 = `Shape3D` / `List Shape3D` / `{ models : List Shape3D, .. }`
     /// を含む record / それらに unify される型変数。
     pub fn previewable_bindings(&self) -> Vec<BindingSignature> {
+        self.bindings_with_return_filter(is_renderable_return)
+    }
+
+    /// GUI の 2D sketch 用。戻り型 (引数を剥がした後) が `Shape2D`、または
+    /// `Shape2D` の field を 1 つ以上持つ record の top-level binding を宣言順で返す。
+    pub fn shape2d_bindings(&self) -> Vec<BindingSignature> {
+        self.bindings_with_return_filter(is_shape2d_return)
+    }
+
+    fn bindings_with_return_filter(&self, pred: impl Fn(&Type) -> bool) -> Vec<BindingSignature> {
         let main_lm = &self.unit.modules[self.unit.main_index];
         let main_qname = main_lm.qualified_name.clone();
         let module_schemes = match self.schemes.get(&main_qname) {
@@ -191,7 +201,7 @@ impl CompiledProgram {
                     break;
                 }
             }
-            if !ok || !is_renderable_return(ret) {
+            if !ok || !pred(ret) {
                 continue;
             }
             let params = collect_params(v, &self.sliders);
@@ -245,6 +255,14 @@ fn collect_params(v: &syntax::ast::ValueDecl, sliders: &[SliderDecl]) -> Vec<Bin
         .collect()
 }
 
+fn is_shape2d_return(ty: &Type) -> bool {
+    let is_shape2d = |t: &Type| matches!(t, Type::Con(n, a) if n == "Shape2D" && a.is_empty());
+    match ty {
+        Type::Record(fields) => fields.iter().any(|(_, t)| is_shape2d(t)),
+        _ => is_shape2d(ty),
+    }
+}
+
 fn is_renderable_return(ty: &Type) -> bool {
     match ty {
         Type::Con(name, args) if name == "Shape3D" && args.is_empty() => true,
@@ -264,6 +282,48 @@ pub fn run_binding(
     binding: &str,
     inputs: &Inputs,
 ) -> Result<MainOutput, Diagnostic> {
+    let cur = eval_binding_value(prog, binding, inputs)?;
+    let mut out = unpack_main_output(cur)?;
+    // eval 中に builtin が記録した control point を Output に詰める。
+    out.control_points = runtime::builtin::take_recorded_controls();
+    Ok(out)
+}
+
+/// 戻り型が `Shape2D` (または Shape2D field を持つ record) の binding を評価し、
+/// 輪郭 polygon 群 (穴を含む) を返す。record は全 Shape2D field の輪郭を連結する。
+/// GUI の 2D sketch が参照表示に使う。
+#[cfg(feature = "manifold")]
+pub fn run_binding_2d(
+    prog: &CompiledProgram,
+    binding: &str,
+    inputs: &Inputs,
+) -> Result<Vec<Vec<[f64; 2]>>, Diagnostic> {
+    let cur = eval_binding_value(prog, binding, inputs)?;
+    let _ = runtime::builtin::take_recorded_controls();
+    match cur {
+        Value::Shape2D(m) => Ok(runtime::manifold_bridge::shape2d_contours(&m)),
+        Value::Record(fields) => {
+            let mut contours = Vec::new();
+            for (_, v) in fields {
+                if let Value::Shape2D(m) = v {
+                    contours.extend(runtime::manifold_bridge::shape2d_contours(&m));
+                }
+            }
+            Ok(contours)
+        }
+        other => Err(Diagnostic::runtime(
+            Span::empty(),
+            format!("binding の戻り値が Shape2D でない: {other}"),
+        )),
+    }
+}
+
+/// binding を lookup し、引数を `inputs` (不足分はデフォルト値) で適用した値を返す。
+fn eval_binding_value(
+    prog: &CompiledProgram,
+    binding: &str,
+    inputs: &Inputs,
+) -> Result<Value, Diagnostic> {
     // GUI からの control point override を thread-local にセット (eval 中 builtin が見る)。
     runtime::builtin::set_control_overrides(inputs.control_overrides.clone());
     // center3d などが Manifold 評価する際に STL 検索パスを引けるようセット。
@@ -301,11 +361,7 @@ pub fn run_binding(
             cur = ev.apply(cur, v, Span::empty())?;
         }
     }
-
-    let mut out = unpack_main_output(cur)?;
-    // eval 中に builtin が記録した control point を Output に詰める。
-    out.control_points = runtime::builtin::take_recorded_controls();
-    Ok(out)
+    Ok(cur)
 }
 
 fn default_for_param(p: &BindingParam) -> Value {
@@ -500,6 +556,54 @@ main = plate
         assert!(names.contains(&"hex_head"), "hex_head should be previewable; got {names:?}");
         assert!(names.contains(&"main"), "main should be previewable; got {names:?}");
         assert!(!names.contains(&"helper"), "helper (Float -> Float) should not be previewable; got {names:?}");
+    }
+
+    #[test]
+    fn shape2d_bindings_lists_shape2d_decls_only() {
+        let src = "\
+profile = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 0.0 4.0]
+disc r = circle r
+sketch1 = { poly1 = profile, circ1 = circle 2.0 }
+plate = cube 20.0 20.0 1.0
+main = plate
+";
+        let prog = compile(src).expect("compile");
+        let names: Vec<String> = prog.shape2d_bindings().into_iter().map(|b| b.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "profile".to_string(),
+                "disc".to_string(),
+                "sketch1".to_string()
+            ]
+        );
+    }
+
+    #[cfg(feature = "manifold")]
+    #[test]
+    fn run_binding_2d_returns_contours() {
+        let src = "\
+profile = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 0.0 4.0]
+main = extrude_xy 1.0 profile
+";
+        let prog = compile(src).expect("compile");
+        let contours =
+            run_binding_2d(&prog, "profile", &Inputs::default()).expect("run_binding_2d");
+        assert_eq!(contours.len(), 1);
+        assert_eq!(contours[0].len(), 3);
+    }
+
+    #[cfg(feature = "manifold")]
+    #[test]
+    fn run_binding_2d_concatenates_record_fields() {
+        let src = "\
+sketch1 = { poly1 = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 0.0 4.0], pt1 = p2 1.0 1.0, poly2 = polygon [p2 10.0 0.0, p2 14.0 0.0, p2 10.0 4.0] }
+main = extrude_xy 1.0 sketch1.poly1
+";
+        let prog = compile(src).expect("compile");
+        let contours =
+            run_binding_2d(&prog, "sketch1", &Inputs::default()).expect("run_binding_2d");
+        assert_eq!(contours.len(), 2);
     }
 
     #[test]
