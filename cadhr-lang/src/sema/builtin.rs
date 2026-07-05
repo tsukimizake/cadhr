@@ -37,6 +37,121 @@ impl BuiltinRegistry {
     }
 }
 
+/// builtin の型シグネチャに登場する型。LSP の completion / hover が参照する。
+#[derive(Clone, Copy, Debug)]
+pub struct BuiltinType {
+    pub name: &'static str,
+    /// 型引数名 (`List a` の `["a"]`)。空ならモノ型。
+    pub params: &'static [&'static str],
+    /// record alias の展開結果 (`Point2D` の `{ x : Float, y : Float }`)。
+    pub alias_body: Option<&'static str>,
+    pub doc: &'static str,
+}
+
+impl BuiltinType {
+    /// hover / completion 表示用の宣言形。
+    /// `type Shape3D` / `type List a` / `type alias Point2D = { x : Float, y : Float }`
+    pub fn decl(&self) -> String {
+        let mut s = String::from("type ");
+        if self.alias_body.is_some() {
+            s.push_str("alias ");
+        }
+        s.push_str(self.name);
+        for p in self.params {
+            s.push(' ');
+            s.push_str(p);
+        }
+        if let Some(body) = self.alias_body {
+            s.push_str(" = ");
+            s.push_str(body);
+        }
+        s
+    }
+}
+
+pub fn type_registry() -> &'static [BuiltinType] {
+    const NONE: &[&str] = &[];
+    const A: &[&str] = &["a"];
+    &[
+        BuiltinType {
+            name: "Int",
+            params: NONE,
+            alias_body: None,
+            doc: "整数。`fromInt` で Float に変換できる",
+        },
+        BuiltinType {
+            name: "Float",
+            params: NONE,
+            alias_body: None,
+            doc: "浮動小数点数。寸法・座標・角度 (度) に使う",
+        },
+        BuiltinType {
+            name: "Bool",
+            params: NONE,
+            alias_body: None,
+            doc: "真偽値 (`True` / `False`)。比較演算子と `if`-`then`-`else` で使う",
+        },
+        BuiltinType {
+            name: "String",
+            params: NONE,
+            alias_body: None,
+            doc: "文字列。`stl` のパスや `control3d` の名前に使う",
+        },
+        BuiltinType {
+            name: "Shape3D",
+            params: NONE,
+            alias_body: None,
+            doc: "3D 形状。`cube` / `sphere` などのプリミティブと `union3d` / `diff3d` などの CSG で組み立て、`main` の `models` に入れる",
+        },
+        BuiltinType {
+            name: "Shape2D",
+            params: NONE,
+            alias_body: None,
+            doc: "2D 形状。`circle` / `polygon` で作り、`extrude_xy` / `revolve_xy` などで Shape3D にする",
+        },
+        BuiltinType {
+            name: "PlacedShape2D",
+            params: NONE,
+            alias_body: None,
+            doc: "`place` で 3D 平面に貼り付けた 2D 形状。`linear_extrude` で押し出す",
+        },
+        BuiltinType {
+            name: "Plane",
+            params: NONE,
+            alias_body: None,
+            doc: "3D 空間内の平面。`place` の貼り付け先",
+        },
+        BuiltinType {
+            name: "Point2D",
+            params: NONE,
+            alias_body: Some("{ x : Float, y : Float }"),
+            doc: "2D 点。`p2 x y` で作る構造的 record 型",
+        },
+        BuiltinType {
+            name: "Point3D",
+            params: NONE,
+            alias_body: Some("{ x : Float, y : Float, z : Float }"),
+            doc: "3D 点。`p3 x y z` で作る構造的 record 型",
+        },
+        BuiltinType {
+            name: "List",
+            params: A,
+            alias_body: None,
+            doc: "リスト。リテラル `[a, b, c]`、`::` (cons)、`++` (append) と case パターンで扱う",
+        },
+        BuiltinType {
+            name: "Range",
+            params: A,
+            alias_body: None,
+            doc: "区間。`intersect` で 2 つの Range の積を取れる",
+        },
+    ]
+}
+
+pub fn get_type(name: &str) -> Option<&'static BuiltinType> {
+    type_registry().iter().find(|t| t.name == name)
+}
+
 /// 初期ビルトイン群 (cube / sphere / cylinder / translate3d / union / difference /
 /// intersect / linear_extrude / p3 / p2 / stl / intersect (Range))。
 /// 評価実装は `runtime/builtin.rs` に登録する。
@@ -389,6 +504,49 @@ mod tests {
         // forall a. Range a -> Range a -> Range a
         let s = inter.scheme.to_string();
         assert!(s.contains("Range") && s.contains("->"));
+    }
+
+    #[test]
+    fn type_registry_covers_signature_types() {
+        // 関数 registry の型シグネチャに登場する型コンストラクタが
+        // type_registry で全て引けることを検査する。
+        fn collect(t: &Type, names: &mut Vec<String>) {
+            match t {
+                Type::Con(name, args) => {
+                    names.push(name.clone());
+                    for a in args {
+                        collect(a, names);
+                    }
+                }
+                Type::Arrow(a, b) => {
+                    collect(a, names);
+                    collect(b, names);
+                }
+                Type::Record(fields) => {
+                    for (_, ft) in fields {
+                        collect(ft, names);
+                    }
+                }
+                Type::Var(_) => {}
+            }
+        }
+        let mut names = Vec::new();
+        for b in registry().iter() {
+            collect(&b.scheme.ty, &mut names);
+        }
+        for name in names {
+            assert!(get_type(&name).is_some(), "type_registry missing: {name}");
+        }
+    }
+
+    #[test]
+    fn builtin_type_decl_rendering() {
+        assert_eq!(get_type("Shape3D").unwrap().decl(), "type Shape3D");
+        assert_eq!(get_type("List").unwrap().decl(), "type List a");
+        assert_eq!(
+            get_type("Point2D").unwrap().decl(),
+            "type alias Point2D = { x : Float, y : Float }"
+        );
     }
 
     #[test]
