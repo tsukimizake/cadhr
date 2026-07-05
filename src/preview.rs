@@ -537,7 +537,7 @@ impl shader::Primitive for Primitive {
         pipeline: &mut Self::Pipeline,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _bounds: &Rectangle,
+        bounds: &Rectangle,
         viewport: &Viewport,
     ) {
         let drained: Vec<u64> = PENDING_REMOVALS
@@ -551,6 +551,7 @@ impl shader::Primitive for Primitive {
             device,
             queue,
             viewport,
+            *bounds * viewport.scale_factor() as f32,
             self.id,
             &self.uniforms,
             &self.gizmo_uniforms,

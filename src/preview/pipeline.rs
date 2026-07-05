@@ -34,6 +34,9 @@ pub struct MeshData {
 }
 
 struct PerInstance {
+    /// widget 全体の物理ピクセル矩形。scroll でクリップされても viewport はこの矩形に
+    /// 張り、はみ出しは scissor (clip_bounds) で切ることでアスペクト比を保つ
+    bounds: Rectangle,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     vertex_buffer: Option<wgpu::Buffer>,
@@ -251,6 +254,7 @@ impl Pipeline {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         viewport: &Viewport,
+        bounds: Rectangle,
         id: u64,
         uniforms: &Uniforms,
         gizmo_uniforms: &Uniforms,
@@ -309,6 +313,7 @@ impl Pipeline {
                 }],
             });
             PerInstance {
+                bounds,
                 uniform_buffer,
                 bind_group,
                 vertex_buffer: None,
@@ -321,6 +326,7 @@ impl Pipeline {
                 gizmo_bind_group,
             }
         });
+        inst.bounds = bounds;
 
         queue.write_buffer(&inst.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
         queue.write_buffer(
@@ -411,14 +417,8 @@ impl Pipeline {
             occlusion_query_set: None,
         });
 
-        pass.set_viewport(
-            clip_bounds.x as f32,
-            clip_bounds.y as f32,
-            clip_bounds.width as f32,
-            clip_bounds.height as f32,
-            0.0,
-            1.0,
-        );
+        let vp = inst.bounds;
+        pass.set_viewport(vp.x, vp.y, vp.width, vp.height, 0.0, 1.0);
         pass.set_scissor_rect(
             clip_bounds.x,
             clip_bounds.y,
@@ -452,13 +452,31 @@ impl Pipeline {
         clip_bounds: &Rectangle<u32>,
         inst: &PerInstance,
     ) {
-        // ビューポートが gizmo を置くには狭すぎる場合はスキップ
-        let needed = GIZMO_SIZE_PX + GIZMO_MARGIN_PX * 2;
-        if clip_bounds.width < needed || clip_bounds.height < needed {
+        // widget が gizmo を置くには狭すぎる場合はスキップ
+        let bounds = inst.bounds;
+        let needed = (GIZMO_SIZE_PX + GIZMO_MARGIN_PX * 2) as f32;
+        if bounds.width < needed || bounds.height < needed {
             return;
         }
-        let gx = clip_bounds.x + GIZMO_MARGIN_PX;
-        let gy = clip_bounds.y + clip_bounds.height - GIZMO_SIZE_PX - GIZMO_MARGIN_PX;
+        let gx = bounds.x + GIZMO_MARGIN_PX as f32;
+        let gy = bounds.y + bounds.height - (GIZMO_SIZE_PX + GIZMO_MARGIN_PX) as f32;
+        // scissor はターゲット内必須なので clip_bounds との交差に絞る。
+        // 交差が無い = gizmo がスクロールで完全に見切れている
+        let gizmo_rect = Rectangle {
+            x: gx,
+            y: gy,
+            width: GIZMO_SIZE_PX as f32,
+            height: GIZMO_SIZE_PX as f32,
+        };
+        let clip = Rectangle {
+            x: clip_bounds.x as f32,
+            y: clip_bounds.y as f32,
+            width: clip_bounds.width as f32,
+            height: clip_bounds.height as f32,
+        };
+        let Some(scissor) = gizmo_rect.intersection(&clip).and_then(Rectangle::snap) else {
+            return;
+        };
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("cadhr_gizmo_pass"),
@@ -475,15 +493,8 @@ impl Pipeline {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        pass.set_viewport(
-            gx as f32,
-            gy as f32,
-            GIZMO_SIZE_PX as f32,
-            GIZMO_SIZE_PX as f32,
-            0.0,
-            1.0,
-        );
-        pass.set_scissor_rect(gx, gy, GIZMO_SIZE_PX, GIZMO_SIZE_PX);
+        pass.set_viewport(gx, gy, GIZMO_SIZE_PX as f32, GIZMO_SIZE_PX as f32, 0.0, 1.0);
+        pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
         pass.set_pipeline(&self.gizmo_pipeline);
         pass.set_bind_group(0, &inst.gizmo_bind_group, &[]);
         pass.set_vertex_buffer(0, self.gizmo_vertex_buffer.slice(..));
