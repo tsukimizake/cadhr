@@ -11,7 +11,7 @@ use iced::widget::{column, combo_box, container, row, shader, slider, text, text
 use iced::{Element, Fill, Length};
 
 use crate::interpreter::{EvalJobParams, EvalJobResult};
-use crate::preview::Scene;
+use crate::preview::{Scene, SceneMessage};
 use crate::preview::pipeline::Vertex;
 use crate::session::SessionPreview;
 use crate::ui::parts;
@@ -146,7 +146,15 @@ impl Preview {
     /// preview 内で完結する状態遷移を適用し、Model レベルの後処理を返す。
     pub fn update(&mut self, msg: PreviewMsg) -> WorkspaceEvent {
         match msg {
-            PreviewMsg::SceneIgnored => WorkspaceEvent::None,
+            PreviewMsg::Scene(SceneMessage::Orbit { dx, dy }) => {
+                self.scene.orbit(dx, dy);
+                WorkspaceEvent::None
+            }
+            PreviewMsg::Scene(SceneMessage::Zoom { delta }) => {
+                self.scene.zoom_by(delta);
+                WorkspaceEvent::None
+            }
+            PreviewMsg::Scene(SceneMessage::Clicked { .. }) => WorkspaceEvent::None,
             PreviewMsg::Close => WorkspaceEvent::Close,
             PreviewMsg::MoveUp => WorkspaceEvent::MoveUp,
             PreviewMsg::MoveDown => WorkspaceEvent::MoveDown,
@@ -200,8 +208,8 @@ impl Preview {
 
 #[derive(Debug, Clone)]
 pub enum PreviewMsg {
-    /// Scene が出す SceneMessage (カメラ操作) を preview レイヤーで握りつぶすための no-op。
-    SceneIgnored,
+    /// Scene からのカメラ操作・クリック。カメラは Scene 側に保持しているのでここで適用する。
+    Scene(SceneMessage),
     ToggleViewCenter,
     Minimize,
     Close,
@@ -268,15 +276,14 @@ pub fn view<'a>(
         return container(header).padding(4).into();
     }
 
-    let widget: Element<'a, crate::preview::SceneMessage> = shader(&p.scene)
+    let widget: Element<'a, SceneMessage> = shader(&p.scene)
         .width(Fill)
         .height(Length::Fixed(220.0))
         .into();
     // shader は下地の上に描くため、背景色は container で敷く
-    let preview_widget: Element<'a, PreviewMsg> =
-        container(widget.map(|_| PreviewMsg::SceneIgnored))
-            .style(parts::canvas_background_style)
-            .into();
+    let preview_widget: Element<'a, PreviewMsg> = container(widget.map(PreviewMsg::Scene))
+        .style(parts::canvas_background_style)
+        .into();
 
     let mut col = column![header, preview_widget].spacing(4);
 
