@@ -73,6 +73,49 @@ fn diff2d_extruded_xz_keeps_hole() {
 }
 
 #[test]
+fn negative_extrude_xy_extrudes_downward() {
+    let src = "main = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 4.0, p2 0.0 4.0] |> extrude_xy (-5.0)";
+    let out = compile_run(src);
+    let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
+    assert!(!mesh.is_empty());
+    let (mut min_z, mut max_z) = (f32::INFINITY, f32::NEG_INFINITY);
+    for p in &mesh.positions {
+        min_z = min_z.min(p[2]);
+        max_z = max_z.max(p[2]);
+    }
+    assert!(
+        (min_z + 5.0).abs() < 0.01 && max_z.abs() < 0.01,
+        "z should span -5..0: {min_z}..{max_z}"
+    );
+}
+
+#[test]
+fn negative_extrude_union_does_not_vanish() {
+    // Manifold::Extrude は height <= 0 で Invalid を返し、それが boolean に混ざると
+    // モデル全体が空になる。負 height をマイナス方向押し出しに変換する回帰テスト。
+    let src = "
+        main =
+            let
+                sq = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 4.0, p2 0.0 4.0]
+            in
+            (sq |> extrude_xz 3.0) |> union3d (sq |> extrude_xz (-3.0))
+    ";
+    let out = compile_run(src);
+    let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
+    assert!(!mesh.is_empty(), "union with negative extrude vanished");
+    let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+    for p in &mesh.positions {
+        min_y = min_y.min(p[1]);
+        max_y = max_y.max(p[1]);
+    }
+    // extrude_xz は +Y 方向、負 height は -Y 方向なので union で Y が -3..3 に広がる
+    assert!(
+        min_y < -2.5 && max_y > 2.5,
+        "y should span -3..3: {min_y}..{max_y}"
+    );
+}
+
+#[test]
 fn bezier_quad_returns_points() {
     let src = "
         main =

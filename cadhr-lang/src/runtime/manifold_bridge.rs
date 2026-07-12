@@ -208,7 +208,22 @@ fn extrude_polygon(
         Some(cs) if !cs.is_empty() => prep_cross_section(cs, plane),
         _ => return Ok(Manifold::empty()),
     };
-    let m = Manifold::extrude_with_options(&cs, height, slices as i32, twist, sx, sy);
+    if height == 0.0 {
+        return Ok(Manifold::empty());
+    }
+    // Manifold::Extrude は height <= 0 で Invalid() を返し、それを boolean に混ぜると
+    // 結果全体が invalid (空) になる。負の height は「プロファイル面からマイナス法線方向
+    // への押し出し」として、abs で押し出してからローカル -Z へ平行移動する。
+    if height < 0.0 && (twist != 0.0 || sx != 1.0 || sy != 1.0) {
+        // TODO: 負 height の complex extrude で twist/scale をどちらの端点に置くか仕様を決める
+        panic!("complex extrude: 負の height と twist/scale の組み合わせは仕様未定");
+    }
+    let m = Manifold::extrude_with_options(&cs, height.abs(), slices as i32, twist, sx, sy);
+    let m = if height < 0.0 {
+        m.translate(0.0, 0.0, height)
+    } else {
+        m
+    };
     Ok(apply_plane_rotation(m, plane))
 }
 
