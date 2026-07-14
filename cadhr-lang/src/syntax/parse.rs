@@ -103,6 +103,7 @@ fn pattern_parser<'tokens, 'src: 'tokens>()
             .map_with(|fields, e| Pattern::Record(fields, dspan(e.span())));
 
         // `( p )` のグループ化、または ctor / atomic patterns
+        // `.boxed()` は型消去でコンパイル時間を抑えるため (chumsky の型爆発対策)。
         let atom = choice((
             wildcard,
             var.clone(),
@@ -112,7 +113,8 @@ fn pattern_parser<'tokens, 'src: 'tokens>()
             record,
             pat.clone()
                 .delimited_by(just(Token::LParen), just(Token::RParen)),
-        ));
+        ))
+        .boxed();
 
         // `a :: rest` を右結合で扱う
         let cons = atom.clone().foldl_with(
@@ -134,6 +136,7 @@ fn pattern_parser<'tokens, 'src: 'tokens>()
                 },
                 None => inner,
             })
+            .boxed()
     })
 }
 
@@ -248,7 +251,8 @@ fn type_expr_parser<'tokens, 'src: 'tokens>()
             con_atom,
             ty.clone()
                 .delimited_by(just(Token::LParen), just(Token::RParen)),
-        ));
+        ))
+        .boxed();
 
         // 引数を 1 つ以上取る constructor application (`List Int`, `Dict Key Value` ...)
         let app_con = module_name()
@@ -277,6 +281,7 @@ fn type_expr_parser<'tokens, 'src: 'tokens>()
                 },
                 None => from,
             })
+            .boxed()
     })
 }
 
@@ -391,7 +396,8 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
                     },
                     None => Expr::Record(fields, span),
                 }
-            });
+            })
+            .boxed();
 
         // `let <bindings> in body`。binding 列は layout pass が BlockOpen/BlockSep/BlockClose で
         // 区切る (Elm 流のインデント整列)。
@@ -422,7 +428,47 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
                 bindings,
                 body: Box::new(body),
                 span: dspan(e.span()),
-            });
+            })
+            .boxed();
+
+        // `sketch <bindings> in body end` の sketch DSL ブロック。
+        // binding は `var x = e` / `let x = e` / `x = e` の 3 形で params は取れない。
+        // (binding 先頭の `let` は layout pass がブロックを開かずに透過する。)
+        // RHS の式形の制約は `sema::sketch` の validation pass が検査する。
+        let sketch_binding = choice((
+            just(Token::Var).to(SketchBindKind::Var),
+            just(Token::Let).to(SketchBindKind::Let),
+        ))
+        .or_not()
+        .then(lower_ident().map_with(|name, e| (name, dspan(e.span()))))
+        .then_ignore(just(Token::Eq))
+        .then(expr.clone())
+        .map_with(|((kind, (name, name_span)), body), e| SketchBinding {
+            kind: kind.unwrap_or(SketchBindKind::Bare),
+            name,
+            name_span,
+            body,
+            span: dspan(e.span()),
+        });
+        let sketch_expr = just(Token::Sketch)
+            .ignore_then(just(Token::BlockOpen))
+            .ignore_then(
+                sketch_binding
+                    .separated_by(just(Token::BlockSep))
+                    .allow_trailing()
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(Token::BlockClose))
+            .then_ignore(just(Token::In))
+            .then(expr.clone())
+            .then_ignore(just(Token::End))
+            .map_with(|(bindings, body), e| Expr::Sketch {
+                bindings,
+                body: Box::new(body),
+                span: dspan(e.span()),
+            })
+            .boxed();
 
         // `if cond then a else b`
         // 各分岐を次行に書く場合、layout pass が継続行 (深い字下げ) として透過する。
@@ -437,7 +483,8 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
                 then_branch: Box::new(then_b),
                 else_branch: Box::new(else_b),
                 span: dspan(e.span()),
-            });
+            })
+            .boxed();
 
         // `case scrutinee of` の後、arm をインデント整列で並べる (Elm 流, 先頭 `|` 無し)。
         // arm 列は layout pass が BlockOpen/BlockSep/BlockClose で区切る。
@@ -468,7 +515,8 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
                 scrutinee: Box::new(scrutinee),
                 arms,
                 span: dspan(e.span()),
-            });
+            })
+            .boxed();
 
         // `\x y -> body` (`->` の後で改行した場合 layout pass が継続行として透過する)
         let lambda = just(Token::BackSlash)
@@ -479,7 +527,8 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
                 params,
                 body: Box::new(body),
                 span: dspan(e.span()),
-            });
+            })
+            .boxed();
 
         // パース可能な単位 (atom)。括弧でグループ化された expr も含む。
         // 注意: 単項マイナスは atom に入れずに app の前 (prefix) でのみ拾う。
@@ -487,6 +536,7 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
         // 認識されてしまい `0.0 (Negate(gear_z g1))` のように誤解析される。
         let atom = choice((
             let_expr,
+            sketch_expr,
             if_expr,
             case_expr,
             lambda,
@@ -498,7 +548,8 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
             record_or_update,
             expr.clone()
                 .delimited_by(just(Token::LParen), just(Token::RParen)),
-        ));
+        ))
+        .boxed();
 
         // `expr.field` の field access (左結合)
         let field_access = atom.clone().foldl_with(
@@ -524,7 +575,7 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
         let negate = just(Token::Minus)
             .ignore_then(app_inner.clone())
             .map_with(|inner, e| Expr::Negate(Box::new(inner), dspan(e.span())));
-        let app = negate.or(app_inner);
+        let app = negate.or(app_inner).boxed();
 
         // 二項演算子を Pratt で組む。優先順位は Elm に概ね合わせる。
         // 低い順: || (2), && (3), 比較 (4), :: ++ (5), + - (6), * / (7),
@@ -648,6 +699,7 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
                 span: dspan(e.span()),
             }),
         ))
+        .boxed()
     })
 }
 
@@ -685,7 +737,8 @@ pub fn decl_parser<'tokens, 'src: 'tokens>()
                 body,
                 span: dspan(e.span()),
             })
-        });
+        })
+        .boxed();
 
     // `type T a b = C1 a | C2 b`
     // constructor の引数は **atomic** な type expr のみ (パイプ `|` で次の constructor に
@@ -753,7 +806,7 @@ pub fn decl_parser<'tokens, 'src: 'tokens>()
         });
 
     // type_alias は `type alias` で始まるので type_decl より先にチェック。
-    choice((type_alias, type_decl, slider, signature, value))
+    choice((type_alias, type_decl, slider, signature, value)).boxed()
 }
 
 /// `exposing (..)` または `exposing (a, b, T(..), T(C1))`
@@ -1006,6 +1059,43 @@ mod tests {
             }
             _ => panic!("expected Slider"),
         }
+    }
+
+    #[test]
+    fn sketch_block_parses() {
+        let src = "sk =\n    sketch\n        var x1 = 0.0\n        let y1 = 3.0\n        poly1 = polygon (segments [p2 x1 y1, p2 4.0 y1])\n    in\n    { poly1 = poly1 }\n    end\n";
+        let m = parse_ok(src);
+        let Decl::Value(v) = &m.decls[0] else {
+            panic!("expected value decl");
+        };
+        let Expr::Sketch { bindings, body, .. } = &v.body else {
+            panic!("expected sketch: {:?}", v.body);
+        };
+        assert_eq!(bindings.len(), 3);
+        assert_eq!(bindings[0].kind, SketchBindKind::Var);
+        assert_eq!(bindings[0].name, "x1");
+        assert_eq!(&src[bindings[0].name_span.range()], "x1");
+        assert_eq!(bindings[1].kind, SketchBindKind::Let);
+        assert_eq!(bindings[2].kind, SketchBindKind::Bare);
+        assert!(matches!(body.as_ref(), Expr::Record(..)));
+    }
+
+    #[test]
+    fn sketch_in_body_on_same_line() {
+        // honi 流: `in { .. }` を binding 列と同じインデント、`end` を dedent。
+        let src = "sk = sketch\n    var x = 1.0\n    p = p2 x x\n    in { p = p }\nend\n";
+        let m = parse_ok(src);
+        let Decl::Value(v) = &m.decls[0] else {
+            panic!()
+        };
+        assert!(matches!(&v.body, Expr::Sketch { .. }));
+    }
+
+    #[test]
+    fn sketch_followed_by_next_decl() {
+        let src = "sk = sketch\n    var x = 1.0\n    p = p2 x x\n    in p\nend\n\nmain = sk\n";
+        let m = parse_ok(src);
+        assert_eq!(m.decls.len(), 2);
     }
 
     #[test]

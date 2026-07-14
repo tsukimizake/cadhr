@@ -61,11 +61,30 @@ pub struct SessionSketch {
     pub shapes: Vec<crate::ui::sketch::SketchShape>,
 }
 
+/// SketchV2 workspace (sketch DSL binding との双方向編集) の永続化。
+/// 図形はコード側が真なので、紐付け先 binding 名とビュー状態だけ持つ。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SessionSketchV2 {
+    pub sketch_id: u64,
+    #[serde(default)]
+    pub order: usize,
+    #[serde(default)]
+    pub minimized: bool,
+    /// 1 grid 単位あたりのピクセル数。
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
+    /// 紐付ける sketch binding の名前。空なら未選択。
+    #[serde(default)]
+    pub binding: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SessionPreviews {
     pub previews: Vec<SessionPreview>,
     #[serde(default)]
     pub sketches: Vec<SessionSketch>,
+    #[serde(default)]
+    pub sketches_v2: Vec<SessionSketchV2>,
 }
 
 pub fn save_session(

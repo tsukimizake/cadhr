@@ -80,6 +80,12 @@ fn walk_expr(e: &Expr, env: &AdtEnv, diag: &mut Vec<Diagnostic>) {
             }
             walk_expr(body, env, diag);
         }
+        Expr::Sketch { bindings, body, .. } => {
+            for b in bindings {
+                walk_expr(&b.body, env, diag);
+            }
+            walk_expr(body, env, diag);
+        }
         Expr::If {
             cond,
             then_branch,

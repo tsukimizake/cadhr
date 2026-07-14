@@ -48,6 +48,8 @@ pub enum Value {
     Shape3D(Model3D),
     /// 2D 幾何形状 (extrude / revolve の入力)。
     Shape2D(Model2D),
+    /// 2D 線分 (`line a b`)。`polygon` の輪郭要素。
+    Segment { a: (f64, f64), b: (f64, f64) },
     /// 名前付きの不透明値 (place の PlacedShape2D)。
     Opaque(String, Vec<Value>),
 }
@@ -282,6 +284,9 @@ impl fmt::Display for Value {
             }
             Value::Shape3D(m) => write!(f, "<Shape3D {m:?}>"),
             Value::Shape2D(m) => write!(f, "<Shape2D {m:?}>"),
+            Value::Segment { a, b } => {
+                write!(f, "<Segment ({}, {}) -> ({}, {})>", a.0, a.1, b.0, b.1)
+            }
             Value::Opaque(tag, _) => write!(f, "<{tag}>"),
         }
     }

@@ -128,6 +128,12 @@ pub fn type_registry() -> &'static [BuiltinType] {
             doc: "2D 点。`p2 x y` で作る構造的 record 型",
         },
         BuiltinType {
+            name: "Segment",
+            params: NONE,
+            alias_body: None,
+            doc: "2D 輪郭の要素 (線分)。`line a b` で作り、`polygon` に閉路として渡す",
+        },
+        BuiltinType {
             name: "Point3D",
             params: NONE,
             alias_body: Some("{ x : Float, y : Float, z : Float }"),
@@ -300,11 +306,24 @@ pub fn registry() -> BuiltinRegistry {
     ));
 
     // -- 2D ポリゴン + 平面別 extrude (簡略 API)
+    let segment = || Type::con("Segment");
+    let r = r.add(mono(
+        "line",
+        vec![point2d(), point2d()],
+        segment(),
+        "2 点を結ぶ線分。`polygon` の輪郭要素",
+    ));
+    let r = r.add(mono(
+        "segments",
+        vec![Type::app("List", vec![point2d()])],
+        Type::app("List", vec![segment()]),
+        "Point2D 列を閉路の線分列に変換する (`polygon (segments [...])`)",
+    ));
     let r = r.add(mono(
         "polygon",
-        vec![Type::app("List", vec![point2d()])],
+        vec![Type::app("List", vec![segment()])],
         shape2d(),
-        "Point2D の閉路リストから 2D ポリゴンを作る",
+        "線分の閉路リストから 2D ポリゴンを作る",
     ));
     let r = r.add(mono(
         "extrude_xy",

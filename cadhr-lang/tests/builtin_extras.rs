@@ -10,7 +10,7 @@ fn compile_run(src: &str) -> cadhr_lang::MainOutput {
 
 #[test]
 fn revolve_xy_makes_solid() {
-    let src = "main = polygon [p2 1.0 0.0, p2 3.0 0.0, p2 3.0 1.0, p2 1.0 1.0] |> revolve_xy 360.0";
+    let src = "main = polygon (segments [p2 1.0 0.0, p2 3.0 0.0, p2 3.0 1.0, p2 1.0 1.0]) |> revolve_xy 360.0";
     let out = compile_run(src);
     let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
     assert!(!mesh.is_empty());
@@ -18,7 +18,7 @@ fn revolve_xy_makes_solid() {
 
 #[test]
 fn complex_extrude_with_twist() {
-    let src = "main = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 4.0, p2 0.0 4.0] |> complex_extrude_xy 10.0 45.0 1.0 1.0";
+    let src = "main = polygon (segments [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 4.0, p2 0.0 4.0]) |> complex_extrude_xy 10.0 45.0 1.0 1.0";
     let out = compile_run(src);
     let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
     assert!(!mesh.is_empty());
@@ -29,8 +29,8 @@ fn union2d_produces_non_empty_extrusion() {
     let src = "
         main =
             let
-                a = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 4.0, p2 0.0 4.0]
-                b = polygon [p2 2.0 2.0, p2 6.0 2.0, p2 6.0 6.0, p2 2.0 6.0]
+                a = polygon (segments [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 4.0, p2 0.0 4.0])
+                b = polygon (segments [p2 2.0 2.0, p2 6.0 2.0, p2 6.0 6.0, p2 2.0 6.0])
                 merged = union2d a b
             in
             extrude_xy 1.0 merged
@@ -45,8 +45,8 @@ fn diff2d_extruded() {
     let src = "
         main =
             let
-                outer = polygon [p2 0.0 0.0, p2 8.0 0.0, p2 8.0 8.0, p2 0.0 8.0]
-                hole = polygon [p2 2.0 2.0, p2 6.0 2.0, p2 6.0 6.0, p2 2.0 6.0]
+                outer = polygon (segments [p2 0.0 0.0, p2 8.0 0.0, p2 8.0 8.0, p2 0.0 8.0])
+                hole = polygon (segments [p2 2.0 2.0, p2 6.0 2.0, p2 6.0 6.0, p2 2.0 6.0])
             in
             extrude_xy 1.0 (outer |> diff2d hole)
     ";
@@ -61,8 +61,8 @@ fn diff2d_extruded_xz_keeps_hole() {
     let src = "
         main =
             let
-                outer = polygon [p2 0.0 0.0, p2 8.0 0.0, p2 8.0 8.0, p2 0.0 8.0]
-                hole = polygon [p2 2.0 2.0, p2 6.0 2.0, p2 6.0 6.0, p2 2.0 6.0]
+                outer = polygon (segments [p2 0.0 0.0, p2 8.0 0.0, p2 8.0 8.0, p2 0.0 8.0])
+                hole = polygon (segments [p2 2.0 2.0, p2 6.0 2.0, p2 6.0 6.0, p2 2.0 6.0])
             in
             extrude_xz 1.0 (outer |> diff2d hole)
     ";
@@ -74,7 +74,7 @@ fn diff2d_extruded_xz_keeps_hole() {
 
 #[test]
 fn negative_extrude_xy_extrudes_downward() {
-    let src = "main = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 4.0, p2 0.0 4.0] |> extrude_xy (-5.0)";
+    let src = "main = polygon (segments [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 4.0, p2 0.0 4.0]) |> extrude_xy (-5.0)";
     let out = compile_run(src);
     let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
     assert!(!mesh.is_empty());
@@ -96,7 +96,7 @@ fn negative_extrude_union_does_not_vanish() {
     let src = "
         main =
             let
-                sq = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 4.0, p2 0.0 4.0]
+                sq = polygon (segments [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 4.0, p2 0.0 4.0])
             in
             (sq |> extrude_xz 3.0) |> union3d (sq |> extrude_xz (-3.0))
     ";
@@ -123,7 +123,7 @@ fn bezier_quad_returns_points() {
                 arc = bezier_quad (p2 0.0 0.0) (p2 5.0 10.0) (p2 10.0 0.0) 8
                 ring = (p2 0.0 0.0) :: arc
             in
-            extrude_xy 1.0 (polygon ring)
+            extrude_xy 1.0 (polygon (segments ring))
     ";
     let out = compile_run(src);
     let mesh = cadhr_lang::runtime::manifold_bridge::to_mesh_arrays(&out.models[0]).unwrap();
@@ -158,7 +158,7 @@ fn center2d_with_translate2d_centers_polygon() {
     // 結果を XY で extrude して bbox を見ると -5..5 になるはず。
     let src = "main =
     let sq =
-            polygon [p2 0.0 0.0, p2 10.0 0.0, p2 10.0 10.0, p2 0.0 10.0]
+            polygon (segments [p2 0.0 0.0, p2 10.0 0.0, p2 10.0 10.0, p2 0.0 10.0])
                 |> translate2d (p2 0.0 0.0) (p2 50.0 50.0)
     in
     sq |> translate2d (center2d sq) (p2 0.0 0.0) |> extrude_xy 1.0

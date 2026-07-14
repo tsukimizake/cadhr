@@ -10,7 +10,7 @@
 //! - 文字列リテラル `Str`
 //! - 主要キーワード (`module`, `exposing`, `import`, `as`, `type`, `alias`,
 //!   `let`, `in`, `if`, `then`, `else`, `case`, `of`, `True`, `False`,
-//!   `slider`)
+//!   `slider`, `sketch`, `end`, `var`)
 //! - 演算子 / 区切り記号
 //!
 //! コメントは `--` 行コメント、`{- ... -}` ブロックコメント (ネスト対応)。
@@ -48,6 +48,12 @@ pub enum Token<'src> {
     True,
     False,
     Slider,
+    /// sketch DSL ブロックの開始 (`sketch .. in .. end`)。
+    Sketch,
+    /// sketch DSL ブロックの終端。
+    End,
+    /// sketch DSL 内の書き込み可能スカラー束縛 (`var x = 0.0`)。
+    Var,
 
     // 演算子と記号
     Eq,       // =
@@ -123,6 +129,9 @@ impl<'src> std::fmt::Display for Token<'src> {
             Token::True => f.write_str("True"),
             Token::False => f.write_str("False"),
             Token::Slider => f.write_str("slider"),
+            Token::Sketch => f.write_str("sketch"),
+            Token::End => f.write_str("end"),
+            Token::Var => f.write_str("var"),
             Token::Eq => f.write_str("="),
             Token::Arrow => f.write_str("->"),
             Token::Colon => f.write_str(":"),
@@ -227,6 +236,9 @@ pub fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Spanned<Token<'src>>>, 
         "True" => Token::True,
         "False" => Token::False,
         "slider" => Token::Slider,
+        "sketch" => Token::Sketch,
+        "end" => Token::End,
+        "var" => Token::Var,
         "_" => Token::Underscore,
         s if s.starts_with(|c: char| c.is_ascii_uppercase()) => Token::UpperIdent(s),
         s => Token::LowerIdent(s),

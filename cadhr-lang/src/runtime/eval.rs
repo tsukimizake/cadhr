@@ -418,6 +418,15 @@ impl<'r> Evaluator<'r> {
 
                 self.eval_expr(body, &let_env)
             }
+            Expr::Sketch { bindings, body, .. } => {
+                // sketch DSL ブロック: 逐次・非再帰に評価して env を拡張する。
+                let mut env_acc: Rc<Env> = env.clone();
+                for b in bindings {
+                    let v = self.eval_expr(&b.body, &env_acc)?;
+                    env_acc = Rc::new(env_acc.extend(&b.name, v));
+                }
+                self.eval_expr(body, &env_acc)
+            }
             Expr::If {
                 cond,
                 then_branch,

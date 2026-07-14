@@ -12,5 +12,6 @@ pub mod env;
 pub mod exhaustive;
 pub mod infer;
 pub mod infer_ty;
+pub mod sketch;
 pub mod slider;
 pub mod ty;

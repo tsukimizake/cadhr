@@ -16,7 +16,7 @@ body r len = cylinder r len
 hexhead e s k =
     let
         ne = 0.0 - e
-        profile = polygon [ p2 0.0 ne, p2 (0.0 - s / 2.0) (ne / 2.0), p2 (0.0 - s / 2.0) (e / 2.0), p2 0.0 e, p2 (s / 2.0) (e / 2.0), p2 (s / 2.0) (ne / 2.0) ]
+        profile = polygon (segments [ p2 0.0 ne, p2 (0.0 - s / 2.0) (ne / 2.0), p2 (0.0 - s / 2.0) (e / 2.0), p2 0.0 e, p2 (s / 2.0) (e / 2.0), p2 (s / 2.0) (ne / 2.0) ])
     in
     extrude_xy k profile
         |> translate3d (p3 0.0 0.0 0.0) (p3 0.0 0.0 (0.0 - k))

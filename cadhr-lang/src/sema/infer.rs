@@ -1515,6 +1515,19 @@ pub fn infer_expr(
             }
             infer_expr(infer, &env_acc, body, diag)
         }
+        Expr::Sketch { bindings, body, .. } => {
+            // sketch DSL ブロック: 逐次・非再帰。binding は params を持たない。
+            let mut env_acc = env.clone();
+            for b in bindings {
+                infer.enter_level();
+                let ty = infer_expr(infer, &env_acc, &b.body, diag);
+                infer.exit_level();
+                let Some(ty) = ty else { continue };
+                let isc = infer.generalize(&ty);
+                env_acc = env_acc.extend(&b.name, isc);
+            }
+            infer_expr(infer, &env_acc, body, diag)
+        }
         Expr::If {
             cond,
             then_branch,
@@ -1862,6 +1875,7 @@ fn span_of_expr(e: &Expr) -> Span {
         | Expr::App { span, .. }
         | Expr::Lambda { span, .. }
         | Expr::Let { span, .. }
+        | Expr::Sketch { span, .. }
         | Expr::If { span, .. }
         | Expr::Case { span, .. }
         | Expr::BinOp { span, .. }

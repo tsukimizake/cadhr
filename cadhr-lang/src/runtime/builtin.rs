@@ -154,6 +154,13 @@ fn as_list(v: &Value) -> Result<&[Value], String> {
     }
 }
 
+fn as_segment(v: &Value) -> Result<((f64, f64), (f64, f64)), String> {
+    match v {
+        Value::Segment { a, b } => Ok((*a, *b)),
+        _ => Err(format!("Segment が期待されましたが {v} でした")),
+    }
+}
+
 pub fn registry() -> BuiltinEvalRegistry {
     BuiltinEvalRegistry::new()
         // -- 3D primitives
@@ -302,11 +309,47 @@ pub fn registry() -> BuiltinEvalRegistry {
             _ => Err("linear_extrude: PlacedShape2D を要求".to_string()),
         })
         // -- 2D ポリゴン + 平面別 extrude
-        .add("polygon", 1, |args| {
+        .add("line", 2, |args| {
+            Ok(Value::Segment {
+                a: as_point2d(&args[0])?,
+                b: as_point2d(&args[1])?,
+            })
+        })
+        .add("segments", 1, |args| {
             let points = as_list(&args[0])?;
             let mut pts: Vec<(f64, f64)> = Vec::with_capacity(points.len());
             for p in points {
                 pts.push(as_point2d(p)?);
+            }
+            let n = pts.len();
+            let mut segs: Vec<Value> = Vec::new();
+            if n >= 2 {
+                for i in 0..n {
+                    let a = pts[i];
+                    let b = pts[(i + 1) % n];
+                    // 点列が既に明示的に閉じている場合、閉路化の縮退辺は作らない
+                    if i + 1 == n && a == b {
+                        break;
+                    }
+                    segs.push(Value::Segment { a, b });
+                }
+            }
+            Ok(Value::List(segs))
+        })
+        .add("polygon", 1, |args| {
+            let segs_v = as_list(&args[0])?;
+            // 線分列を描画順に連結した頂点列に畳む。連結していない線分は
+            // 両端点をそのまま並べる (polygon は暗黙に閉じる)。
+            let mut pts: Vec<(f64, f64)> = Vec::new();
+            for s in segs_v {
+                let (a, b) = as_segment(s)?;
+                if pts.last() != Some(&a) {
+                    pts.push(a);
+                }
+                pts.push(b);
+            }
+            if pts.len() > 2 && pts.first() == pts.last() {
+                pts.pop();
             }
             Ok(Value::Shape2D(Model2D::Polygon(pts)))
         })

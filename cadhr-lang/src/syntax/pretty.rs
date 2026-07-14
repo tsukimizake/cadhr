@@ -340,6 +340,38 @@ fn pretty_expr_prec(e: &Expr, prec: u8, indent: usize, buf: &mut String) {
                 buf.push(')');
             }
         }
+        Expr::Sketch { bindings, body, .. } => {
+            if prec > 0 {
+                buf.push('(');
+            }
+            // binding 先頭に kind キーワードが付き、末尾に `end`。
+            // `in` / body / `end` は binding と同列 (indent+4) に置く。let 束縛の
+            // RHS に埋まっても外側レイアウトの列と衝突せず re-parse できる形。
+            buf.push_str("sketch");
+            for b in bindings {
+                buf.push('\n');
+                push_indent(indent + 4, buf);
+                match b.kind {
+                    SketchBindKind::Var => buf.push_str("var "),
+                    SketchBindKind::Let => buf.push_str("let "),
+                    SketchBindKind::Bare => {}
+                }
+                buf.push_str(&b.name);
+                buf.push_str(" = ");
+                pretty_expr(&b.body, indent + 4, buf);
+            }
+            buf.push('\n');
+            push_indent(indent + 4, buf);
+            buf.push_str("in\n");
+            push_indent(indent + 4, buf);
+            pretty_expr(body, indent + 4, buf);
+            buf.push('\n');
+            push_indent(indent + 4, buf);
+            buf.push_str("end");
+            if prec > 0 {
+                buf.push(')');
+            }
+        }
         Expr::If {
             cond,
             then_branch,
@@ -602,6 +634,24 @@ mod tests {
     #[test]
     fn rt_let_in() {
         round_trip("f = let x = 1 in x + 2");
+    }
+
+    #[test]
+    fn rt_sketch_block() {
+        let s = round_trip(
+            "sk = sketch\n    var x1 = 0.0\n    let y1 = 3.0\n    poly1 = polygon (segments [p2 x1 y1, p2 4.0 y1, p2 x1 7.0])\n    in { poly1 = poly1 }\nend",
+        );
+        assert!(s.contains("sketch"), "{s}");
+        assert!(s.contains("var x1 = 0.0"), "{s}");
+        assert!(s.contains("let y1 = 3.0"), "{s}");
+        assert!(s.contains("end"), "{s}");
+    }
+
+    #[test]
+    fn rt_sketch_nested_in_let() {
+        round_trip(
+            "f =\n    let\n        sk = sketch\n                var x = 1.0\n                p = p2 x x\n            in p\n            end\n    in\n    sk",
+        );
     }
 
     #[test]

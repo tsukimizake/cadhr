@@ -18,6 +18,7 @@ pub mod diagnostic;
 pub mod module;
 pub mod runtime;
 pub mod sema;
+pub mod sketch;
 pub mod syntax;
 
 pub use diagnostic::{Diagnostic, RelatedInfo, Severity, Span};
@@ -126,6 +127,16 @@ pub fn compile_with_paths(
     let resolver = Resolver::new(search_paths.to_vec());
     let unit = resolver.resolve_from_source(src)?;
 
+    // sketch DSL の制約検査。構文的な検査なので型推論より先に fail fast する
+    // (違反した sketch ブロックは GUI と紐付けられないため error 扱い)。
+    let mut sketch_diag: Vec<Diagnostic> = Vec::new();
+    for lm in &unit.modules {
+        sketch_diag.extend(sema::sketch::check_module(&lm.module));
+    }
+    if !sketch_diag.is_empty() {
+        return Err(sketch_diag);
+    }
+
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     let registry = sema::builtin::registry();
     let (schemes, infer_diag) = sema::infer::infer_unit(&unit, &registry);
@@ -166,6 +177,13 @@ impl CompiledProgram {
     /// `Shape2D` の field を 1 つ以上持つ record の top-level binding を宣言順で返す。
     pub fn shape2d_bindings(&self) -> Vec<BindingSignature> {
         self.bindings_with_return_filter(is_shape2d_return)
+    }
+
+    /// GUI の SketchV2 workspace 用。body が `sketch .. end` そのものである
+    /// 引数なし top-level binding の名前を宣言順で返す (双方向編集可能な binding)。
+    pub fn sketch_block_bindings(&self) -> Vec<String> {
+        let main_lm = &self.unit.modules[self.unit.main_index];
+        sketch::sketch_binding_names(&main_lm.module)
     }
 
     fn bindings_with_return_filter(&self, pred: impl Fn(&Type) -> bool) -> Vec<BindingSignature> {
@@ -561,9 +579,9 @@ main = plate
     #[test]
     fn shape2d_bindings_lists_shape2d_decls_only() {
         let src = "\
-profile = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 0.0 4.0]
+profile = polygon (segments [p2 0.0 0.0, p2 4.0 0.0, p2 0.0 4.0])
 disc r = circle r
-sketch1 = { poly1 = profile, circ1 = circle 2.0 }
+sk1 = { poly1 = profile, circ1 = circle 2.0 }
 plate = cube 20.0 20.0 1.0
 main = plate
 ";
@@ -574,7 +592,7 @@ main = plate
             vec![
                 "profile".to_string(),
                 "disc".to_string(),
-                "sketch1".to_string()
+                "sk1".to_string()
             ]
         );
     }
@@ -583,7 +601,7 @@ main = plate
     #[test]
     fn run_binding_2d_returns_contours() {
         let src = "\
-profile = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 0.0 4.0]
+profile = polygon (segments [p2 0.0 0.0, p2 4.0 0.0, p2 0.0 4.0])
 main = extrude_xy 1.0 profile
 ";
         let prog = compile(src).expect("compile");
@@ -597,13 +615,33 @@ main = extrude_xy 1.0 profile
     #[test]
     fn run_binding_2d_concatenates_record_fields() {
         let src = "\
-sketch1 = { poly1 = polygon [p2 0.0 0.0, p2 4.0 0.0, p2 0.0 4.0], pt1 = p2 1.0 1.0, poly2 = polygon [p2 10.0 0.0, p2 14.0 0.0, p2 10.0 4.0] }
-main = extrude_xy 1.0 sketch1.poly1
+sk1 = { poly1 = polygon (segments [p2 0.0 0.0, p2 4.0 0.0, p2 0.0 4.0]), pt1 = p2 1.0 1.0, poly2 = polygon (segments [p2 10.0 0.0, p2 14.0 0.0, p2 10.0 4.0]) }
+main = extrude_xy 1.0 sk1.poly1
 ";
         let prog = compile(src).expect("compile");
         let contours =
-            run_binding_2d(&prog, "sketch1", &Inputs::default()).expect("run_binding_2d");
+            run_binding_2d(&prog, "sk1", &Inputs::default()).expect("run_binding_2d");
         assert_eq!(contours.len(), 2);
+    }
+
+    #[cfg(feature = "manifold")]
+    #[test]
+    fn sketch_block_compiles_and_evaluates() {
+        let src = "sk =\n    sketch\n        var x1 = 0.0\n        let y1 = 3.0\n        poly1 = polygon (segments [p2 x1 y1, p2 4.0 y1, p2 x1 7.0])\n        circ1 = circle 2.0 |> translate2d (p2 0.0 0.0) (p2 4.0 5.0)\n    in\n    { poly1 = poly1, circ1 = circ1 }\n    end\n\nmain = extrude_xy 1.0 sk.poly1\n";
+        let prog = compile(src).expect("compile");
+        let contours = run_binding_2d(&prog, "sk", &Inputs::default()).expect("run_binding_2d");
+        assert_eq!(contours.len(), 2);
+    }
+
+    #[test]
+    fn sketch_validation_errors_are_fatal() {
+        // var の右辺が Int リテラル → sketch DSL 違反で compile が Err になる。
+        let src = "sk =\n    sketch\n        var x = 1\n        p = p2 x x\n    in\n    p\n    end\n";
+        let err = compile(src).expect_err("expected sketch validation error");
+        assert!(
+            err.iter().any(|d| d.message().contains("sketch")),
+            "diags: {err:?}"
+        );
     }
 
     #[test]

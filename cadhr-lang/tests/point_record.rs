@@ -22,10 +22,10 @@ fn point_field_access_when_type_known() {
 
 #[test]
 fn record_literal_is_accepted_as_point2d() {
-    // polygon : List Point2D。record リテラルをそのまま point として渡せる。
+    // segments : List Point2D -> List Segment。record リテラルをそのまま point として渡せる。
     let src = "main =\n\
         \x20   let\n\
-        \x20       s = polygon [{ x = 0.0, y = 0.0 }, { x = 10.0, y = 0.0 }, { x = 5.0, y = 8.0 }]\n\
+        \x20       s = polygon (segments [{ x = 0.0, y = 0.0 }, { x = 10.0, y = 0.0 }, { x = 5.0, y = 8.0 }])\n\
         \x20       m = extrude_xy 3.0 s\n\
         \x20   in\n\
         \x20   { models = [m], bom = [], controls = [] }\n";

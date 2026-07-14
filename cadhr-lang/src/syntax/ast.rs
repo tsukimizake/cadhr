@@ -180,6 +180,13 @@ pub enum Expr {
         body: Box<Expr>,
         span: Span,
     },
+    /// `sketch <bindings> in body end` の sketch DSL ブロック。
+    /// binding は逐次スコープ (前方参照不可)。制約は `sema::sketch` が検査する。
+    Sketch {
+        bindings: Vec<SketchBinding>,
+        body: Box<Expr>,
+        span: Span,
+    },
     /// `if cond then a else b`
     If {
         cond: Box<Expr>,
@@ -217,6 +224,27 @@ pub struct RecordField {
     pub name: String,
     pub value: Expr,
     pub span: Span,
+}
+
+/// sketch ブロック内の 1 束縛。params は取れない。
+#[derive(Clone, Debug)]
+pub struct SketchBinding {
+    pub kind: SketchBindKind,
+    pub name: String,
+    /// binder 名そのものの span (LSP rename / GUI 書き戻しで使う)。
+    pub name_span: Span,
+    pub body: Expr,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SketchBindKind {
+    /// `var x = <Floatリテラル>`: 逆評価 (GUI ドラッグ) の書き込み対象。
+    Var,
+    /// `let x = <スカラー式>`: 読み取り専用スカラー。
+    Let,
+    /// キーワードなし (`poly1 = polygon [...]`): 幾何 / 点 / 線分の束縛。
+    Bare,
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +285,48 @@ pub enum Pattern {
         name: String,
         span: Span,
     },
+}
+
+impl Expr {
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::Var { span, .. }
+            | Expr::Ctor { span, .. }
+            | Expr::Lit(_, span)
+            | Expr::List(_, span)
+            | Expr::Record(_, span)
+            | Expr::RecordUpdate { span, .. }
+            | Expr::Field { span, .. }
+            | Expr::App { span, .. }
+            | Expr::Lambda { span, .. }
+            | Expr::Let { span, .. }
+            | Expr::Sketch { span, .. }
+            | Expr::If { span, .. }
+            | Expr::Case { span, .. }
+            | Expr::BinOp { span, .. }
+            | Expr::Negate(_, span)
+            | Expr::Range { span, .. }
+            | Expr::Error(span) => *span,
+        }
+    }
+}
+
+/// カリー化された適用 `f a b ...` を (head 名, 引数列) に展開する。
+/// head が裸の小文字識別子でなければ head は `None`。
+pub fn app_spine(e: &Expr) -> (Option<&str>, Vec<&Expr>) {
+    let mut args: Vec<&Expr> = Vec::new();
+    let mut cur = e;
+    while let Expr::App { func, arg, .. } = cur {
+        args.push(arg);
+        cur = func;
+    }
+    args.reverse();
+    match cur {
+        Expr::Var {
+            module: None, name, ..
+        } => (Some(name.as_str()), args),
+        _ => (None, args),
+    }
 }
 
 /// 数値・文字列・真偽値リテラル。Range は `Expr::Range` で別に持つ。

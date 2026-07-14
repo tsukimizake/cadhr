@@ -8,8 +8,8 @@ main =
         w = 40.0
         h = 120.0
         x = (w - slit) / 2.0
-        outer = polygon [ p2 0.0 0.0, p2 70.0 0.0, p2 70.0 120.0, p2 0.0 120.0 ]
-        cut = polygon [ p2 x 0.0, p2 (slit + w) 0.0, p2 (slit + w) (h - 20.0), p2 x (h - 20.0) ]
+        outer = polygon (segments [ p2 0.0 0.0, p2 70.0 0.0, p2 70.0 120.0, p2 0.0 120.0 ])
+        cut = polygon (segments [ p2 x 0.0, p2 (slit + w) 0.0, p2 (slit + w) (h - 20.0), p2 x (h - 20.0) ])
         shape = extrude_xy 100.0 outer |> diff3d (extrude_xy 100.0 cut)
     in
     { models = [shape], bom = [], controls = [] }

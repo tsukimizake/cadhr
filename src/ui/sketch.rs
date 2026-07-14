@@ -389,7 +389,7 @@ fn polygon_expr(pts: &[GridPoint], x_vars: &[(i32, String)], y_vars: &[(i32, Str
         .map(|[x, y]| format!("p2 {} {}", coord_term(*x, x_vars), coord_term(*y, y_vars)))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("polygon [{body}]")
+    format!("polygon (segments [{body}])")
 }
 
 fn circle_expr(
@@ -880,14 +880,14 @@ mod tests {
         assert_eq!(chain_points(poly_lines(&s, 0)), vec![[0, 0], [10, 0], [10, 5]]);
         assert_eq!(
             s.code(),
-            "let\n    x1 = 10.0\n    y1 = 0.0\nin\npolygon [p2 0.0 y1, p2 x1 y1, p2 x1 5.0]"
+            "let\n    x1 = 10.0\n    y1 = 0.0\nin\npolygon (segments [p2 0.0 y1, p2 x1 y1, p2 x1 5.0])"
         );
     }
 
     #[test]
     fn unique_coords_stay_literal() {
         let s = sketch_with(&[[[0, 1], [10, 2]]]);
-        assert_eq!(s.code(), "polygon [p2 0.0 1.0, p2 10.0 2.0]");
+        assert_eq!(s.code(), "polygon (segments [p2 0.0 1.0, p2 10.0 2.0])");
     }
 
     #[test]
@@ -901,7 +901,7 @@ mod tests {
         ]);
         assert_eq!(
             s.code(),
-            "let\n    x1 = (-1.0)\n    x2 = 2.0\n    y1 = 0.0\n    y2 = 3.0\nin\npolygon [p2 x1 y1, p2 x2 y1, p2 x2 y2, p2 x1 y2]"
+            "let\n    x1 = (-1.0)\n    x2 = 2.0\n    y1 = 0.0\n    y2 = 3.0\nin\npolygon (segments [p2 x1 y1, p2 x2 y1, p2 x2 y2, p2 x1 y2])"
         );
     }
 
@@ -918,7 +918,7 @@ mod tests {
     #[test]
     fn negative_coords_are_parenthesized() {
         let s = sketch_with(&[[[-1, 0], [0, -2]]]);
-        assert_eq!(s.code(), "polygon [p2 (-1.0) 0.0, p2 0.0 (-2.0)]");
+        assert_eq!(s.code(), "polygon (segments [p2 (-1.0) 0.0, p2 0.0 (-2.0)])");
     }
 
     #[test]
@@ -938,7 +938,7 @@ mod tests {
         s.add_line([14, 0], [10, 4]);
         assert_eq!(
             s.code(),
-            "let\n    x1 = 0.0\n    x2 = 10.0\n    y1 = 0.0\n    y2 = 4.0\n    poly1 = polygon [p2 x1 y1, p2 4.0 y1, p2 x1 y2]\n    poly2 = polygon [p2 x2 y1, p2 14.0 y1, p2 x2 y2]\nin\n{ poly1 = poly1, poly2 = poly2 }"
+            "let\n    x1 = 0.0\n    x2 = 10.0\n    y1 = 0.0\n    y2 = 4.0\n    poly1 = polygon (segments [p2 x1 y1, p2 4.0 y1, p2 x1 y2])\n    poly2 = polygon (segments [p2 x2 y1, p2 14.0 y1, p2 x2 y2])\nin\n{ poly1 = poly1, poly2 = poly2 }"
         );
     }
 
@@ -960,7 +960,7 @@ mod tests {
         let mut s = sketch_with(&[[[0, 0], [1, 2]]]);
         s.update(SketchMsg::AddPolygon);
         // アクティブな空 polygon があっても single 形式のまま
-        assert_eq!(s.code(), "polygon [p2 0.0 0.0, p2 1.0 2.0]");
+        assert_eq!(s.code(), "polygon (segments [p2 0.0 0.0, p2 1.0 2.0])");
     }
 
     #[test]
@@ -971,9 +971,9 @@ mod tests {
         s.update(SketchMsg::CircleAdded([2, 3], 5));
         assert_eq!(
             s.shape_code_at(0),
-            "let\n    x1 = 4.0\n    y1 = 0.0\nin\npolygon [p2 0.0 y1, p2 x1 y1, p2 x1 4.0]"
+            "let\n    x1 = 4.0\n    y1 = 0.0\nin\npolygon (segments [p2 0.0 y1, p2 x1 y1, p2 x1 4.0])"
         );
-        assert_eq!(s.shape_code_at(1), "polygon [p2 9.0 9.0, p2 8.0 8.0]");
+        assert_eq!(s.shape_code_at(1), "polygon (segments [p2 9.0 9.0, p2 8.0 8.0])");
         assert_eq!(
             s.shape_code_at(2),
             "circle 5.0 |> translate2d (p2 0.0 0.0) (p2 2.0 3.0)"
@@ -1013,7 +1013,7 @@ mod tests {
         s.update(SketchMsg::CircleAdded([4, 4], 2));
         assert_eq!(
             s.code(),
-            "let\n    x1 = 0.0\n    x2 = 4.0\n    y1 = 0.0\n    y2 = 4.0\n    poly1 = polygon [p2 x1 y1, p2 x2 y1, p2 x1 y2]\n    circ1 = circle 2.0 |> translate2d (p2 0.0 0.0) (p2 x2 y2)\nin\n{ poly1 = poly1, circ1 = circ1 }"
+            "let\n    x1 = 0.0\n    x2 = 4.0\n    y1 = 0.0\n    y2 = 4.0\n    poly1 = polygon (segments [p2 x1 y1, p2 x2 y1, p2 x1 y2])\n    circ1 = circle 2.0 |> translate2d (p2 0.0 0.0) (p2 x2 y2)\nin\n{ poly1 = poly1, circ1 = circ1 }"
         );
     }
 
@@ -1041,7 +1041,7 @@ mod tests {
         s.update(SketchMsg::PointAdded([5, 5]));
         assert_eq!(
             s.code(),
-            "let\n    x1 = 5.0\n    y1 = 0.0\n    poly1 = polygon [p2 0.0 y1, p2 x1 y1]\n    pt1 = p2 x1 5.0\nin\n{ poly1 = poly1, pt1 = pt1 }"
+            "let\n    x1 = 5.0\n    y1 = 0.0\n    poly1 = polygon (segments [p2 0.0 y1, p2 x1 y1])\n    pt1 = p2 x1 5.0\nin\n{ poly1 = poly1, pt1 = pt1 }"
         );
     }
 

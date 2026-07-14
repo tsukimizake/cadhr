@@ -105,6 +105,16 @@ pub fn free_var_names_in(e: &Expr, bound: &mut HashSet<String>, out: &mut HashSe
             free_var_names_in(body, bound, out);
             *bound = saved;
         }
+        Expr::Sketch { bindings, body, .. } => {
+            // 逐次スコープ (前方参照不可): binding 本体を見てから名前を bound に足す。
+            let saved: HashSet<String> = bound.clone();
+            for b in bindings {
+                free_var_names_in(&b.body, bound, out);
+                bound.insert(b.name.clone());
+            }
+            free_var_names_in(body, bound, out);
+            *bound = saved;
+        }
         Expr::If {
             cond,
             then_branch,
