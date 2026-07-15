@@ -246,7 +246,8 @@ pub struct SketchBinding {
 pub enum SketchBindKind {
     /// `var x = <Floatリテラル>`: 逆評価 (GUI ドラッグ) の書き込み対象。
     Var,
-    /// `let x = <スカラー式>`: 読み取り専用スカラー。
+    /// `let x = <スカラー式>`: 導出スカラー。逆評価は RHS を辿って var へ押し込む
+    /// (RHS に var が無ければ読み取り専用)。
     Let,
     /// キーワードなし (`poly1 = polygon [...]`): 幾何 / 点 / 線分の束縛。
     Bare,

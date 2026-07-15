@@ -4,7 +4,8 @@
 //! 逆評価 (頂点ドラッグ → コード書き戻し) が常に可能な形に式を制限する:
 //!
 //! - `var x = <符号付き Float リテラル>` — 逆評価の書き込み対象
-//! - `let y = <スカラー式>` — 読み取り専用スカラー (リテラル / 既出スカラー名 / 四則演算)
+//! - `let y = <スカラー式>` — 導出スカラー (リテラル / 既出スカラー名 / 四則演算)。
+//!   逆評価は RHS を辿って var へ押し込む
 //! - `name = <幾何式>` — `p2` / `line` / `polygon` / `circle` の束縛
 //! - `/` の右辺は 0 でない Float リテラルのみ (逆評価が常に定義されるように)
 //! - ブロック外の変数参照・Int リテラル・if / case / lambda 等は禁止。
@@ -44,7 +45,7 @@ pub fn check_module(m: &Module) -> Vec<Diagnostic> {
             if val.is_none() {
                 diag.push(Diagnostic::SketchDsl {
                     span: v.body.span(),
-                    message: "トップレベル var の右辺は Float リテラルのみ書けます (例: `var z = 3.0`)"
+                    message: "トップレベル var の右辺は Float リテラルのみ書けます (例: `var z = 3.0`)。計算式は sketch 内の let で書けます (ドラッグは参照先の var に伝播します)"
                         .to_string(),
                 });
             }
@@ -199,7 +200,7 @@ fn check_var_rhs(cx: &mut Ctx, e: &Expr) -> Option<f64> {
         None => {
             cx.err(
                 span_of(e),
-                "var の右辺は Float リテラルのみ書けます (例: `var x = 3.0`)",
+                "var の右辺は Float リテラルのみ書けます (例: `var x = 3.0`)。計算式は let で書けます (ドラッグは参照先の var に伝播します)",
             );
             None
         }

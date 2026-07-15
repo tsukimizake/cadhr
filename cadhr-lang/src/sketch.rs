@@ -8,7 +8,9 @@
 //!     - `var` 束縛への参照 → その定義リテラル (ブロック内 var / トップレベル var とも。
 //!       トップレベル var は複数 sketch ブロックから共有されるので、書き込むと
 //!       参照している全ブロックが連動する)
-//!     - `let` 束縛への参照 → 書き込み不可
+//!     - `let` 束縛への参照 → RHS を辿って var へ押し込む (導出値。
+//!       `let t = b + 150.0` の t をドラッグすると b が書き換わる)。
+//!       RHS に var が無い (`let y = 3.0` 等) 場合は書き込み不可
 //!     - 二項演算 → 書き込み可能な側がちょうど 1 つならそちらへ押し込む
 //!       (もう一方は現在値で定数化)。両方可 / 両方不可なら拒否。
 //!   共有頂点 (junction) は構成する全ての座標式へ書き込む。軸ごとに独立で、
@@ -96,7 +98,7 @@ pub struct DragOutcome {
 /// ドラッグが一切適用できなかった理由。
 #[derive(Clone, Debug, PartialEq)]
 pub enum DragReject {
-    /// 対象軸が読み取り専用 (let 固定 / 書き込み可能な葉が無い)。
+    /// 対象軸が読み取り専用 (座標式から書き込み可能な var に到達できない)。
     ReadOnly(String),
     /// 書き込み先が曖昧 (二項演算の両辺が書き込み可能)。
     Ambiguous(String),
@@ -497,12 +499,15 @@ impl<'a> Block<'a> {
     }
 
     /// 部分木に `var` 束縛 (ブロック内 / トップレベル) への参照が含まれるか。
+    /// `let` 参照は導出値として RHS に再帰する (循環は `build` の逐次評価が先に弾く)。
     fn contains_writable(&self, e: &Expr) -> bool {
         match e {
             Expr::Var {
                 module: None, name, ..
             } => match self.by_name.get(name.as_str()) {
-                Some(b) => b.kind == SketchBindKind::Var,
+                Some(b) if b.kind == SketchBindKind::Var => true,
+                Some(b) if b.kind == SketchBindKind::Let => self.contains_writable(&b.body),
+                Some(_) => false,
                 None => self.top_vars.contains_key(name.as_str()),
             },
             Expr::Negate(inner, _) => self.contains_writable(inner),
@@ -532,6 +537,8 @@ impl<'a> Block<'a> {
                     let (_, leaf) = signed_lit_leaf(&b.body).ok_or(SolveErr::ReadOnly)?;
                     Ok((leaf, target))
                 }
+                // let は導出値: RHS を辿って依存先の var へ押し込む。
+                Some(b) if b.kind == SketchBindKind::Let => self.invert_inner(&b.body, target),
                 Some(_) => Err(SolveErr::ReadOnly),
                 None => match self.top_vars.get(name.as_str()) {
                     Some(body) => {
@@ -589,7 +596,7 @@ enum SolveErr {
 impl SolveErr {
     fn reason(self) -> &'static str {
         match self {
-            SolveErr::ReadOnly => "let で固定されています",
+            SolveErr::ReadOnly => "書き込める var がありません",
             SolveErr::Ambiguous => "書き込み先が曖昧です (両辺に var があります)",
             SolveErr::ZeroFactor => "係数が 0 のため動かせません",
         }
@@ -1272,6 +1279,79 @@ mod tests {
         .expect("drag");
         assert!(out.source.contains("var x1 = 4.0"), "{}", out.source);
         assert!(out.source.contains("x1 + 1.0"), "{}", out.source);
+    }
+
+    #[test]
+    fn drag_through_let_pushes_into_var() {
+        // let は導出値: t = b + 150.0 の t をドラッグすると b が書き換わる。
+        let src = "sk =\n    sketch\n        var b = -40.0\n        let t = b + 150.0\n        p = p2 0.0 t\n    in\n    { p = p }\n    end\n";
+        let out = drag(
+            src,
+            "sk",
+            DragTarget::Point { geom: 0 },
+            DragValue::Pos([0.0, 120.0]),
+        )
+        .expect("drag");
+        assert!(out.source.contains("var b = -30.0"), "{}", out.source);
+        assert!(out.source.contains("let t = b + 150.0"), "{}", out.source);
+        let SketchGeom::Point { pos, .. } = &out.model.geoms[0] else {
+            panic!()
+        };
+        assert_eq!(*pos, [0.0, 120.0]);
+    }
+
+    #[test]
+    fn drag_through_let_chain() {
+        // let の多段: t2 = t * 2.0, t = b + 5.0 → b まで押し込む。
+        let src = "sk =\n    sketch\n        var b = 10.0\n        let t = b + 5.0\n        let t2 = t * 2.0\n        p = p2 t2 0.0\n    in\n    { p = p }\n    end\n";
+        let out = drag(
+            src,
+            "sk",
+            DragTarget::Point { geom: 0 },
+            DragValue::Pos([40.0, 0.0]),
+        )
+        .expect("drag");
+        assert!(out.source.contains("var b = 15.0"), "{}", out.source);
+    }
+
+    #[test]
+    fn drag_through_let_ambiguous_when_var_on_both_sides() {
+        let src = "sk =\n    sketch\n        var b = 1.0\n        let t = b + 1.0\n        p = p2 (t + b) (t + b)\n    in\n    { p = p }\n    end\n";
+        let err = drag(
+            src,
+            "sk",
+            DragTarget::Point { geom: 0 },
+            DragValue::Pos([9.0, 8.0]),
+        )
+        .expect_err("should reject");
+        assert!(matches!(err, DragReject::Ambiguous(_)), "{err:?}");
+    }
+
+    #[test]
+    fn drag_through_let_conflicts_with_direct_var_axis() {
+        // x = t (→ b へ押し込み)、y = b。異なる値の書き込みは衝突。
+        let src = "sk =\n    sketch\n        var b = 0.0\n        let t = b + 150.0\n        p = p2 t b\n    in\n    { p = p }\n    end\n";
+        let err = drag(
+            src,
+            "sk",
+            DragTarget::Point { geom: 0 },
+            DragValue::Pos([160.0, 20.0]),
+        )
+        .expect_err("should conflict");
+        assert!(matches!(err, DragReject::Conflict(_)), "{err:?}");
+    }
+
+    #[test]
+    fn drag_through_let_reaches_top_level_var() {
+        let src = "var zb = 5.0\nsk =\n    sketch\n        let t = zb + 1.0\n        p = p2 0.0 t\n    in\n    { p = p }\n    end\n";
+        let out = drag(
+            src,
+            "sk",
+            DragTarget::Point { geom: 0 },
+            DragValue::Pos([0.0, 10.0]),
+        )
+        .expect("drag");
+        assert!(out.source.contains("var zb = 9.0"), "{}", out.source);
     }
 
     #[test]
