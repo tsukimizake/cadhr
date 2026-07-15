@@ -9,7 +9,9 @@
 //! [`SketchEdit`] イベントとして main.rs に委譲する。
 
 use iced::widget::canvas::{self, Path, Stroke};
-use iced::widget::{canvas as canvas_widget, column, combo_box, container, row, slider, text};
+use iced::widget::{
+    canvas as canvas_widget, column, combo_box, container, pick_list, row, slider, text,
+};
 use iced::{Color, Element, Fill, Length, Point, Rectangle, Renderer, Size, Theme, mouse};
 
 use cadhr_lang::sketch::{DragTarget, DragValue, SketchGeom, SketchModel};
@@ -25,6 +27,20 @@ pub enum Tool {
     Line,
     Circle,
     Point,
+}
+
+/// Tool メニュー (pick_list) の並び。
+const TOOLS: [Tool; 4] = [Tool::Select, Tool::Line, Tool::Circle, Tool::Point];
+
+impl std::fmt::Display for Tool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Tool::Select => "Select",
+            Tool::Line => "Line",
+            Tool::Circle => "Circle",
+            Tool::Point => "Point",
+        })
+    }
 }
 
 /// エディタ本文の書き換えを要する操作。main.rs が `cadhr_lang::sketch` を呼んで
@@ -617,19 +633,14 @@ pub fn view<'a>(s: &'a SketchV2, index: usize, total: usize) -> Element<'a, Sket
     .on_input(SketchV2Msg::BindingChanged)
     .width(Length::Fixed(140.0))
     .size(13.0);
-    let tool_button = |t: Tool, on: &'static str, off: &'static str| {
-        parts::dark_button(if s.tool == t { on } else { off }).on_press(SketchV2Msg::SetTool(t))
-    };
+    let tool_menu = pick_list(TOOLS, Some(s.tool), SketchV2Msg::SetTool).text_size(13);
     let header = row![
         parts::dark_button("↑").on_press(SketchV2Msg::MoveUp),
         parts::dark_button("↓").on_press(SketchV2Msg::MoveDown),
         parts::dark_button(if s.minimized { "▶" } else { "▼" }).on_press(SketchV2Msg::Minimize),
         text(label),
         binding_cb,
-        tool_button(Tool::Select, "[Select]", "Select"),
-        tool_button(Tool::Line, "[Line]", "Line"),
-        tool_button(Tool::Circle, "[Circle]", "Circle"),
-        tool_button(Tool::Point, "[Point]", "Point"),
+        tool_menu,
         parts::dark_button("Factor xy").on_press(SketchV2Msg::FactorVars),
         parts::dark_button("×").on_press(SketchV2Msg::Close),
     ]
