@@ -1013,14 +1013,93 @@ pub fn remove_geom(src: &str, binding: &str, geom_name: &str) -> Result<String, 
     Ok(apply_edits(src, &edits))
 }
 
-/// 新しい空 sketch binding のスニペット。戻り値は (binding 名, 追記テキスト)。
-/// 起点として原点に参照点を 1 つ置く。
-pub fn new_sketch_snippet(taken: &[String]) -> (String, String) {
-    let name = fresh_name("sk", |n| taken.iter().any(|t| t == n));
-    let text = format!(
-        "\n{name} =\n    sketch\n        pt1 = p2 0.0 0.0\n    in\n    {{ pt1 = pt1 }}\n    end\n"
-    );
-    (name, text)
+/// 座標式のうちリテラル葉だけを出現順で集める。junction などで共有された
+/// 同一 span は 1 回だけ数える。
+fn collect_lit_leaves(
+    exprs: &[&Expr],
+    out: &mut Vec<(Span, f64)>,
+    seen: &mut HashSet<(usize, usize)>,
+) {
+    for e in exprs {
+        if let Some((v, leaf)) = signed_lit_leaf(e) {
+            if seen.insert((leaf.span.start, leaf.span.end)) {
+                out.push((leaf.span, v));
+            }
+        }
+    }
+}
+
+/// 2 回以上現れる同値の座標リテラルを軸ごとに `var xN` / `var yN` へまとめる。
+/// 対象は座標式全体がリテラルであるもののみ。既に var / 式になっている座標、
+/// circle の半径と translate2d の src は対象外。まとめた座標は以後ドラッグで連動する。
+/// x と y は値が同じでも別の var にする (共有すると斜めドラッグが衝突拒否されるため)。
+pub fn factor_vars(src: &str, binding: &str) -> Result<String, String> {
+    let module = parse_or_msg(src)?;
+    let (bindings, _body, _span) = find_block(&module, binding)?;
+    let block = Block::build(bindings)?;
+
+    // 軸ごと (0 = x, 1 = y) の座標リテラルを出現順で集める
+    let mut leaves: [Vec<(Span, f64)>; 2] = [Vec::new(), Vec::new()];
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    for b in bindings.iter().filter(|b| b.kind == SketchBindKind::Bare) {
+        let slots: Vec<PosSlot> = match block.geom_shape(b)? {
+            GeomShape::Point(s) => vec![s],
+            GeomShape::Segment(a, b) => vec![a, b],
+            GeomShape::Polygon(v) => v,
+            GeomShape::Circle(c) => c.dst.into_iter().collect(),
+        };
+        for s in &slots {
+            collect_lit_leaves(&s.xs, &mut leaves[0], &mut seen);
+            collect_lit_leaves(&s.ys, &mut leaves[1], &mut seen);
+        }
+    }
+
+    let mut taken: HashSet<String> = bindings.iter().map(|b| b.name.clone()).collect();
+    let mut decls: Vec<(String, f64)> = Vec::new();
+    let mut edits: Vec<TextEdit> = Vec::new();
+    for (axis, prefix) in [(0, "x"), (1, "y")] {
+        // 値ごとにグループ化 (初出順)。ビット比較なのでリテラル同士なら厳密一致。
+        let mut groups: Vec<(u64, Vec<Span>)> = Vec::new();
+        for (span, v) in &leaves[axis] {
+            let bits = v.to_bits();
+            match groups.iter_mut().find(|(b, _)| *b == bits) {
+                Some((_, spans)) => spans.push(*span),
+                None => groups.push((bits, vec![*span])),
+            }
+        }
+        for (bits, spans) in groups {
+            if spans.len() < 2 {
+                continue;
+            }
+            let name = fresh_name(prefix, |n| taken.contains(n));
+            taken.insert(name.clone());
+            decls.push((name.clone(), f64::from_bits(bits)));
+            for span in spans {
+                edits.push(TextEdit {
+                    span,
+                    replacement: name.clone(),
+                });
+            }
+        }
+    }
+    if decls.is_empty() {
+        return Err("まとめられる重複座標がありません".to_string());
+    }
+
+    // var 宣言は前方参照禁止のため先頭の binding の直前に挿入する
+    let first = bindings
+        .first()
+        .ok_or_else(|| "sketch ブロックに束縛がありません".to_string())?;
+    let indent = line_indent(src, first.span.start);
+    let mut header = String::new();
+    for (name, v) in &decls {
+        header.push_str(&format!("var {name} = {}\n{indent}", fmt_float(*v)));
+    }
+    edits.push(TextEdit {
+        span: Span::new(first.span.start, first.span.start),
+        replacement: header,
+    });
+    Ok(apply_edits(src, &edits))
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,13 +1418,6 @@ mod tests {
     }
 
     #[test]
-    fn new_sketch_snippet_parses() {
-        let (name, text) = new_sketch_snippet(&["sk1".to_string()]);
-        assert_eq!(name, "sk2");
-        model_from_source(&text, &name).expect("snippet parses");
-    }
-
-    #[test]
     fn drag_after_structural_edit_roundtrip() {
         // 追加した点をドラッグ → モデルに反映される
         let (s1, _) = add_point(SRC_SEGMENTS, "sk", [1.0, 1.0]).expect("add");
@@ -1360,5 +1432,91 @@ mod tests {
             panic!()
         };
         assert_eq!(*pos, [6.0, -7.5]);
+    }
+
+    #[test]
+    fn factor_vars_groups_per_axis() {
+        let src = "sk =\n    sketch\n        poly1 = polygon (segments [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 3.0, p2 0.0 3.0])\n    in\n    { poly1 = poly1 }\n    end\n";
+        let before = model_of(src);
+        let s = factor_vars(src, "sk").expect("factor");
+        assert!(s.contains("var x1 = 0.0"), "{s}");
+        assert!(s.contains("var x2 = 4.0"), "{s}");
+        // 0.0 は y 軸にも 2 回現れるが、x1 とは別 var になる
+        assert!(s.contains("var y1 = 0.0"), "{s}");
+        assert!(s.contains("var y2 = 3.0"), "{s}");
+        assert!(
+            s.contains("segments [p2 x1 y1, p2 x2 y1, p2 x2 y2, p2 x1 y2]"),
+            "{s}"
+        );
+        assert_eq!(model_of(&s).geoms, before.geoms, "形状は変わらない");
+    }
+
+    #[test]
+    fn factor_vars_nothing_to_merge_is_rejected() {
+        // x の 2.0 は var 参照とリテラルで 1 回ずつ → リテラル同士でないのでまとめない
+        let src = "sk =\n    sketch\n        var x1 = 2.0\n        pt1 = p2 x1 1.0\n        pt2 = p2 2.0 5.0\n    in\n    { pt1 = pt1, pt2 = pt2 }\n    end\n";
+        let err = factor_vars(src, "sk").expect_err("reject");
+        assert!(err.contains("まとめられる"), "{err}");
+    }
+
+    #[test]
+    fn factor_vars_avoids_existing_names() {
+        let src = "sk =\n    sketch\n        var x1 = 9.0\n        pt1 = p2 x1 0.0\n        pt2 = p2 5.0 0.0\n        pt3 = p2 5.0 1.0\n    in\n    { pt1 = pt1, pt2 = pt2, pt3 = pt3 }\n    end\n";
+        let s = factor_vars(src, "sk").expect("factor");
+        assert!(s.contains("var x2 = 5.0"), "{s}");
+        assert!(s.contains("p2 x2 0.0") || s.contains("p2 x2 y1"), "{s}");
+        model_from_source(&s, "sk").expect("parses");
+    }
+
+    #[test]
+    fn factor_vars_shares_junction_literals_once() {
+        // line 形式 polygon の junction (同一 span) は 1 回として数える。
+        // x 軸は 4.0 のみ 2 回 (v2, v3)、y 軸は 0.0 のみ 2 回 (v1, v2)。
+        let s = factor_vars(SRC_LINES, "sk").expect("factor");
+        assert!(s.contains("var x1 = 4.0"), "{s}");
+        assert!(s.contains("var y1 = 0.0"), "{s}");
+        assert!(s.contains("v1 = p2 0.0 y1"), "{s}");
+        assert!(s.contains("v2 = p2 x1 y1"), "{s}");
+        assert!(s.contains("v3 = p2 x1 3.0"), "{s}");
+        model_from_source(&s, "sk").expect("parses");
+    }
+
+    #[test]
+    fn factor_vars_skips_circle_src_and_radius() {
+        // translate2d の src (p2 0.0 0.0) と半径 3.0 は対象外
+        let src = "sk =\n    sketch\n        pt1 = p2 0.0 3.0\n        circ1 = circle 3.0 |> translate2d (p2 0.0 0.0) (p2 0.0 6.0)\n    in\n    { pt1 = pt1, circ1 = circ1 }\n    end\n";
+        // x: pt1 の 0.0 と dst の 0.0 の 2 回 → まとめる。src の 0.0 は数えない
+        let s = factor_vars(src, "sk").expect("factor");
+        assert!(s.contains("var x1 = 0.0"), "{s}");
+        assert!(s.contains("pt1 = p2 x1 3.0"), "{s}");
+        assert!(s.contains("circle 3.0"), "半径はまとめない: {s}");
+        assert!(s.contains("translate2d (p2 0.0 0.0) (p2 x1 6.0)"), "{s}");
+        model_from_source(&s, "sk").expect("parses");
+    }
+
+    #[test]
+    fn factor_vars_negative_literals() {
+        let src = "sk =\n    sketch\n        pt1 = p2 (-1.5) 0.0\n        pt2 = p2 (-1.5) 2.0\n    in\n    { pt1 = pt1, pt2 = pt2 }\n    end\n";
+        let s = factor_vars(src, "sk").expect("factor");
+        assert!(s.contains("var x1 = -1.5"), "{s}");
+        let m = model_from_source(&s, "sk").expect("parses");
+        assert_eq!(m.geoms.len(), 2);
+    }
+
+    #[test]
+    fn factor_vars_then_drag_moves_shared() {
+        let src = "sk =\n    sketch\n        pt1 = p2 4.0 0.0\n        pt2 = p2 4.0 2.0\n    in\n    { pt1 = pt1, pt2 = pt2 }\n    end\n";
+        let s = factor_vars(src, "sk").expect("factor");
+        let out = drag(
+            &s,
+            "sk",
+            DragTarget::Point { geom: 0 },
+            DragValue::Pos([7.0, 0.0]),
+        )
+        .expect("drag");
+        let SketchGeom::Point { pos, .. } = &out.model.geoms[1] else {
+            panic!()
+        };
+        assert_eq!(pos[0], 7.0, "共有 var 経由で pt2 も連動する");
     }
 }

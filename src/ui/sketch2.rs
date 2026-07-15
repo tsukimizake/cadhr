@@ -53,8 +53,8 @@ pub enum SketchEdit {
     RemoveGeom {
         name: String,
     },
-    /// 新しい空 sketch binding をファイル末尾へ挿入して紐付ける。
-    NewBinding,
+    /// 2 回以上現れる同値の座標リテラルを軸ごとに var へまとめる。
+    FactorVars,
 }
 
 pub struct SketchV2 {
@@ -161,7 +161,6 @@ impl SketchV2 {
                 self.cache.clear();
                 WorkspaceEvent::SketchEdit(SketchEdit::Refresh)
             }
-            SketchV2Msg::NewBinding => WorkspaceEvent::SketchEdit(SketchEdit::NewBinding),
             SketchV2Msg::SelectGeom(name) => {
                 let is_poly = self.model.as_ref().is_some_and(|m| {
                     m.geoms
@@ -174,6 +173,7 @@ impl SketchV2 {
             SketchV2Msg::RemoveGeom(name) => {
                 WorkspaceEvent::SketchEdit(SketchEdit::RemoveGeom { name })
             }
+            SketchV2Msg::FactorVars => WorkspaceEvent::SketchEdit(SketchEdit::FactorVars),
             SketchV2Msg::DragStep { target, value } => {
                 WorkspaceEvent::SketchEdit(SketchEdit::Drag { target, value })
             }
@@ -202,9 +202,9 @@ pub enum SketchV2Msg {
     ZoomChanged(f32),
     SetTool(Tool),
     BindingChanged(String),
-    NewBinding,
     SelectGeom(String),
     RemoveGeom(String),
+    FactorVars,
     /// ハンドルドラッグの 1 ステップ (mousemove ごとに逐次書き戻し)。
     DragStep {
         target: DragTarget,
@@ -626,11 +626,11 @@ pub fn view<'a>(s: &'a SketchV2, index: usize, total: usize) -> Element<'a, Sket
         parts::dark_button(if s.minimized { "▶" } else { "▼" }).on_press(SketchV2Msg::Minimize),
         text(label),
         binding_cb,
-        parts::dark_button("+ New").on_press(SketchV2Msg::NewBinding),
         tool_button(Tool::Select, "[Select]", "Select"),
         tool_button(Tool::Line, "[Line]", "Line"),
         tool_button(Tool::Circle, "[Circle]", "Circle"),
         tool_button(Tool::Point, "[Point]", "Point"),
+        parts::dark_button("Factor xy").on_press(SketchV2Msg::FactorVars),
         parts::dark_button("×").on_press(SketchV2Msg::Close),
     ]
     .spacing(2);
@@ -687,7 +687,7 @@ pub fn view<'a>(s: &'a SketchV2, index: usize, total: usize) -> Element<'a, Sket
     let mut col = column![header, canvas_el, geom_list, zoom_row].spacing(4);
     if s.binding.is_empty() {
         col = col.push(
-            text("select a sketch binding (or + New) to edit")
+            text("select a sketch binding to edit")
                 .size(13)
                 .color(Color::from_rgb(0.6, 0.6, 0.6)),
         );

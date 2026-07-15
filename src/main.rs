@@ -525,26 +525,6 @@ fn handle_sketch_edit(model: &mut Model, id: u64, edit: SketchEdit) -> Task<Msg>
             model.unsaved = true;
             Task::none()
         }
-        SketchEdit::NewBinding => {
-            // 既存 top-level 名を集めて衝突しない名前でファイル末尾に挿入する
-            let taken: Vec<String> = cadhr_lang::syntax::parse::parse(&src)
-                .map(|m| {
-                    m.decls
-                        .iter()
-                        .filter_map(|d| match d {
-                            cadhr_lang::syntax::ast::Decl::Value(v) => Some(v.name.clone()),
-                            cadhr_lang::syntax::ast::Decl::Signature(s) => Some(s.name.clone()),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let (name, snippet) = sk::new_sketch_snippet(&taken);
-            if let Some(s2) = sketch2_mut(model, id) {
-                s2.binding = name;
-            }
-            apply_sketch_text_edit(model, id, Ok(format!("{src}{snippet}")))
-        }
         _ if binding.is_empty() => {
             if let Some(s2) = sketch2_mut(model, id) {
                 s2.set_status("sketch binding を選択してください".to_string());
@@ -568,6 +548,9 @@ fn handle_sketch_edit(model: &mut Model, id: u64, edit: SketchEdit) -> Task<Msg>
                 Task::none()
             }
         },
+        SketchEdit::FactorVars => {
+            apply_sketch_text_edit(model, id, sk::factor_vars(&src, &binding))
+        }
         SketchEdit::AddPoint { pos } => apply_sketch_text_edit(
             model,
             id,
