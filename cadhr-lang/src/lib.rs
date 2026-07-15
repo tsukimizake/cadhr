@@ -633,6 +633,46 @@ main = extrude_xy 1.0 sk1.poly1
         assert_eq!(contours.len(), 2);
     }
 
+    #[cfg(feature = "manifold")]
+    #[test]
+    fn top_level_var_shared_between_sketches() {
+        // z1 は 2 つの sketch から参照され、通常の binding からも Float として使える。
+        let src = "\
+var z1 = 3.0
+
+skxz =
+    sketch
+        poly1 = polygon (segments [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 z1, p2 0.0 z1])
+    in
+    { poly1 = poly1 }
+    end
+
+skyz =
+    sketch
+        circ1 = circle 2.0 |> translate2d (p2 0.0 0.0) (p2 5.0 z1)
+    in
+    { circ1 = circ1 }
+    end
+
+main = extrude_xy z1 skxz.poly1
+";
+        let prog = compile(src).expect("compile");
+        let out = run_binding(&prog, "main", &Inputs::default()).expect("run_binding");
+        assert_eq!(out.models.len(), 1);
+        let contours = run_binding_2d(&prog, "skyz", &Inputs::default()).expect("run_binding_2d");
+        assert_eq!(contours.len(), 1);
+    }
+
+    #[test]
+    fn top_level_var_bad_rhs_is_fatal() {
+        let src = "var z1 = 1.0 + 2.0\nmain = cube z1 z1 z1\n";
+        let err = compile(src).expect_err("expected var validation error");
+        assert!(
+            err.iter().any(|d| d.message().contains("Float リテラル")),
+            "diags: {err:?}"
+        );
+    }
+
     #[test]
     fn sketch_validation_errors_are_fatal() {
         // var の右辺が Int リテラル → sketch DSL 違反で compile が Err になる。

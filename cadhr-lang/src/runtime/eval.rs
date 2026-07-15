@@ -164,13 +164,14 @@ impl<'r> Evaluator<'r> {
             }
         }
 
-        // pass 2: eager な値を依存順に評価
+        // pass 2: eager な値 (トップレベル var 含む) を依存順に評価
         let eager: Vec<&ValueDecl> = lm
             .module
             .decls
             .iter()
             .filter_map(|d| match d {
                 Decl::Value(v) if v.params.is_empty() => Some(v),
+                Decl::Var(v) => Some(v),
                 _ => None,
             })
             .collect();
@@ -263,12 +264,13 @@ impl<'r> Evaluator<'r> {
             }
         }
 
-        // pass 2: eager な値を依存順に
+        // pass 2: eager な値 (トップレベル var 含む) を依存順に
         let eager: Vec<&ValueDecl> = m
             .decls
             .iter()
             .filter_map(|d| match d {
                 Decl::Value(v) if v.params.is_empty() => Some(v),
+                Decl::Var(v) => Some(v),
                 _ => None,
             })
             .collect();

@@ -740,6 +740,22 @@ pub fn decl_parser<'tokens, 'src: 'tokens>()
         })
         .boxed();
 
+    // `var name = expr` のトップレベル共有スカラー宣言。複数の sketch ブロックから
+    // 参照でき、逆評価の書き込み対象になる。RHS が Float リテラルであることは
+    // `sema::sketch` が検査する。
+    let var_decl = just(Token::Var)
+        .ignore_then(lower_ident())
+        .then_ignore(just(Token::Eq))
+        .then(expr.clone())
+        .map_with(|(name, body), e| {
+            Decl::Var(ValueDecl {
+                name,
+                params: vec![],
+                body,
+                span: dspan(e.span()),
+            })
+        });
+
     // `type T a b = C1 a | C2 b`
     // constructor の引数は **atomic** な type expr のみ (パイプ `|` で次の constructor に
     // 進めるよう、空白区切りの繰り返しで type_expr を全部食べないようにする)。
@@ -806,7 +822,7 @@ pub fn decl_parser<'tokens, 'src: 'tokens>()
         });
 
     // type_alias は `type alias` で始まるので type_decl より先にチェック。
-    choice((type_alias, type_decl, slider, signature, value)).boxed()
+    choice((type_alias, type_decl, slider, var_decl, signature, value)).boxed()
 }
 
 /// `exposing (..)` または `exposing (a, b, T(..), T(C1))`
@@ -1059,6 +1075,20 @@ mod tests {
             }
             _ => panic!("expected Slider"),
         }
+    }
+
+    #[test]
+    fn top_level_var_decl() {
+        let m = parse_ok("var z1 = 50.0\nsk = z1\n");
+        match &m.decls[0] {
+            Decl::Var(v) => {
+                assert_eq!(v.name, "z1");
+                assert!(v.params.is_empty());
+                assert!(matches!(v.body, Expr::Lit(Lit::Float(_), _)));
+            }
+            other => panic!("unexpected decl: {other:?}"),
+        }
+        assert!(matches!(&m.decls[1], Decl::Value(_)));
     }
 
     #[test]

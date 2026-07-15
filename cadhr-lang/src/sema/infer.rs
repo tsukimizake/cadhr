@@ -945,12 +945,13 @@ fn infer_module_into(
         env = env.extend(&name, isc);
     }
 
-    // 4. value decl の依存解析 → SCC → 葉から順に推論
+    // 4. value decl の依存解析 → SCC → 葉から順に推論。
+    // トップレベル var も型推論上は通常の定数定義と同じ。
     let value_decls: Vec<&ValueDecl> = module
         .decls
         .iter()
         .filter_map(|d| match d {
-            Decl::Value(v) => Some(v),
+            Decl::Value(v) | Decl::Var(v) => Some(v),
             _ => None,
         })
         .collect();

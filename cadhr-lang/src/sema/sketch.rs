@@ -7,9 +7,13 @@
 //! - `let y = <スカラー式>` — 読み取り専用スカラー (リテラル / 既出スカラー名 / 四則演算)
 //! - `name = <幾何式>` — `p2` / `line` / `polygon` / `circle` の束縛
 //! - `/` の右辺は 0 でない Float リテラルのみ (逆評価が常に定義されるように)
-//! - ブロック外の変数参照・Int リテラル・if / case / lambda 等は禁止
+//! - ブロック外の変数参照・Int リテラル・if / case / lambda 等は禁止。
+//!   例外として同一モジュールのトップレベル `var` はスカラーとして参照できる
+//!   (複数 sketch ブロック間での座標共有用。書き込み対象になる)
 //! - body は `{ f = 幾何名, ... }` の record か単一の幾何名のみ
 //! - polygon の線分列は静的に連結 + 閉路であること
+//!
+//! トップレベル `var` 宣言自体もここで検査する (RHS は符号付き Float リテラルのみ)。
 //!
 //! 検査は構文的 (型推論より前に実行できる)。座標値はブロック内で静的に決まるので
 //! 連結性検査のためにここで評価する。
@@ -26,10 +30,31 @@ const RESERVED_HEADS: [&str; 6] = ["p2", "line", "polygon", "segments", "circle"
 
 pub fn check_module(m: &Module) -> Vec<Diagnostic> {
     let mut diag = Vec::new();
+    // トップレベル `var` の収集 + RHS 検査。sketch ブロックからスカラーとして参照できる。
+    let mut top_vars: HashMap<&str, Option<f64>> = HashMap::new();
+    for d in &m.decls {
+        if let Decl::Var(v) = d {
+            if RESERVED_HEADS.contains(&v.name.as_str()) {
+                diag.push(Diagnostic::SketchDsl {
+                    span: v.span,
+                    message: format!("`{}` は sketch 内で予約された名前です", v.name),
+                });
+            }
+            let val = signed_float_lit(&v.body);
+            if val.is_none() {
+                diag.push(Diagnostic::SketchDsl {
+                    span: v.body.span(),
+                    message: "トップレベル var の右辺は Float リテラルのみ書けます (例: `var z = 3.0`)"
+                        .to_string(),
+                });
+            }
+            top_vars.insert(v.name.as_str(), val);
+        }
+    }
     for d in &m.decls {
         match d {
-            Decl::Value(v) => find_sketches(&v.body, &mut diag),
-            Decl::Slider(s) => find_sketches(&s.body, &mut diag),
+            Decl::Value(v) => find_sketches(&v.body, &top_vars, &mut diag),
+            Decl::Slider(s) => find_sketches(&s.body, &top_vars, &mut diag),
             _ => {}
         }
     }
@@ -38,29 +63,35 @@ pub fn check_module(m: &Module) -> Vec<Diagnostic> {
 
 /// 式ツリーから sketch ブロックを探して検査する。sketch の内部には再帰しない
 /// (内部の制約は `check_sketch` が見る)。
-fn find_sketches(e: &Expr, diag: &mut Vec<Diagnostic>) {
+fn find_sketches(e: &Expr, top_vars: &HashMap<&str, Option<f64>>, diag: &mut Vec<Diagnostic>) {
     match e {
         Expr::Sketch {
             bindings,
             body,
             span,
-        } => check_sketch(bindings, body, *span, diag),
+        } => check_sketch(bindings, body, *span, top_vars, diag),
         Expr::Var { .. } | Expr::Ctor { .. } | Expr::Lit(..) | Expr::Error(_) => {}
-        Expr::List(items, _) => items.iter().for_each(|x| find_sketches(x, diag)),
-        Expr::Record(fields, _) => fields.iter().for_each(|f| find_sketches(&f.value, diag)),
+        Expr::List(items, _) => items.iter().for_each(|x| find_sketches(x, top_vars, diag)),
+        Expr::Record(fields, _) => fields
+            .iter()
+            .for_each(|f| find_sketches(&f.value, top_vars, diag)),
         Expr::RecordUpdate { base, updates, .. } => {
-            find_sketches(base, diag);
-            updates.iter().for_each(|f| find_sketches(&f.value, diag));
+            find_sketches(base, top_vars, diag);
+            updates
+                .iter()
+                .for_each(|f| find_sketches(&f.value, top_vars, diag));
         }
-        Expr::Field { receiver, .. } => find_sketches(receiver, diag),
+        Expr::Field { receiver, .. } => find_sketches(receiver, top_vars, diag),
         Expr::App { func, arg, .. } => {
-            find_sketches(func, diag);
-            find_sketches(arg, diag);
+            find_sketches(func, top_vars, diag);
+            find_sketches(arg, top_vars, diag);
         }
-        Expr::Lambda { body, .. } => find_sketches(body, diag),
+        Expr::Lambda { body, .. } => find_sketches(body, top_vars, diag),
         Expr::Let { bindings, body, .. } => {
-            bindings.iter().for_each(|b| find_sketches(&b.body, diag));
-            find_sketches(body, diag);
+            bindings
+                .iter()
+                .for_each(|b| find_sketches(&b.body, top_vars, diag));
+            find_sketches(body, top_vars, diag);
         }
         Expr::If {
             cond,
@@ -68,29 +99,29 @@ fn find_sketches(e: &Expr, diag: &mut Vec<Diagnostic>) {
             else_branch,
             ..
         } => {
-            find_sketches(cond, diag);
-            find_sketches(then_branch, diag);
-            find_sketches(else_branch, diag);
+            find_sketches(cond, top_vars, diag);
+            find_sketches(then_branch, top_vars, diag);
+            find_sketches(else_branch, top_vars, diag);
         }
         Expr::Case {
             scrutinee, arms, ..
         } => {
-            find_sketches(scrutinee, diag);
+            find_sketches(scrutinee, top_vars, diag);
             for a in arms {
                 if let Some(g) = &a.guard {
-                    find_sketches(g, diag);
+                    find_sketches(g, top_vars, diag);
                 }
-                find_sketches(&a.body, diag);
+                find_sketches(&a.body, top_vars, diag);
             }
         }
         Expr::BinOp { left, right, .. } => {
-            find_sketches(left, diag);
-            find_sketches(right, diag);
+            find_sketches(left, top_vars, diag);
+            find_sketches(right, top_vars, diag);
         }
-        Expr::Negate(inner, _) => find_sketches(inner, diag),
+        Expr::Negate(inner, _) => find_sketches(inner, top_vars, diag),
         Expr::Range { lo, hi, .. } => {
-            find_sketches(lo, diag);
-            find_sketches(hi, diag);
+            find_sketches(lo, top_vars, diag);
+            find_sketches(hi, top_vars, diag);
         }
     }
 }
@@ -123,10 +154,15 @@ fn check_sketch(
     bindings: &[SketchBinding],
     body: &Expr,
     _span: Span,
+    top_vars: &HashMap<&str, Option<f64>>,
     diag: &mut Vec<Diagnostic>,
 ) {
+    // トップレベル var をスカラーとして参照できるよう env に前置きする。
     let mut cx = Ctx {
-        env: HashMap::new(),
+        env: top_vars
+            .iter()
+            .map(|(name, v)| (*name, Entry::Scalar(*v)))
+            .collect(),
         diag,
     };
     for b in bindings {
@@ -134,6 +170,11 @@ fn check_sketch(
             cx.err(
                 b.name_span,
                 format!("`{}` は sketch 内で予約された名前です", b.name),
+            );
+        } else if top_vars.contains_key(b.name.as_str()) {
+            cx.err(
+                b.name_span,
+                format!("`{}` はトップレベル var と同名です (shadow できません)", b.name),
             );
         } else if cx.env.contains_key(b.name.as_str()) {
             cx.err(
@@ -201,7 +242,7 @@ fn check_scalar(cx: &mut Ctx, e: &Expr) -> Option<f64> {
             None => {
                 cx.err(
                     *span,
-                    format!("未定義の名前 `{name}` (sketch ブロック外の変数は参照できません)"),
+                    format!("未定義の名前 `{name}` (トップレベル var 以外の sketch ブロック外変数は参照できません)"),
                 );
                 None
             }
@@ -325,7 +366,7 @@ fn check_point_ref(cx: &mut Ctx, e: &Expr) -> Option<(f64, f64)> {
             None => {
                 cx.err(
                     *span,
-                    format!("未定義の名前 `{name}` (sketch ブロック外の変数は参照できません)"),
+                    format!("未定義の名前 `{name}` (トップレベル var 以外の sketch ブロック外変数は参照できません)"),
                 );
                 None
             }
@@ -363,7 +404,7 @@ fn check_segment_item(cx: &mut Ctx, e: &Expr) -> Option<((f64, f64), (f64, f64))
             None => {
                 cx.err(
                     *span,
-                    format!("未定義の名前 `{name}` (sketch ブロック外の変数は参照できません)"),
+                    format!("未定義の名前 `{name}` (トップレベル var 以外の sketch ブロック外変数は参照できません)"),
                 );
                 None
             }
@@ -559,6 +600,45 @@ mod tests {
         assert_err_contains(
             "w = 10.0\nsk = sketch\n    p = p2 w 0.0\n    in p\nend\n",
             "未定義の名前 `w`",
+        );
+    }
+
+    #[test]
+    fn top_level_var_reference_ok() {
+        // 宣言順に関係なく (後方の var も) 参照できる。let のオペランドにも使える。
+        assert_ok(
+            "sk = sketch\n    let y = z1 + 1.0\n    p = p2 z1 y\n    in p\nend\nvar z1 = 50.0\n",
+        );
+    }
+
+    #[test]
+    fn top_level_var_shared_by_two_sketches_ok() {
+        assert_ok(
+            "var z1 = 50.0\nskA = sketch\n    p = p2 0.0 z1\n    in p\nend\nskB = sketch\n    q = p2 1.0 z1\n    in q\nend\n",
+        );
+    }
+
+    #[test]
+    fn top_level_var_rhs_must_be_literal() {
+        assert_err_contains(
+            "var z1 = 1.0 + 2.0\nsk = sketch\n    p = p2 z1 0.0\n    in p\nend\n",
+            "トップレベル var の右辺は Float リテラル",
+        );
+    }
+
+    #[test]
+    fn top_level_var_shadowing_rejected() {
+        assert_err_contains(
+            "var z1 = 50.0\nsk = sketch\n    var z1 = 1.0\n    p = p2 z1 0.0\n    in p\nend\n",
+            "shadow できません",
+        );
+    }
+
+    #[test]
+    fn top_level_var_reserved_name_rejected() {
+        assert_err_contains(
+            "var p2 = 1.0\nsk = sketch\n    q = p2 1.0 1.0\n    in q\nend\n",
+            "予約された名前",
         );
     }
 

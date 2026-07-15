@@ -5,7 +5,9 @@
 //! - [`drag`]: 逆評価。ハンドルのドラッグ (新しい座標) を var / リテラルへの
 //!   テキスト書き換えとして解決する。書き込み先の決定規則:
 //!     - 座標式全体が符号付き Float リテラル → そのリテラル (匿名 var 扱い)
-//!     - `var` 束縛への参照 → その定義リテラル
+//!     - `var` 束縛への参照 → その定義リテラル (ブロック内 var / トップレベル var とも。
+//!       トップレベル var は複数 sketch ブロックから共有されるので、書き込むと
+//!       参照している全ブロックが連動する)
 //!     - `let` 束縛への参照 → 書き込み不可
 //!     - 二項演算 → 書き込み可能な側がちょうど 1 つならそちらへ押し込む
 //!       (もう一方は現在値で定数化)。両方可 / 両方不可なら拒否。
@@ -177,9 +179,21 @@ fn find_block<'a>(
     ))
 }
 
+/// 同一モジュールのトップレベル `var` 宣言 (名前 → RHS 式)。
+fn top_var_map(module: &Module) -> HashMap<&str, &Expr> {
+    module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Var(v) => Some((v.name.as_str(), &v.body)),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn model(module: &Module, binding: &str) -> Result<SketchModel, String> {
     let (bindings, _body, span) = find_block(module, binding)?;
-    let block = Block::build(bindings)?;
+    let block = Block::build(module, bindings)?;
     let mut geoms = Vec::new();
     for b in bindings {
         if b.kind != SketchBindKind::Bare {
@@ -280,14 +294,24 @@ enum GeomShape<'a> {
 struct Block<'a> {
     by_name: HashMap<&'a str, &'a SketchBinding>,
     scalar_values: HashMap<&'a str, f64>,
+    /// トップレベル `var` (名前 → RHS 式)。ブロック内 binding が優先される。
+    top_vars: HashMap<&'a str, &'a Expr>,
 }
 
 impl<'a> Block<'a> {
-    fn build(bindings: &'a [SketchBinding]) -> Result<Self, String> {
+    fn build(module: &'a Module, bindings: &'a [SketchBinding]) -> Result<Self, String> {
         let mut block = Block {
             by_name: HashMap::new(),
             scalar_values: HashMap::new(),
+            top_vars: top_var_map(module),
         };
+        // RHS がリテラルでない top var は sema が拒否するのでここでは単に無視する
+        // (参照時に「スカラーではありません」エラーになる)。
+        for (name, e) in &block.top_vars {
+            if let Some((v, _)) = signed_lit_leaf(e) {
+                block.scalar_values.insert(*name, v);
+            }
+        }
         for b in bindings {
             if b.kind != SketchBindKind::Bare {
                 let v = block.eval_scalar(&b.body)?;
@@ -472,15 +496,15 @@ impl<'a> Block<'a> {
         }
     }
 
-    /// 部分木に `var` 束縛への参照が含まれるか。
+    /// 部分木に `var` 束縛 (ブロック内 / トップレベル) への参照が含まれるか。
     fn contains_writable(&self, e: &Expr) -> bool {
         match e {
             Expr::Var {
                 module: None, name, ..
-            } => matches!(
-                self.by_name.get(name.as_str()),
-                Some(b) if b.kind == SketchBindKind::Var
-            ),
+            } => match self.by_name.get(name.as_str()) {
+                Some(b) => b.kind == SketchBindKind::Var,
+                None => self.top_vars.contains_key(name.as_str()),
+            },
             Expr::Negate(inner, _) => self.contains_writable(inner),
             Expr::BinOp { left, right, .. } => {
                 self.contains_writable(left) || self.contains_writable(right)
@@ -508,7 +532,14 @@ impl<'a> Block<'a> {
                     let (_, leaf) = signed_lit_leaf(&b.body).ok_or(SolveErr::ReadOnly)?;
                     Ok((leaf, target))
                 }
-                _ => Err(SolveErr::ReadOnly),
+                Some(_) => Err(SolveErr::ReadOnly),
+                None => match self.top_vars.get(name.as_str()) {
+                    Some(body) => {
+                        let (_, leaf) = signed_lit_leaf(body).ok_or(SolveErr::ReadOnly)?;
+                        Ok((leaf, target))
+                    }
+                    None => Err(SolveErr::ReadOnly),
+                },
             },
             Expr::Negate(inner, _) => self.invert_inner(inner, -target),
             Expr::BinOp {
@@ -605,7 +636,10 @@ fn signed_lit_leaf(e: &Expr) -> Option<(f64, Leaf)> {
 }
 
 /// Float リテラルとして re-lex 可能な形に整形する (`.0` を保証)。
+/// -0.0 は 0.0 に正規化する (`-0.0 < 0.0` が false のため括弧が付かず、
+/// `-0.0` のまま埋め込むと引数位置で減算にパースされてしまう)。
 fn fmt_float(v: f64) -> String {
+    let v = if v == 0.0 { 0.0 } else { v };
     let s = format!("{v}");
     if s.contains('.') { s } else { format!("{s}.0") }
 }
@@ -648,7 +682,7 @@ pub fn drag(
     }
     let module = parse_or_msg(src).map_err(DragReject::Invalid)?;
     let (bindings, _body, _span) = find_block(&module, binding).map_err(DragReject::Invalid)?;
-    let block = Block::build(bindings).map_err(DragReject::Invalid)?;
+    let block = Block::build(&module, bindings).map_err(DragReject::Invalid)?;
     let bare: Vec<&SketchBinding> = bindings
         .iter()
         .filter(|b| b.kind == SketchBindKind::Bare)
@@ -1036,7 +1070,7 @@ fn collect_lit_leaves(
 pub fn factor_vars(src: &str, binding: &str) -> Result<String, String> {
     let module = parse_or_msg(src)?;
     let (bindings, _body, _span) = find_block(&module, binding)?;
-    let block = Block::build(bindings)?;
+    let block = Block::build(&module, bindings)?;
 
     // 軸ごと (0 = x, 1 = y) の座標リテラルを出現順で集める
     let mut leaves: [Vec<(Span, f64)>; 2] = [Vec::new(), Vec::new()];
@@ -1054,7 +1088,9 @@ pub fn factor_vars(src: &str, binding: &str) -> Result<String, String> {
         }
     }
 
+    // トップレベル var は shadow できないので、生成名から除外する。
     let mut taken: HashSet<String> = bindings.iter().map(|b| b.name.clone()).collect();
+    taken.extend(block.top_vars.keys().map(|n| n.to_string()));
     let mut decls: Vec<(String, f64)> = Vec::new();
     let mut edits: Vec<TextEdit> = Vec::new();
     for (axis, prefix) in [(0, "x"), (1, "y")] {
@@ -1435,6 +1471,27 @@ mod tests {
     }
 
     #[test]
+    fn add_point_negative_zero_is_normalized() {
+        // キャンバスのスナップ計算は -0.0 を作ることがある
+        let (s, _) = add_point(SRC_SEGMENTS, "sk", [11.0, -0.0]).expect("add");
+        assert!(s.contains("p2 11.0 0.0"), "{s}");
+        model_from_source(&s, "sk").expect("parses");
+    }
+
+    #[test]
+    fn drag_to_negative_zero_writes_plain_zero() {
+        let src = "sk =\n    sketch\n        pt1 = p2 1.0 2.0\n    in\n    { pt1 = pt1 }\n    end\n";
+        let out = drag(
+            src,
+            "sk",
+            DragTarget::Point { geom: 0 },
+            DragValue::Pos([11.0, -0.0]),
+        )
+        .expect("drag");
+        assert!(out.source.contains("p2 11.0 0.0"), "{}", out.source);
+    }
+
+    #[test]
     fn factor_vars_groups_per_axis() {
         let src = "sk =\n    sketch\n        poly1 = polygon (segments [p2 0.0 0.0, p2 4.0 0.0, p2 4.0 3.0, p2 0.0 3.0])\n    in\n    { poly1 = poly1 }\n    end\n";
         let before = model_of(src);
@@ -1501,6 +1558,83 @@ mod tests {
         assert!(s.contains("var x1 = -1.5"), "{s}");
         let m = model_from_source(&s, "sk").expect("parses");
         assert_eq!(m.geoms.len(), 2);
+    }
+
+    const SRC_TOP_VAR: &str = "var z1 = 50.0\n\nskxz =\n    sketch\n        var x1 = 10.0\n        p = p2 x1 z1\n    in\n    { p = p }\n    end\n\nskyz =\n    sketch\n        q = p2 3.0 z1\n        r = p2 4.0 (z1 + 10.0)\n    in\n    { q = q, r = r }\n    end\n";
+
+    #[test]
+    fn model_reads_top_level_var() {
+        let m = model_from_source(SRC_TOP_VAR, "skxz").expect("model");
+        let SketchGeom::Point { pos, .. } = &m.geoms[0] else {
+            panic!()
+        };
+        assert_eq!(*pos, [10.0, 50.0]);
+        let m2 = model_from_source(SRC_TOP_VAR, "skyz").expect("model");
+        let SketchGeom::Point { pos, .. } = &m2.geoms[1] else {
+            panic!()
+        };
+        assert_eq!(*pos, [4.0, 60.0]);
+    }
+
+    #[test]
+    fn drag_writes_top_level_var_and_other_sketch_follows() {
+        let out = drag(
+            SRC_TOP_VAR,
+            "skxz",
+            DragTarget::Point { geom: 0 },
+            DragValue::Pos([10.0, 70.0]),
+        )
+        .expect("drag");
+        assert!(out.source.contains("var z1 = 70.0"), "{}", out.source);
+        // 同じ z1 を参照する別 sketch も新ソースでは連動する
+        let m2 = model_from_source(&out.source, "skyz").expect("model");
+        let SketchGeom::Point { pos, .. } = &m2.geoms[0] else {
+            panic!()
+        };
+        assert_eq!(*pos, [3.0, 70.0]);
+    }
+
+    #[test]
+    fn drag_offset_expr_pushes_into_top_level_var() {
+        // r の y は `z1 + 10.0` → z1 に押し込まれ、オフセットは保持される。
+        let out = drag(
+            SRC_TOP_VAR,
+            "skyz",
+            DragTarget::Point { geom: 1 },
+            DragValue::Pos([4.0, 90.0]),
+        )
+        .expect("drag");
+        assert!(out.source.contains("var z1 = 80.0"), "{}", out.source);
+        assert!(out.source.contains("z1 + 10.0"), "{}", out.source);
+    }
+
+    #[test]
+    fn local_binding_shadows_top_var_in_block() {
+        // sema は shadow を拒否するが、Block の名前解決はブロック内優先で一貫させる。
+        let src = "var a = 1.0\nsk =\n    sketch\n        let a = 5.0\n        p = p2 a a\n    in\n    { p = p }\n    end\n";
+        let m = model_from_source(src, "sk").expect("model");
+        let SketchGeom::Point { pos, .. } = &m.geoms[0] else {
+            panic!()
+        };
+        assert_eq!(*pos, [5.0, 5.0]);
+        // ブロック内 let 優先なので両軸とも書き込み不可
+        let err = drag(
+            src,
+            "sk",
+            DragTarget::Point { geom: 0 },
+            DragValue::Pos([9.0, 9.0]),
+        )
+        .expect_err("reject");
+        assert!(matches!(err, DragReject::ReadOnly(_)), "{err:?}");
+    }
+
+    #[test]
+    fn factor_vars_avoids_top_level_var_names() {
+        let src = "var x1 = 9.0\nsk =\n    sketch\n        pt1 = p2 5.0 0.0\n        pt2 = p2 5.0 1.0\n    in\n    { pt1 = pt1, pt2 = pt2 }\n    end\n";
+        let s = factor_vars(src, "sk").expect("factor");
+        // トップレベル x1 と衝突しない名前が生成される
+        assert!(s.contains("var x2 = 5.0"), "{s}");
+        model_from_source(&s, "sk").expect("parses");
     }
 
     #[test]

@@ -73,6 +73,11 @@ pub enum Decl {
     Signature(SignatureDecl),
     /// `f x y = body`
     Value(ValueDecl),
+    /// `var x = <Floatリテラル>`。sketch ブロック間で共有するスカラーで、
+    /// 逆評価 (GUI ドラッグ) の書き込み対象になる。型推論・評価上は通常の
+    /// 定数定義と同じなので payload は `ValueDecl` を共有する (params は常に空)。
+    /// RHS の制約は `sema::sketch` が検査する。
+    Var(ValueDecl),
     /// `type T a b = C1 a | C2 b`
     Type(TypeDecl),
     /// `type alias R = { f : T }`
