@@ -28,16 +28,14 @@ const MAX_PITCH: f64 = std::f64::consts::FRAC_PI_2 - 0.001;
 const EDGE_ANGLE_THRESHOLD_DEG: f32 = 25.0;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum SceneMessage {
-    /// UV coordinates + camera state at click time + widget aspect ratio
-    Clicked {
-        u: f32,
-        v: f32,
-        rotate_x: f64,
-        rotate_y: f64,
-        zoom: f32,
-        aspect: f32,
-    },
+    /// マウスドラッグによる回転 (ピクセル差分)。update 側で Scene.camera に適用する。
+    Orbit { dx: f64, dy: f64 },
+    /// ホイールによるズーム差分。
+    Zoom { delta: f32 },
+    /// UV coordinates + widget aspect ratio (カメラは Scene.camera から読む)
+    Clicked { u: f32, v: f32, aspect: f32 },
 }
 
 pub struct Scene {
@@ -50,32 +48,33 @@ pub struct Scene {
     pub mesh: Arc<MeshData>,
     /// 0 = まだメッシュが設定されていない
     pub mesh_version: u64,
+    /// カメラは widget state ではなく Model 側 (ここ) に持つ。
+    /// widget state だとワークスペースの並び替えで表示位置に取り残される。
+    pub camera: Camera,
 }
 
-pub struct CameraState {
+#[derive(Debug, Clone, Copy)]
+pub struct Camera {
     pub rotate_x: f64,
     pub rotate_y: f64,
     pub zoom: f32,
-    dragging: bool,
-    last_cursor: Option<Point>,
 }
 
-impl CameraState {
-    pub fn with_values(rotate_x: f64, rotate_y: f64, zoom: f32) -> Self {
+impl Default for Camera {
+    fn default() -> Self {
         Self {
-            rotate_x,
-            rotate_y,
-            zoom,
-            dragging: false,
-            last_cursor: None,
+            rotate_x: 0.0,
+            rotate_y: 0.0,
+            zoom: 10.0,
         }
     }
 }
 
-impl Default for CameraState {
-    fn default() -> Self {
-        Self::with_values(0.0, 0.0, 10.0)
-    }
+/// shader widget 内部 state。ドラッグ追跡のみでカメラ値は持たない。
+#[derive(Default)]
+pub struct DragState {
+    dragging: bool,
+    last_cursor: Option<Point>,
 }
 
 impl Drop for Scene {
@@ -100,7 +99,18 @@ impl Scene {
                 edge_indices: vec![],
             }),
             mesh_version: 0,
+            camera: Camera::default(),
         }
+    }
+
+    pub fn orbit(&mut self, dx: f64, dy: f64) {
+        self.camera.rotate_y += dx * ROTATE_SENSITIVITY;
+        self.camera.rotate_x =
+            (self.camera.rotate_x + dy * ROTATE_SENSITIVITY).clamp(-MAX_PITCH, MAX_PITCH);
+    }
+
+    pub fn zoom_by(&mut self, delta: f32) {
+        self.camera.zoom = (self.camera.zoom + delta * ZOOM_SENSITIVITY).clamp(MIN_ZOOM, MAX_ZOOM);
     }
 
     pub fn set_mesh(&mut self, vertices: Vec<Vertex>, indices: Vec<u32>) {
@@ -114,35 +124,39 @@ impl Scene {
         self.mesh_version = NEXT_MESH_VERSION.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// control points を球体としてメインメッシュに追加してから書き戻す。
+    /// 旧 GUI の `set_mesh_with_control_points` の再復活。CP の色は `selected_cp`
+    /// で 1 つだけ強調表示する。
     pub fn set_mesh_with_control_points(
         &mut self,
         mut vertices: Vec<Vertex>,
         mut indices: Vec<u32>,
-        control_points: &[cadhr_lang::manifold_bridge::ControlPoint],
+        control_points: &[(String, [f64; 3])],
         selected_cp: Option<usize>,
     ) {
         self.update_bbox(&vertices);
-
-        // CP 球体を追加する前のメインメッシュからエッジ抽出
         let edge_indices = extract_sharp_edges(&vertices, &indices, EDGE_ANGLE_THRESHOLD_DEG);
-
         let cp_radius = (self.aabb_max_abs() * 0.03).max(0.5);
-        for (ci, cp) in control_points.iter().enumerate() {
-            let color = if selected_cp == Some(ci) {
+        for (i, (_, pos)) in control_points.iter().enumerate() {
+            let color = if Some(i) == selected_cp {
                 [0.0, 1.0, 0.5, 1.0]
             } else {
                 [1.0, 0.9, 0.0, 1.0]
             };
-            let center = [cp.x.value as f32, cp.y.value as f32, cp.z.value as f32];
+            let center = [pos[0] as f32, pos[1] as f32, pos[2] as f32];
             append_sphere(&mut vertices, &mut indices, center, cp_radius, color, 8);
         }
-
         self.mesh = Arc::new(MeshData {
             vertices,
             indices,
             edge_indices,
         });
         self.mesh_version = NEXT_MESH_VERSION.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn aabb_max_abs(&self) -> f32 {
+        let v = self.bbox_min.abs().max(self.bbox_max.abs());
+        v.x.max(v.y).max(v.z)
     }
 
     fn update_bbox(&mut self, vertices: &[Vertex]) {
@@ -183,15 +197,10 @@ impl Scene {
         (max * 2.4 * 3.0).max(5.0)
     }
 
-    /// CP 球体半径計算用: 原点からの最大距離
-    fn aabb_max_abs(&self) -> f32 {
-        let v = self.bbox_min.abs().max(self.bbox_max.abs());
-        v.x.max(v.y).max(v.z)
-    }
-
-    fn build_uniforms(&self, cam: &CameraState, bounds: Rectangle) -> Uniforms {
+    fn build_uniforms(&self, bounds: Rectangle) -> Uniforms {
         let aspect = (bounds.width / bounds.height.max(1.0)).max(0.01);
 
+        let cam = &self.camera;
         let rx = cam.rotate_x as f32;
         let ry = cam.rotate_y as f32;
         let dist = self.base_camera_distance() * (20.0 / cam.zoom);
@@ -215,14 +224,38 @@ impl Scene {
             edge_color: DEFAULT_EDGE_COLOR,
         }
     }
+
+    /// 軸ジゾモ用の uniform。メインカメラの「回転だけ」を再利用し、
+    /// 平行投影で常に同じ画面サイズで描画する (zoom/モデル位置の影響を受けない)。
+    /// 描画先は固定サイズの正方形サブビューポートのため aspect は 1.0 固定。
+    fn build_gizmo_uniforms(&self) -> Uniforms {
+        let rx = self.camera.rotate_x as f32;
+        let ry = self.camera.rotate_y as f32;
+        // 軸ベクトル長 1.0 がジゾモ枠の約 2/3 を占めるように [-1.5, 1.5] に張る
+        let dist = 5.0_f32;
+        let x = dist * ry.sin() * rx.cos();
+        let y = dist * ry.cos() * rx.cos();
+        let z = dist * rx.sin();
+        let eye = Vec3::new(x, y, z);
+        let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Z);
+        let proj = Mat4::orthographic_rh(-1.5, 1.5, -1.5, 1.5, 0.1, 10.0);
+
+        Uniforms {
+            view_proj: (proj * view).to_cols_array_2d(),
+            color: [0.0; 4],
+            light_dir: [0.0; 4],
+            edge_color: [0.0; 4],
+        }
+    }
 }
 
 /// Generate ray from UV coordinates (0..1) through the camera.
 /// Returns (origin, direction) in world space.
+#[allow(dead_code)]
 pub fn generate_ray_from_uv(
     u: f32,
     v: f32,
-    cam: &CameraState,
+    cam: &Camera,
     base_camera_distance: f32,
     aspect: f32,
     view_center: Vec3,
@@ -257,6 +290,7 @@ pub fn generate_ray_from_uv(
 }
 
 /// Ray-sphere intersection, returns distance t or None.
+#[allow(dead_code)]
 pub fn ray_sphere_intersect(
     origin: &[f64; 3],
     dir: &[f64; 3],
@@ -292,16 +326,13 @@ fn append_sphere(
     let base_idx = vertices.len() as u32;
     let stacks = segments;
     let slices = segments * 2;
-
     for i in 0..=stacks {
         let phi = std::f32::consts::PI * i as f32 / stacks as f32;
         for j in 0..=slices {
             let theta = 2.0 * std::f32::consts::PI * j as f32 / slices as f32;
-
             let nx = phi.sin() * theta.cos();
             let ny = phi.sin() * theta.sin();
             let nz = phi.cos();
-
             vertices.push(Vertex {
                 position: [
                     center[0] + radius * nx,
@@ -313,7 +344,6 @@ fn append_sphere(
             });
         }
     }
-
     for i in 0..stacks {
         for j in 0..slices {
             let row1 = base_idx + (i * (slices + 1)) as u32;
@@ -400,7 +430,7 @@ fn extract_sharp_edges(vertices: &[Vertex], indices: &[u32], threshold_deg: f32)
 }
 
 impl shader::Program<SceneMessage> for Scene {
-    type State = CameraState;
+    type State = DragState;
     type Primitive = Primitive;
 
     fn update(
@@ -429,15 +459,8 @@ impl shader::Program<SceneMessage> for Scene {
                         let aspect = bounds.width / bounds.height.max(1.0);
                         state.last_cursor = None;
                         return Some(
-                            shader::Action::publish(SceneMessage::Clicked {
-                                u,
-                                v,
-                                rotate_x: state.rotate_x,
-                                rotate_y: state.rotate_y,
-                                zoom: state.zoom,
-                                aspect,
-                            })
-                            .and_capture(),
+                            shader::Action::publish(SceneMessage::Clicked { u, v, aspect })
+                                .and_capture(),
                         );
                     }
                 }
@@ -445,25 +468,22 @@ impl shader::Program<SceneMessage> for Scene {
                 Some(shader::Action::capture())
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
-                if let Some(last) = state.last_cursor {
+                let action = if let Some(last) = state.last_cursor {
                     let dx = (position.x - last.x) as f64;
                     let dy = (position.y - last.y) as f64;
-                    state.rotate_y += dx * ROTATE_SENSITIVITY;
-                    state.rotate_x =
-                        (state.rotate_x + dy * ROTATE_SENSITIVITY).clamp(-MAX_PITCH, MAX_PITCH);
-                }
+                    shader::Action::publish(SceneMessage::Orbit { dx, dy }).and_capture()
+                } else {
+                    shader::Action::capture()
+                };
                 state.last_cursor = Some(*position);
-                // iced 0.14 の Action::capture() は redraw_request=Wait のまま。
-                // カメラを動かした直後は明示的に再描画要求しないとフレームが出ない。
-                Some(shader::Action::request_redraw().and_capture())
+                Some(action)
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if in_bounds => {
                 let scroll = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => *y,
                     mouse::ScrollDelta::Pixels { y, .. } => y / 50.0,
                 };
-                state.zoom = (state.zoom + scroll * ZOOM_SENSITIVITY).clamp(MIN_ZOOM, MAX_ZOOM);
-                Some(shader::Action::request_redraw().and_capture())
+                Some(shader::Action::publish(SceneMessage::Zoom { delta: scroll }).and_capture())
             }
             _ => None,
         }
@@ -471,13 +491,14 @@ impl shader::Program<SceneMessage> for Scene {
 
     fn draw(
         &self,
-        state: &Self::State,
+        _state: &Self::State,
         _cursor: mouse::Cursor,
         bounds: Rectangle,
     ) -> Self::Primitive {
         Primitive {
             id: self.id,
-            uniforms: self.build_uniforms(state, bounds),
+            uniforms: self.build_uniforms(bounds),
+            gizmo_uniforms: self.build_gizmo_uniforms(),
             mesh: self.mesh.clone(),
             mesh_version: self.mesh_version,
         }
@@ -503,6 +524,7 @@ impl shader::Program<SceneMessage> for Scene {
 pub struct Primitive {
     id: u64,
     uniforms: Uniforms,
+    gizmo_uniforms: Uniforms,
     mesh: Arc<MeshData>,
     mesh_version: u64,
 }
@@ -515,7 +537,7 @@ impl shader::Primitive for Primitive {
         pipeline: &mut Self::Pipeline,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _bounds: &Rectangle,
+        bounds: &Rectangle,
         viewport: &Viewport,
     ) {
         let drained: Vec<u64> = PENDING_REMOVALS
@@ -529,8 +551,10 @@ impl shader::Primitive for Primitive {
             device,
             queue,
             viewport,
+            *bounds * viewport.scale_factor() as f32,
             self.id,
             &self.uniforms,
+            &self.gizmo_uniforms,
             &self.mesh,
             self.mesh_version,
         );

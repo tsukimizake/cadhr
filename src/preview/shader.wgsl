@@ -56,3 +56,21 @@ fn vs_edge(in: VsIn) -> @builtin(position) vec4<f32> {
 fn fs_edge() -> @location(0) vec4<f32> {
     return u.edge_color;
 }
+
+struct GizmoOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) vert_color: vec4<f32>,
+};
+
+@vertex
+fn vs_gizmo(in: VsIn) -> GizmoOut {
+    var out: GizmoOut;
+    out.clip_pos = u.view_proj * vec4<f32>(in.position, 1.0);
+    out.vert_color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_gizmo(in: GizmoOut) -> @location(0) vec4<f32> {
+    return in.vert_color;
+}

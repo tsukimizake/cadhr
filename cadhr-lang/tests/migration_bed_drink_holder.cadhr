@@ -1,0 +1,24 @@
+-- bed_drink_holder を新 cadhr-lang で書き直し。
+-- cube/cylinder/rotate/translate と CSG difference のみで構成されているので、
+-- 2D sketch を介さずそのまま移行できる。
+
+cut slit w h = cube slit w (h - 20.0)
+
+hole w h =
+    cylinder (4.5 / 2.0) 40.0
+        |> rotate3d (p3 0.0 90.0 0.0)
+        |> translate3d (p3 0.0 0.0 0.0) (p3 0.0 (w / 2.0) h)
+
+main =
+    let
+        slit = 18.0
+        w = 40.0
+        h = 120.0
+        x = 40.0
+        base = cube x w h
+        cut_shape = cut slit w h
+            |> translate3d (p3 0.0 0.0 0.0) (p3 ((x - slit) / 2.0) 0.0 0.0)
+        hole_shape = hole w 80.0
+        shape = base |> diff3d cut_shape |> diff3d hole_shape
+    in
+    { models = [shape], bom = [], controls = [] }

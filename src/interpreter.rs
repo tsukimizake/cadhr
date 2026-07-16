@@ -1,110 +1,125 @@
-use cadhr_lang::bom::{BomEntry, BomExtractor};
-use cadhr_lang::collision::check_collisions;
-use cadhr_lang::manifold_bridge::{
-    ControlPoint, ConversionError, EvaluatedNode, MeshGenerator, Model3D, extract_control_points,
-};
-use cadhr_lang::module::{ModuleResolver, resolve_modules};
-use cadhr_lang::parse::{
-    FileRegistry, QueryParam, ScopedTerm, SrcSpan, Term, collect_query_params, database,
-    parse_error_span, query as parse_query, substitute_query_params,
-};
-use cadhr_lang::term_processor::TermProcessor;
-use cadhr_lang::term_rewrite::CadhrError;
-use cadhr_lang::term_rewrite::{execute, infer_query_param_ranges};
+//! cadhr-lang インタープリタ呼び出し層。
+//!
+//! コード変更時と slider 操作時で再実行すべき処理が違うので、2 つの job に分ける:
+//!
+//! - [`run_compile_job`] : ソース文字列 → `CompiledProgram`。
+//!   パース・型推論・slider 抽出・網羅性検査までやる重い処理。
+//! - [`run_eval_job`] : `CompiledProgram` + slider 値 + target binding 名 → 頂点・
+//!   インデックス + BOM。`run_binding` + `manifold_bridge::to_mesh_arrays_with_paths`
+//!   の薄ラッパで、slider を動かすたびに呼ぶ。`CompiledProgram` は `Clone` なので
+//!   GUI 側 Model に保持する。
+//! - [`run_collision_job`] : 衝突プレビュー専用。常に `main` の models を pair で
+//!   交差判定する。
 
-use crate::debug_log;
+use cadhr_lang::runtime::manifold_bridge::{MeshArrays, to_mesh_arrays_with_paths};
+use cadhr_lang::{
+    BindingParam, CompiledProgram, Inputs, Span, Value, compile_with_paths, run_binding,
+    run_binding_2d,
+};
+
 use crate::preview::pipeline::Vertex;
-use manifold_rs::Mesh as RsMesh;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// `main(...)` の出力引数を平坦化して flat な `Vec<Term>` にする。
-/// 引数が `output(Models, Bom, Controls)` レコード形式ならフィールドを順に展開、
-/// その他は単一項として 1 要素のベクタにする。リスト (`[a, b, c]` および
-/// cons-cell `[a | [b | [c]]]`) は再帰的に平坦化する。
-/// 結果は extract_control_points / BomExtractor / MeshGenerator が受け取る
-/// flat な項列。
-fn unpack_main_output(resolved: &[ScopedTerm]) -> Vec<ScopedTerm> {
-    fn flatten_into(term: ScopedTerm, out: &mut Vec<ScopedTerm>) {
-        match term {
-            Term::List { items, tail } => {
-                for it in items {
-                    flatten_into(it, out);
-                }
-                if let Some(t) = tail {
-                    flatten_into(*t, out);
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    let mut out = Vec::new();
-    for t in resolved {
-        if let Term::Struct { functor, args, .. } = t
-            && functor == "main"
-        {
-            for arg in args {
-                match arg {
-                    Term::Struct {
-                        functor: rec_func,
-                        args: rec_args,
-                        ..
-                    } if rec_func == "output" => {
-                        for field in rec_args {
-                            flatten_into(field.clone(), &mut out);
-                        }
-                    }
-                    other => flatten_into(other.clone(), &mut out),
-                }
-            }
-            return out;
-        }
-    }
-    out
+// ---------------- compile job ----------------
+
+#[derive(Clone, Debug)]
+pub struct CompileJobParams {
+    pub source: String,
+    pub search_paths: Vec<PathBuf>,
 }
 
-#[derive(Debug)]
-pub struct MeshJobParams {
-    pub database: String,
-    pub query: String,
-    pub include_paths: Vec<PathBuf>,
-    pub control_point_overrides: HashMap<String, f64>,
-    pub query_param_overrides: HashMap<String, f64>,
-}
-
-#[derive(Clone)]
-pub enum MeshJobResult {
+#[derive(Clone, Debug)]
+pub enum CompileJobResult {
     Success {
-        vertices: Vec<Vertex>,
-        indices: Vec<u32>,
-        evaluated_nodes: Vec<EvaluatedNode>,
-        control_points: Vec<ControlPoint>,
-        bom_entries: Vec<BomEntry>,
-        query_params: Vec<QueryParam>,
-        resolved_terms_debug: String,
+        program: CompiledProgram,
+        diagnostics: Vec<String>,
     },
     Error {
         message: String,
-        span: Option<SrcSpan>,
+        span: Option<Span>,
+        diagnostics: Vec<String>,
     },
 }
 
-impl std::fmt::Debug for MeshJobResult {
+pub fn run_compile_job(params: CompileJobParams) -> CompileJobResult {
+    log_compile_request(&params);
+    let result = match compile_with_paths(&params.source, &params.search_paths) {
+        Ok(prog) => {
+            let diagnostics = prog.diagnostics.iter().map(|d| d.message()).collect();
+            CompileJobResult::Success {
+                program: prog,
+                diagnostics,
+            }
+        }
+        Err(errs) => {
+            let first = errs.first();
+            CompileJobResult::Error {
+                message: first
+                    .map(|d| d.message())
+                    .unwrap_or_else(|| "compile failed".into()),
+                span: first.map(|d| d.span()),
+                diagnostics: errs.iter().map(|d| d.message()).collect(),
+            }
+        }
+    };
+    log_compile_result(&result);
+    result
+}
+
+// ---------------- eval job ----------------
+
+#[derive(Clone, Debug)]
+pub struct EvalJobParams {
+    pub program: CompiledProgram,
+    pub slider_values: HashMap<String, f64>,
+    /// STL ファイル等を解決するための path。compile_job と同じものを渡す。
+    pub search_paths: Vec<PathBuf>,
+    /// GUI が control point をドラッグして上書きしたときの (name → position)。
+    pub control_overrides: HashMap<String, [f64; 3]>,
+    /// 評価する top-level binding の名前。`"main"` がデフォルト。
+    pub target: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CollisionJobParams {
+    pub program: CompiledProgram,
+    pub slider_values: HashMap<String, f64>,
+    pub search_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone)]
+pub enum EvalJobResult {
+    Success {
+        vertices: Vec<Vertex>,
+        indices: Vec<u32>,
+        bom: Vec<String>,
+        /// `control3d "name" (p3 ..)` で記録された (name, current_position)。
+        control_points: Vec<(String, [f64; 3])>,
+    },
+    Error {
+        message: String,
+        span: Option<Span>,
+    },
+}
+
+impl std::fmt::Debug for EvalJobResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MeshJobResult::Success {
+            EvalJobResult::Success {
                 vertices,
                 indices,
-                resolved_terms_debug,
-                ..
+                bom,
+                control_points,
             } => f
-                .debug_struct("MeshJobResult::Success")
-                .field("vertices_count", &vertices.len())
-                .field("indices_count", &indices.len())
-                .field("resolved_terms", &resolved_terms_debug)
+                .debug_struct("Success")
+                .field("vertices_len", &vertices.len())
+                .field("indices_len", &indices.len())
+                .field("bom_len", &bom.len())
+                .field("cp_len", &control_points.len())
                 .finish(),
-            MeshJobResult::Error { message, span } => f
-                .debug_struct("MeshJobResult::Error")
+            EvalJobResult::Error { message, span } => f
+                .debug_struct("Error")
                 .field("message", message)
                 .field("span", span)
                 .finish(),
@@ -112,330 +127,334 @@ impl std::fmt::Debug for MeshJobResult {
     }
 }
 
-fn format_error(
-    label: &str,
-    msg: &str,
-    span: Option<SrcSpan>,
-    registry: &FileRegistry,
-) -> (String, Option<SrcSpan>) {
-    let location = span.map(|s| registry.format_span(&s)).unwrap_or_default();
-    let formatted = if location.is_empty() {
-        format!("{}: {}", label, msg)
-    } else {
-        format!("{} at {}: {}", label, location, msg)
+pub fn run_eval_job(params: EvalJobParams) -> EvalJobResult {
+    log_eval_request("eval", &params);
+    let inputs = build_inputs(&params.program, &params.target, &params);
+
+    let output = match run_binding(&params.program, &params.target, &inputs) {
+        Ok(o) => o,
+        Err(d) => {
+            let r = EvalJobResult::Error {
+                message: d.message(),
+                span: Some(d.span()),
+            };
+            log_eval_result("eval", &r);
+            return r;
+        }
     };
-    (formatted, span)
+
+    let (vertices, indices) = build_mesh(&output.models, &params.search_paths);
+    let bom: Vec<String> = output.bom.iter().map(|v| format!("{v}")).collect();
+    let result = EvalJobResult::Success {
+        vertices,
+        indices,
+        bom,
+        control_points: output.control_points,
+    };
+    log_eval_result("eval", &result);
+    result
 }
 
-fn rs_mesh_to_vertices_colored(
-    rs_mesh: &RsMesh,
-    color: [f32; 4],
-) -> Result<(Vec<Vertex>, Vec<u32>), String> {
-    let raw = rs_mesh.vertices();
-    if raw.is_empty() {
-        return Ok((vec![], vec![]));
-    }
-    let stride = rs_mesh.num_props() as usize;
-    if stride != 6 {
-        return Err(format!(
-            "manifold-rs mesh has unexpected num_props={} (expected 6)",
-            stride
-        ));
-    }
-    let vertices: Vec<Vertex> = raw
-        .chunks_exact(stride)
-        .map(|c| Vertex {
-            position: [c[0], c[1], c[2]],
-            normal: [c[3], c[4], c[5]],
-            color,
-        })
-        .collect();
-    let indices = rs_mesh.indices();
-    Ok((vertices, indices))
+// ---------------- 2D eval job (sketch の参照表示用) ----------------
+
+#[derive(Clone, Debug)]
+pub struct Eval2DJobParams {
+    pub program: CompiledProgram,
+    pub search_paths: Vec<PathBuf>,
+    /// 評価する Shape2D binding の名前。
+    pub target: String,
 }
 
-fn append_mesh(
-    all_verts: &mut Vec<Vertex>,
-    all_idx: &mut Vec<u32>,
-    verts: Vec<Vertex>,
-    idx: Vec<u32>,
-) {
-    let base = all_verts.len() as u32;
-    all_verts.extend(verts);
-    all_idx.extend(idx.iter().map(|&i| i + base));
-}
-
-fn rs_mesh_to_vertices(rs_mesh: &RsMesh) -> Result<(Vec<Vertex>, Vec<u32>), String> {
-    let raw = rs_mesh.vertices();
-    if raw.is_empty() {
-        return Ok((vec![], vec![]));
-    }
-    let stride = rs_mesh.num_props() as usize;
-    if stride != 6 {
-        return Err(format!(
-            "manifold-rs mesh has unexpected num_props={} (expected 6: xyz+normals)",
-            stride
-        ));
-    }
-    let vertices: Vec<Vertex> = raw
-        .chunks_exact(stride)
-        .map(|c| Vertex {
-            position: [c[0], c[1], c[2]],
-            normal: [c[3], c[4], c[5]],
-            color: [0.0, 0.0, 0.0, 0.0],
-        })
-        .collect();
-    let indices = rs_mesh.indices();
-    Ok((vertices, indices))
-}
-
-pub fn run_mesh_job(params: MeshJobParams) -> MeshJobResult {
-    debug_log!("MeshJob query: {}", params.query);
-    debug_log!("MeshJob db:\n{}", params.database);
-    let resolve_result = (|| -> Result<
-        (Vec<cadhr_lang::parse::ScopedTerm>, Vec<ControlPoint>, Vec<QueryParam>),
-        (String, Option<SrcSpan>),
-    > {
-        let mut file_registry = FileRegistry::new();
-        file_registry.register_main("db".to_string(), params.database.clone());
-        let query_file_id = file_registry.register("query".to_string(), params.query.clone());
-
-        let (_, query_terms) = parse_query(&params.query).map_err(|e| {
-            let span = parse_error_span(&params.query, &e).map(|mut s| {
-                s.file_id = query_file_id;
-                s
-            });
-            format_error("Parse error", &format!("{:?}", e), span, &file_registry)
-        })?;
-        let db = database(&params.database).map_err(|e| {
-            let span = parse_error_span(&params.database, &e);
-            format_error("Parse error", &format!("{:?}", e), span, &file_registry)
-        })?;
-        let mut effective_include_paths = cadhr_lang::default_include_paths();
-        effective_include_paths.extend(params.include_paths.iter().cloned());
-        let mut db = resolve_modules(
-            db,
-            &effective_include_paths,
-            &mut ModuleResolver::new(),
-            &mut file_registry,
-        )
-        .map_err(|e| (format!("Module error: {}", e), None))?;
-
-        let mut query_params = collect_query_params(&query_terms);
-        infer_query_param_ranges(&query_terms, &db, &mut query_params)
-            .map_err(|e| (format!("Range inference error: {}", e), None))?;
-
-        // range / default のいずれも持たない query Var は「出力束縛変数」
-        // (`main(OUT)` の OUT 等) とみなし、スライダー化しない。
-        // stale な override が残っていても適用せず、make_output 等の unify を壊さない。
-        query_params.retain(|p| {
-            p.default_value.is_some() || p.min.is_some() || p.max.is_some()
-        });
-
-        let mut values = HashMap::new();
-        for param in &query_params {
-            let val = if let Some(&v) = params.query_param_overrides.get(&param.name) {
-                v
-            } else if let Some(dv) = &param.default_value {
-                dv.to_f64()
-            } else if let (Some(min), Some(max)) = (param.min.as_ref(), param.max.as_ref()) {
-                (min.value.to_f64() + max.value.to_f64()) / 2.0
-            } else {
-                continue;
-            };
-            values.insert(param.name.clone(), val);
-        }
-
-        let substituted = substitute_query_params(&query_terms, &values);
-        let (resolved_raw, _env) = execute(&mut db, substituted).map_err(|e| {
-            format_error("Rewrite error", &e.to_string(), e.span(), &file_registry)
-        })?;
-
-        let mut resolved = unpack_main_output(&resolved_raw);
-        let control_points =
-            extract_control_points(&mut resolved, &params.control_point_overrides);
-        Ok((resolved, control_points, query_params))
-    })();
-
-    match resolve_result {
-        Ok((resolved, control_points, query_params)) => {
-            let resolved_terms_debug = format!("{:#?}", resolved);
-
-            let bom_entries = BomExtractor.process(&resolved).unwrap_or_else(|e| {
-                debug_log!("BOM extraction warning: {}", e);
-                vec![]
-            });
-
-            if resolved.is_empty() {
-                return MeshJobResult::Success {
-                    vertices: vec![],
-                    indices: vec![],
-                    evaluated_nodes: vec![],
-                    control_points,
-                    bom_entries,
-                    query_params,
-                    resolved_terms_debug,
-                };
-            }
-
-            let mesh_generator = MeshGenerator {
-                include_paths: params.include_paths.clone(),
-            };
-            match mesh_generator.process(&resolved) {
-                Ok((rs_mesh, evaluated_nodes)) => match rs_mesh_to_vertices(&rs_mesh) {
-                    Ok((verts, idxs)) => MeshJobResult::Success {
-                        vertices: verts,
-                        indices: idxs,
-                        evaluated_nodes,
-                        control_points,
-                        bom_entries,
-                        query_params,
-                        resolved_terms_debug,
-                    },
-                    Err(e) => MeshJobResult::Error {
-                        message: e,
-                        span: None,
-                    },
-                },
-                Err(e) => MeshJobResult::Error {
-                    message: format!("Mesh error: {}", e),
-                    span: e.span(),
-                },
-            }
-        }
-        Err((message, span)) => MeshJobResult::Error { message, span },
-    }
-}
-
-#[derive(Debug)]
-pub struct CollisionJobParams {
-    pub database: String,
-    pub query: String,
-    pub include_paths: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-pub enum CollisionJobResult {
+#[derive(Clone, Debug)]
+pub enum Eval2DJobResult {
     Success {
-        vertices: Vec<Vertex>,
-        indices: Vec<u32>,
-        part_count: usize,
-        collision_count: usize,
+        /// 輪郭 polygon 群 (穴は別 contour)。座標は grid 単位。
+        contours: Vec<Vec<[f32; 2]>>,
     },
     Error {
         message: String,
-        span: Option<SrcSpan>,
     },
 }
 
-pub fn run_collision_job(params: CollisionJobParams) -> CollisionJobResult {
-    debug_log!("CollisionJob query: {}", params.query);
-    debug_log!("CollisionJob db:\n{}", params.database);
-    let resolve_result =
-        (|| -> Result<Vec<cadhr_lang::parse::ScopedTerm>, (String, Option<SrcSpan>)> {
-            let mut file_registry = FileRegistry::new();
-            file_registry.register_main("db".to_string(), params.database.clone());
-            let query_file_id = file_registry.register("query".to_string(), params.query.clone());
-
-            let (_, query_terms) = parse_query(&params.query).map_err(|e| {
-                let span = parse_error_span(&params.query, &e).map(|mut s| {
-                    s.file_id = query_file_id;
-                    s
-                });
-                format_error("Parse error", &format!("{:?}", e), span, &file_registry)
-            })?;
-            let db = database(&params.database).map_err(|e| {
-                let span = parse_error_span(&params.database, &e);
-                format_error("Parse error", &format!("{:?}", e), span, &file_registry)
-            })?;
-            let mut effective_include_paths = cadhr_lang::default_include_paths();
-            effective_include_paths.extend(params.include_paths.iter().cloned());
-            let mut db = resolve_modules(
-                db,
-                &effective_include_paths,
-                &mut ModuleResolver::new(),
-                &mut file_registry,
-            )
-            .map_err(|e| (format!("Module error: {}", e), None))?;
-
-            let (resolved_raw, _env) = execute(&mut db, query_terms).map_err(|e| {
-                format_error("Rewrite error", &e.to_string(), e.span(), &file_registry)
-            })?;
-            Ok(unpack_main_output(&resolved_raw))
-        })();
-
-    let resolved = match resolve_result {
-        Ok(r) => r,
-        Err((message, span)) => return CollisionJobResult::Error { message, span },
+pub fn run_eval2d_job(params: Eval2DJobParams) -> Eval2DJobResult {
+    let inputs = Inputs {
+        search_paths: params.search_paths.clone(),
+        ..Inputs::default()
     };
-
-    debug_log!("CollisionJob resolved: {:#?}", resolved);
-
-    let exprs: Result<Vec<Model3D>, _> = resolved
-        .iter()
-        .filter_map(|t| match Model3D::from_term(t) {
-            Ok(e) => Some(Ok(e)),
-            Err(ConversionError::UnknownPrimitive(_)) => None,
-            Err(e) => Some(Err(e)),
-        })
-        .collect();
-
-    let exprs = match exprs {
-        Ok(e) => e,
-        Err(e) => {
-            return CollisionJobResult::Error {
-                message: format!("Conversion error: {}", e),
-                span: None,
-            };
-        }
-    };
-
-    if exprs.is_empty() {
-        return CollisionJobResult::Error {
-            message: "No mesh terms found in query result".to_string(),
-            span: None,
-        };
-    }
-
-    match check_collisions(&exprs, &params.include_paths) {
-        Ok(result) => {
-            let mut all_verts = Vec::new();
-            let mut all_idx = Vec::new();
-
-            match rs_mesh_to_vertices_colored(&result.combined_mesh, [0.0, 0.0, 0.0, 0.0]) {
-                Ok((v, i)) => append_mesh(&mut all_verts, &mut all_idx, v, i),
-                Err(e) => {
-                    return CollisionJobResult::Error {
-                        message: e,
-                        span: None,
-                    };
-                }
-            }
-
-            let collision_count = result.collision_meshes.len();
-            for mesh in &result.collision_meshes {
-                match rs_mesh_to_vertices_colored(mesh, [1.0, 0.15, 0.0, 1.0]) {
-                    Ok((v, i)) => append_mesh(&mut all_verts, &mut all_idx, v, i),
-                    Err(e) => {
-                        return CollisionJobResult::Error {
-                            message: e,
-                            span: None,
-                        };
-                    }
-                }
-            }
-
-            CollisionJobResult::Success {
-                vertices: all_verts,
-                indices: all_idx,
-                part_count: result.part_count,
-                collision_count,
-            }
-        }
-        Err(e) => CollisionJobResult::Error {
-            message: format!("Collision error: {}", e),
-            span: None,
+    match run_binding_2d(&params.program, &params.target, &inputs) {
+        Ok(contours) => Eval2DJobResult::Success {
+            contours: contours
+                .into_iter()
+                .map(|c| c.into_iter().map(|[x, y]| [x as f32, y as f32]).collect())
+                .collect(),
+        },
+        Err(d) => Eval2DJobResult::Error {
+            message: d.message(),
         },
     }
 }
 
+/// 衝突チェック: `main` の出力 models をペア毎に intersect して、非空の交差を集める。
+/// 結果メッシュは交差領域だけを集めたもの (色で main mesh と区別)。target は常に `main`。
+pub fn run_collision_job(params: CollisionJobParams) -> EvalJobResult {
+    use cadhr_lang::Model3D;
+    use cadhr_lang::runtime::manifold_bridge::{evaluate_with_paths, to_mesh_arrays_with_paths};
+
+    log_collision_request(&params);
+    let inputs = build_collision_inputs(&params);
+
+    let output = match run_binding(&params.program, "main", &inputs) {
+        Ok(o) => o,
+        Err(d) => {
+            let r = EvalJobResult::Error {
+                message: d.message(),
+                span: Some(d.span()),
+            };
+            log_eval_result("collision", &r);
+            return r;
+        }
+    };
+
+    let models = &output.models;
+    let n = models.len();
+    let mut collisions: Vec<Model3D> = Vec::new();
+    let mut bom: Vec<String> = Vec::new();
+    for i in 0..n {
+        let mi = match evaluate_with_paths(&models[i], &params.search_paths) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if mi.is_empty() {
+            continue;
+        }
+        for j in (i + 1)..n {
+            // 交差は宣言ツリー上で `Intersect` ノードを作る (lazy 評価のまま)。
+            let inter = Model3D::Intersect(Box::new(models[i].clone()), Box::new(models[j].clone()));
+            // 空かどうか確認: evaluate して vertex 数チェック
+            if let Ok(m) = evaluate_with_paths(&inter, &params.search_paths) {
+                if !m.is_empty() {
+                    collisions.push(inter);
+                    bom.push(format!("part #{i} ⊗ part #{j}: collision"));
+                }
+            }
+        }
+    }
+
+    if collisions.is_empty() {
+        bom.push(format!("no collision among {n} parts"));
+    }
+
+    let mut vertices: Vec<Vertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for m in &collisions {
+        if let Ok(arr) = to_mesh_arrays_with_paths(m, &params.search_paths) {
+            let base = vertices.len() as u32;
+            for (p, n) in arr.positions.iter().zip(arr.normals.iter()) {
+                vertices.push(Vertex {
+                    position: *p,
+                    normal: *n,
+                    color: [1.0, 0.3, 0.3, 0.9],
+                });
+            }
+            for i in arr.indices {
+                indices.push(base + i);
+            }
+        }
+    }
+
+    let result = EvalJobResult::Success {
+        vertices,
+        indices,
+        bom,
+        control_points: Vec::new(),
+    };
+    log_eval_result("collision", &result);
+    result
+}
+
+fn build_inputs(prog: &CompiledProgram, target: &str, params: &EvalJobParams) -> Inputs {
+    let mut inputs = Inputs::default();
+    inputs.control_overrides = params.control_overrides.clone();
+    inputs.search_paths = params.search_paths.clone();
+    if let Some(sig) = prog.binding_signature(target) {
+        for p in &sig.params {
+            let v = params.slider_values.get(&p.name).copied();
+            inputs
+                .values
+                .insert(p.name.clone(), build_param_value(p, v));
+        }
+    }
+    inputs
+}
+
+fn build_collision_inputs(params: &CollisionJobParams) -> Inputs {
+    let mut inputs = Inputs::default();
+    inputs.search_paths = params.search_paths.clone();
+    if let Some(sig) = params.program.binding_signature("main") {
+        for p in &sig.params {
+            let v = params.slider_values.get(&p.name).copied();
+            inputs
+                .values
+                .insert(p.name.clone(), build_param_value(p, v));
+        }
+    }
+    inputs
+}
+
+fn build_param_value(p: &BindingParam, v: Option<f64>) -> Value {
+    match (&p.range, v) {
+        (Some(r), Some(x)) => {
+            if r.elem_ty == cadhr_lang::ElemTy::Int {
+                Value::Int(x as i64)
+            } else {
+                Value::Float(x)
+            }
+        }
+        (Some(r), None) => {
+            let mid = (r.lo + r.hi) / 2.0;
+            if r.elem_ty == cadhr_lang::ElemTy::Int {
+                Value::Int(mid as i64)
+            } else {
+                Value::Float(mid)
+            }
+        }
+        (None, Some(x)) => Value::Float(x),
+        (None, None) => Value::Float(0.0),
+    }
+}
+
+fn build_mesh(
+    models: &[cadhr_lang::Model3D],
+    search_paths: &[PathBuf],
+) -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for m in models {
+        let arr = match to_mesh_arrays_with_paths(m, search_paths) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        append_mesh(&mut vertices, &mut indices, arr);
+    }
+    (vertices, indices)
+}
+
+fn append_mesh(verts: &mut Vec<Vertex>, idxs: &mut Vec<u32>, arr: MeshArrays) {
+    let base = verts.len() as u32;
+    for (p, n) in arr.positions.iter().zip(arr.normals.iter()) {
+        verts.push(Vertex {
+            position: *p,
+            normal: *n,
+            color: [0.0, 0.0, 0.0, 0.0],
+        });
+    }
+    for i in arr.indices {
+        idxs.push(base + i);
+    }
+}
+
+// ---------------- debug logging ----------------
+
+fn log_compile_request(params: &CompileJobParams) {
+    eprintln!("───── cadhr-lang compile ─────");
+    if !params.search_paths.is_empty() {
+        eprintln!("[search_paths]");
+        for p in &params.search_paths {
+            eprintln!("  {}", p.display());
+        }
+    }
+    eprintln!("[source]");
+    for (i, line) in params.source.lines().enumerate() {
+        eprintln!("  {:>4} | {line}", i + 1);
+    }
+}
+
+fn log_compile_result(result: &CompileJobResult) {
+    match result {
+        CompileJobResult::Success {
+            program,
+            diagnostics,
+        } => {
+            eprintln!("[compile OK]");
+            let names: Vec<String> = program
+                .previewable_bindings()
+                .into_iter()
+                .map(|b| b.name)
+                .collect();
+            eprintln!("  previewable bindings: [{}]", names.join(", "));
+            for d in diagnostics {
+                eprintln!("  diag: {d}");
+            }
+        }
+        CompileJobResult::Error {
+            message,
+            span,
+            diagnostics,
+        } => {
+            eprintln!("[compile ERROR] {message} (span={span:?})");
+            for d in diagnostics {
+                eprintln!("  diag: {d}");
+            }
+        }
+    }
+    eprintln!("──────────────────────────────");
+}
+
+fn log_eval_request(kind: &str, params: &EvalJobParams) {
+    eprintln!("───── cadhr-lang {kind} target={} ─────", params.target);
+    log_slider_table(&params.slider_values);
+    if !params.control_overrides.is_empty() {
+        eprintln!("[control_overrides]");
+        let mut items: Vec<(&String, &[f64; 3])> = params.control_overrides.iter().collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in items {
+            eprintln!("  {k} = [{}, {}, {}]", v[0], v[1], v[2]);
+        }
+    }
+}
+
+fn log_collision_request(params: &CollisionJobParams) {
+    eprintln!("───── cadhr-lang collision ─────");
+    log_slider_table(&params.slider_values);
+}
+
+fn log_slider_table(sliders: &HashMap<String, f64>) {
+    if sliders.is_empty() {
+        return;
+    }
+    eprintln!("[sliders]");
+    let mut items: Vec<(&String, &f64)> = sliders.iter().collect();
+    items.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, v) in items {
+        eprintln!("  {k} = {v}");
+    }
+}
+
+fn log_eval_result(kind: &str, result: &EvalJobResult) {
+    match result {
+        EvalJobResult::Success {
+            vertices,
+            indices,
+            bom,
+            control_points,
+        } => {
+            eprintln!(
+                "[{kind} OK] verts={} idx={} bom={} cp={}",
+                vertices.len(),
+                indices.len(),
+                bom.len(),
+                control_points.len()
+            );
+            for b in bom {
+                eprintln!("  bom: {b}");
+            }
+            for (n, p) in control_points {
+                eprintln!("  cp: {n} = [{}, {}, {}]", p[0], p[1], p[2]);
+            }
+        }
+        EvalJobResult::Error { message, span } => {
+            eprintln!("[{kind} ERROR] {message} (span={span:?})");
+        }
+    }
+    eprintln!("──────────────────────────────");
+}

@@ -34,6 +34,7 @@ pub fn vertices_to_threemf(vertices: &[Vertex], indices: &[u32]) -> Option<Vec<u
         partnumber: None,
         name: None,
         pid: None,
+        pindex: None,
         mesh: Some(mesh),
         components: None,
     };

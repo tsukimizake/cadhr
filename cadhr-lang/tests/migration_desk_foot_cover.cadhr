@@ -1,0 +1,12 @@
+-- desk_foot_cover を新 cadhr-lang で書き直し。
+-- 旧 `sketch(p2(0,0), [line_to(p2(0,40)), line_to(p2(30,0))]) |> rotateToXY |> linear_extrude(X+1)`
+-- を `polygon (segments [...]) |> extrude_xy (x+1.0)` に置換。
+
+main x =
+    let
+        profile = polygon (segments [p2 0.0 0.0, p2 0.0 40.0, p2 30.0 0.0])
+        shape = extrude_xy (x + 1.0) profile
+    in
+    { models = [shape], bom = [], controls = [] }
+
+slider main.x = 0.0 .. 50.0

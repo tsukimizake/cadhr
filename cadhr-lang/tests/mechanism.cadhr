@@ -1,67 +1,53 @@
-% mechanism: 平歯車 (spur gear) の機構記述
-%
-% NOTE: この .cadhr は cadhr-lang/tests/mechanism_integration.rs に include_str!
-%   され、テスト走行時に db_src 先頭に連結される。ライブラリとして配布する目的
-%   ではなく、translate API (点ベース) と connecting-rod 系制約のテストフィクスチャ。
-%
-% 部品レコード:
-%   gp(Name, Module, Teeth, X, Y, Theta, Thickness)
-%     - Name      : 部品名 (アトム or 文字列)
-%     - Module    : 歯車モジュール (M)
-%     - Teeth     : 歯数 (Z)
-%     - X, Y      : 中心座標 (XY 平面)
-%     - Theta     : 回転角 (degree)
-%     - Thickness : 軸方向の厚み
-%
-% 使い方:
-%   main(T1, OUT) :- do_mech([
-%       gp(g1, 1, 20, 0,  0, T1, 5),
-%       gp(g2, 1, 40, 30, 0, T2,    5),
-%       gp(g3, 1, 20, 60, 0, T3,    5)
-%   ], OUT).
-%
-% NOTE on tooth counts:
-%   cadhr-lang は Rational ベースの線形ソルバを使うので、隣接ペアの歯数比による
-%   T 計算は割り切れなくても厳密に解ける (Rational のまま伝播)。
-%
-% リスト要素として埋め込まれた T1, T2, T3 は同じ節のスコープに居るため、
-% 内部の mesh/2 制約で束縛が伝播し、render_part でその値が描画に反映される。
+-- mechanism: 平歯車 (spur gear) の機構記述。新 cadhr-lang (Elm-like) 版。
+--
+-- 旧 Prolog 版は隣接歯車間の `Z1*T1 + Z2*T2 = 0` を線形ソルバで逆方向に解いて
+-- T2 / T3 を求めていた。新版は `next_theta` の forward 関数として書き直し、
+-- 上流の回転角から下流の回転角を順次計算する。
 
-% ─────── 歯車の描画 ───────
-% 歯車本体はピッチ円半径の円柱で代用する (歯形は今のところ非表示)。
-% 隣接歯車同士は規格通りに配置されればちょうど接触する。
-%
-% translate(Shape, SrcPoint, DstPoint): 歯車中心 (ローカル原点 = p(0,0,0)) を
-% ワールド上の (X, Y, 0) に運ぶ。
-render_part(gp(_, M, Z, X, Y, T, Th), MODEL) :-
-    R = M*Z/2,
-    MODEL = cylinder(R, Th)
-        |> rotate(0, 0, T)
-        |> translate(p(0, 0, 0), p(X, Y, 0)).
+type Gear
+    = Gear Float Float Float Float Float Float
 
-% ─────── 噛み合い制約 ───────
-% 隣接する 2 つの平歯車の噛み合いを表現する。
-%
-% 1. モジュール一致: head パターンの同じ M で構造的に強制
-%    (不一致なら unify 失敗で no-clause-matches となる)
-% 2. 中心距離整合: (X2-X1)^2 + (Y2-Y1)^2 = (M*(Z1+Z2)/2)^2
-%    (sqrt が無いため二乗形式)
-%    位置 (X,Y) はユーザが直接書く想定で、不整合は assert_eq でラベル付きエラー
-% 3. 回転比: Z1*T1 + Z2*T2 = 0
-%    (外接歯車では歯数比に反比例し、回転は逆向き)
-%    この式は通常 T1 が既知で T2 を解く形になるため `=` で線形ソルバに渡す。
-mesh(gp(_, M, Z1, X1, Y1, T1, _), gp(_, M, Z2, X2, Y2, T2, _)) :-
-    DX = X2 - X1,
-    DY = Y2 - Y1,
-    R = M*(Z1 + Z2)/2,
-    assert_eq(DX*DX + DY*DY, R*R, "gear center distance"),
-    Z1*T1 + Z2*T2 = 0.
+-- gear のフィールドアクセサ (case で分解)
+gear_z : Gear -> Float
+gear_z g =
+    case g of
+        Gear _ z _ _ _ _ -> z
 
-% ─────── トラバーサル ───────
-% 部品リストを 1 本の chain として扱い、隣接ペアごとに mesh/2 を適用、
-% 同時に各部品を描画する。出力は描画モデルのリスト。
-do_mech([G], [M]) :- render_part(G, M).
-do_mech([A, B | Rest], [M | Ms]) :-
-    mesh(A, B),
-    render_part(A, M),
-    do_mech([B | Rest], Ms).
+gear_theta : Gear -> Float
+gear_theta g =
+    case g of
+        Gear _ _ _ _ t _ -> t
+
+-- 歯車本体をピッチ円半径の円柱で描画。ローカル原点 = 中心。
+render : Gear -> Shape3D
+render g =
+    case g of
+        Gear m z x y theta th ->
+            cylinder (m * z / 2.0) th
+                |> rotate3d (p3 0.0 0.0 theta)
+                |> translate3d (p3 0.0 0.0 0.0) (p3 x y 0.0)
+
+-- 上流歯車から下流歯車の回転角を計算。外接平歯車は逆比反転。
+next_theta : Gear -> Gear -> Float
+next_theta g1 g2 = (0.0 - gear_z g1 * gear_theta g1) / gear_z g2
+
+-- 中心 (x,y) と回転角を渡して Gear を構築するヘルパ
+mkGear : Float -> Float -> Float -> Float -> Float -> Float -> Gear
+mkGear m z x y theta th = Gear m z x y theta th
+
+main t1 =
+    let
+        g1 = mkGear 1.0 20.0 0.0 0.0 t1 5.0
+        g2_seed = mkGear 1.0 40.0 30.0 0.0 0.0 5.0
+        t2 = next_theta g1 g2_seed
+        g2 = mkGear 1.0 40.0 30.0 0.0 t2 5.0
+        g3_seed = mkGear 1.0 20.0 60.0 0.0 0.0 5.0
+        t3 = next_theta g2 g3_seed
+        g3 = mkGear 1.0 20.0 60.0 0.0 t3 5.0
+    in
+    { models = [render g1, render g2, render g3]
+    , bom = []
+    , controls = []
+    }
+
+slider main.t1 = 0.0 .. 360.0
