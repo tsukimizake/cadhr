@@ -179,7 +179,7 @@ impl CompiledProgram {
         self.bindings_with_return_filter(is_shape2d_return)
     }
 
-    /// GUI の SketchV2 workspace 用。body が `sketch .. end` そのものである
+    /// GUI の Sketch workspace 用。body が `sketch .. end` そのものである
     /// 引数なし top-level binding の名前を宣言順で返す (双方向編集可能な binding)。
     pub fn sketch_block_bindings(&self) -> Vec<String> {
         let main_lm = &self.unit.modules[self.unit.main_index];

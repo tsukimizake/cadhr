@@ -37,6 +37,16 @@ pub struct SketchModel {
     /// sketch 式全体の span。
     pub span: Span,
     pub geoms: Vec<SketchGeom>,
+    /// ハンドルごとの連動情報。
+    pub links: Vec<HandleLink>,
+}
+
+/// ハンドル 1 つ分の連動情報。`leaves` はドラッグで書き込まれるリテラル葉の
+/// ソース上の位置 (span start)。葉を共有するハンドル同士はドラッグで連動して動く。
+#[derive(Clone, Debug, PartialEq)]
+pub struct HandleLink {
+    pub target: DragTarget,
+    pub leaves: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -197,35 +207,76 @@ pub fn model(module: &Module, binding: &str) -> Result<SketchModel, String> {
     let (bindings, _body, span) = find_block(module, binding)?;
     let block = Block::build(module, bindings)?;
     let mut geoms = Vec::new();
+    let mut links = Vec::new();
     for b in bindings {
         if b.kind != SketchBindKind::Bare {
             continue;
         }
+        let gi = geoms.len();
         match block.geom_shape(b)? {
-            GeomShape::Point(slot) => geoms.push(SketchGeom::Point {
-                name: b.name.clone(),
-                pos: slot.pos,
-            }),
-            GeomShape::Segment(a, bb) => geoms.push(SketchGeom::Segment {
-                name: b.name.clone(),
-                a: a.pos,
-                b: bb.pos,
-            }),
-            GeomShape::Polygon(slots) => geoms.push(SketchGeom::Polygon {
-                name: b.name.clone(),
-                verts: slots.iter().map(|s| s.pos).collect(),
-            }),
-            GeomShape::Circle(c) => geoms.push(SketchGeom::Circle {
-                name: b.name.clone(),
-                center: c.center_pos,
-                radius: c.radius.value,
-            }),
+            GeomShape::Point(slot) => {
+                links.push(HandleLink {
+                    target: DragTarget::Point { geom: gi },
+                    leaves: block.slot_leaves(&slot),
+                });
+                geoms.push(SketchGeom::Point {
+                    name: b.name.clone(),
+                    pos: slot.pos,
+                });
+            }
+            GeomShape::Segment(a, bb) => {
+                links.push(HandleLink {
+                    target: DragTarget::SegmentEnd { geom: gi, end: 0 },
+                    leaves: block.slot_leaves(&a),
+                });
+                links.push(HandleLink {
+                    target: DragTarget::SegmentEnd { geom: gi, end: 1 },
+                    leaves: block.slot_leaves(&bb),
+                });
+                geoms.push(SketchGeom::Segment {
+                    name: b.name.clone(),
+                    a: a.pos,
+                    b: bb.pos,
+                });
+            }
+            GeomShape::Polygon(slots) => {
+                for (vi, s) in slots.iter().enumerate() {
+                    links.push(HandleLink {
+                        target: DragTarget::PolyVertex { geom: gi, vert: vi },
+                        leaves: block.slot_leaves(s),
+                    });
+                }
+                geoms.push(SketchGeom::Polygon {
+                    name: b.name.clone(),
+                    verts: slots.iter().map(|s| s.pos).collect(),
+                });
+            }
+            GeomShape::Circle(c) => {
+                links.push(HandleLink {
+                    target: DragTarget::CircleCenter { geom: gi },
+                    leaves: c
+                        .dst
+                        .as_ref()
+                        .map(|d| block.slot_leaves(d))
+                        .unwrap_or_default(),
+                });
+                links.push(HandleLink {
+                    target: DragTarget::CircleRadius { geom: gi },
+                    leaves: block.axis_leaves(&c.radius.exprs, c.radius.value),
+                });
+                geoms.push(SketchGeom::Circle {
+                    name: b.name.clone(),
+                    center: c.center_pos,
+                    radius: c.radius.value,
+                });
+            }
         }
     }
     Ok(SketchModel {
         binding: binding.to_string(),
         span,
         geoms,
+        links,
     })
 }
 
@@ -583,6 +634,25 @@ impl<'a> Block<'a> {
             }
             _ => Err(SolveErr::ReadOnly),
         }
+    }
+
+    /// 軸 1 つ分のドラッグ書き込み先リテラル葉 (span start)。1 式でも書き込め
+    /// ない場合 [`drag`] はその軸ごと固定するので、連動情報としても空を返す。
+    fn axis_leaves(&self, exprs: &[&Expr], value: f64) -> Vec<usize> {
+        let mut leaves = Vec::new();
+        for e in exprs {
+            match self.invert(e, value) {
+                Ok((leaf, _)) => leaves.push(leaf.span.start),
+                Err(_) => return Vec::new(),
+            }
+        }
+        leaves
+    }
+
+    fn slot_leaves(&self, slot: &PosSlot) -> Vec<usize> {
+        let mut leaves = self.axis_leaves(&slot.xs, slot.pos[0]);
+        leaves.extend(self.axis_leaves(&slot.ys, slot.pos[1]));
+        leaves
     }
 }
 
@@ -1195,6 +1265,56 @@ mod tests {
         };
         assert_eq!(*center, [3.0, 5.0]);
         assert_eq!(*radius, 2.0);
+    }
+
+    fn leaves_of(m: &SketchModel, t: DragTarget) -> Vec<usize> {
+        m.links
+            .iter()
+            .find(|l| l.target == t)
+            .unwrap_or_else(|| panic!("no link for {t:?}"))
+            .leaves
+            .clone()
+    }
+
+    fn shares_leaf(m: &SketchModel, a: DragTarget, b: DragTarget) -> bool {
+        let la = leaves_of(m, a);
+        leaves_of(m, b).iter().any(|l| la.contains(l))
+    }
+
+    #[test]
+    fn links_shared_var_couples_vertices() {
+        let m = model_of(SRC_SEGMENTS);
+        // 頂点 0 と 3 は x1 を共有、頂点 0 と 1 は独立
+        assert!(shares_leaf(
+            &m,
+            DragTarget::PolyVertex { geom: 0, vert: 0 },
+            DragTarget::PolyVertex { geom: 0, vert: 3 },
+        ));
+        assert!(!shares_leaf(
+            &m,
+            DragTarget::PolyVertex { geom: 0, vert: 0 },
+            DragTarget::PolyVertex { geom: 0, vert: 1 },
+        ));
+    }
+
+    #[test]
+    fn links_pinned_axis_has_no_leaf() {
+        let m = model_of(SRC_SEGMENTS);
+        // 頂点 2 は x=x2 (var), y=y2 (let → 書き込み不可) なので葉は x2 の 1 つだけ
+        assert_eq!(
+            leaves_of(&m, DragTarget::PolyVertex { geom: 0, vert: 2 }).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn links_named_point_couples_segment_and_polygon() {
+        let m = model_of(SRC_LINES);
+        // v2 (geom 1) は l1 (geom 3) の終点と poly1 (geom 4) の頂点 1 に現れる
+        let v2 = DragTarget::Point { geom: 1 };
+        assert!(shares_leaf(&m, v2, DragTarget::SegmentEnd { geom: 3, end: 1 }));
+        assert!(shares_leaf(&m, v2, DragTarget::PolyVertex { geom: 4, vert: 1 }));
+        assert!(!shares_leaf(&m, v2, DragTarget::Point { geom: 0 }));
     }
 
     #[test]

@@ -14,7 +14,6 @@
 use cadhr_lang::runtime::manifold_bridge::{MeshArrays, to_mesh_arrays_with_paths};
 use cadhr_lang::{
     BindingParam, CompiledProgram, Inputs, Span, Value, compile_with_paths, run_binding,
-    run_binding_2d,
 };
 
 use crate::preview::pipeline::Vertex;
@@ -153,45 +152,6 @@ pub fn run_eval_job(params: EvalJobParams) -> EvalJobResult {
     };
     log_eval_result("eval", &result);
     result
-}
-
-// ---------------- 2D eval job (sketch の参照表示用) ----------------
-
-#[derive(Clone, Debug)]
-pub struct Eval2DJobParams {
-    pub program: CompiledProgram,
-    pub search_paths: Vec<PathBuf>,
-    /// 評価する Shape2D binding の名前。
-    pub target: String,
-}
-
-#[derive(Clone, Debug)]
-pub enum Eval2DJobResult {
-    Success {
-        /// 輪郭 polygon 群 (穴は別 contour)。座標は grid 単位。
-        contours: Vec<Vec<[f32; 2]>>,
-    },
-    Error {
-        message: String,
-    },
-}
-
-pub fn run_eval2d_job(params: Eval2DJobParams) -> Eval2DJobResult {
-    let inputs = Inputs {
-        search_paths: params.search_paths.clone(),
-        ..Inputs::default()
-    };
-    match run_binding_2d(&params.program, &params.target, &inputs) {
-        Ok(contours) => Eval2DJobResult::Success {
-            contours: contours
-                .into_iter()
-                .map(|c| c.into_iter().map(|[x, y]| [x as f32, y as f32]).collect())
-                .collect(),
-        },
-        Err(d) => Eval2DJobResult::Error {
-            message: d.message(),
-        },
-    }
 }
 
 /// 衝突チェック: `main` の出力 models をペア毎に intersect して、非空の交差を集める。

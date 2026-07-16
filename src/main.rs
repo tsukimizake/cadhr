@@ -1,6 +1,7 @@
 mod debug;
 mod export;
 mod highlight;
+mod history;
 mod interpreter;
 mod preview;
 mod session;
@@ -13,14 +14,10 @@ use iced::widget::{
     column, container, pane_grid, pick_list, row, scrollable, text, text_editor, toggler,
 };
 use iced::{Element, Fill, Length, Subscription, Task};
-use interpreter::{
-    CollisionJobParams, CompileJobParams, CompileJobResult, Eval2DJobParams, Eval2DJobResult,
-    EvalJobResult,
-};
+use interpreter::{CollisionJobParams, CompileJobParams, CompileJobResult, EvalJobResult};
 use ui::parts;
 use ui::preview::Preview;
-use ui::sketch::Sketch;
-use ui::sketch2::{SketchEdit, SketchV2};
+use ui::sketch::{Sketch, SketchEdit};
 use ui::workspace::{Workspace, WorkspaceEvent, WorkspaceMsg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,16 +31,10 @@ enum AddKind {
     Preview,
     Collision,
     Sketch,
-    SketchV2,
 }
 
 impl AddKind {
-    const ALL: [AddKind; 4] = [
-        AddKind::Preview,
-        AddKind::Collision,
-        AddKind::Sketch,
-        AddKind::SketchV2,
-    ];
+    const ALL: [AddKind; 3] = [AddKind::Preview, AddKind::Collision, AddKind::Sketch];
 }
 
 impl std::fmt::Display for AddKind {
@@ -52,7 +43,6 @@ impl std::fmt::Display for AddKind {
             AddKind::Preview => write!(f, "Preview"),
             AddKind::Collision => write!(f, "Collision Check"),
             AddKind::Sketch => write!(f, "2D Sketch"),
-            AddKind::SketchV2 => write!(f, "2D Sketch v2 (DSL)"),
         }
     }
 }
@@ -134,6 +124,8 @@ fn main() -> iced::Result {
 
 struct Model {
     editor: text_editor::Content,
+    /// エディタ本文の undo / redo 履歴 (キー入力・Sketch ドラッグ・構造編集)。
+    history: history::History,
     workspaces: Vec<Workspace>,
     next_workspace_id: u64,
     program: Option<CompiledProgram>,
@@ -141,9 +133,7 @@ struct Model {
     candidates: Vec<BindingSignature>,
     /// combo_box の選択肢用キャッシュ (= `candidates.iter().map(|b| b.name).collect()`)。
     candidate_names: Vec<String>,
-    /// sketch の target 候補 (戻り型 Shape2D の binding 名)。compile 完了時に更新。
-    shape2d_candidate_names: Vec<String>,
-    /// SketchV2 の紐付け候補 (body が sketch..end の binding 名)。compile 完了時に更新。
+    /// Sketch の紐付け候補 (body が sketch..end の binding 名)。compile 完了時に更新。
     sketch_binding_names: Vec<String>,
     error_message: String,
     error_span: Option<Span>,
@@ -163,16 +153,16 @@ struct Model {
 #[allow(dead_code)]
 enum Msg {
     EditorAction(text_editor::Action),
+    Undo,
+    Redo,
     UpdatePreviews,
     CompileDone(CompileJobResult),
     EvalDone(u64, EvalJobResult),
-    Eval2DDone(u64, Eval2DJobResult),
     Workspace(u64, WorkspaceMsg),
 
     AddPreview,
     AddCollisionCheck,
     AddSketch,
-    AddSketchV2,
 
     NewSession,
     OpenSession,
@@ -200,12 +190,12 @@ fn init() -> (Model, Task<Msg>) {
 
     let mut model = Model {
         editor: text_editor::Content::with_text(DEFAULT_EDITOR_TEXT),
+        history: history::History::default(),
         workspaces: vec![Workspace::Preview(Preview::new(0))],
         next_workspace_id: 1,
         program: None,
         candidates: Vec::new(),
         candidate_names: Vec::new(),
-        shape2d_candidate_names: Vec::new(),
         sketch_binding_names: Vec::new(),
         error_message: String::new(),
         error_span: None,
@@ -247,11 +237,6 @@ fn workspaces_from_session(sp: &session::SessionPreviews) -> Vec<Workspace> {
                 .iter()
                 .map(|s| (s.order, Workspace::Sketch(Sketch::from_session(s)))),
         )
-        .chain(
-            sp.sketches_v2
-                .iter()
-                .map(|s| (s.order, Workspace::SketchV2(SketchV2::from_session(s)))),
-        )
         .collect();
     workspaces.sort_by_key(|(order, _)| *order);
     workspaces.into_iter().map(|(_, w)| w).collect()
@@ -268,13 +253,6 @@ fn preview_mut(model: &mut Model, id: u64) -> Option<&mut Preview> {
 fn sketch_mut(model: &mut Model, id: u64) -> Option<&mut Sketch> {
     match model.workspaces.iter_mut().find(|w| w.id() == id)? {
         Workspace::Sketch(s) => Some(s),
-        _ => None,
-    }
-}
-
-fn sketch2_mut(model: &mut Model, id: u64) -> Option<&mut SketchV2> {
-    match model.workspaces.iter_mut().find(|w| w.id() == id)? {
-        Workspace::SketchV2(s) => Some(s),
         _ => None,
     }
 }
@@ -331,7 +309,7 @@ fn spawn_compile_job(model: &Model) -> Task<Msg> {
 }
 
 /// compile 要求の唯一の入口。実行中なら dirty を立てて完了後に 1 回だけ再実行する
-/// (SketchV2 のドラッグ中は編集が高頻度に来るため)。
+/// (Sketch のドラッグ中は編集が高頻度に来るため)。
 fn request_compile(model: &mut Model) -> Task<Msg> {
     if model.compile_in_flight {
         model.compile_dirty = true;
@@ -373,26 +351,8 @@ fn spawn_eval_for(model: &Model, workspace_id: u64) -> Task<Msg> {
                 move |r| Msg::EvalDone(workspace_id, r),
             )
         }
-        Some(Workspace::Sketch(s)) => {
-            if s.target.is_empty() {
-                return Task::none();
-            }
-            let params = Eval2DJobParams {
-                program: prog,
-                search_paths: search_paths(model),
-                target: s.target.clone(),
-            };
-            Task::perform(
-                async move {
-                    std::thread::spawn(move || interpreter::run_eval2d_job(params))
-                        .join()
-                        .expect("eval worker panicked")
-                },
-                move |r| Msg::Eval2DDone(workspace_id, r),
-            )
-        }
-        // SketchV2 の model は CompileDone 時に同期計算する (eval job 不要)
-        Some(Workspace::SketchV2(_)) => Task::none(),
+        // Sketch の model は CompileDone 時に同期計算する (eval job 不要)
+        Some(Workspace::Sketch(_)) => Task::none(),
         None => Task::none(),
     }
 }
@@ -409,19 +369,13 @@ fn spawn_eval_all(model: &Model) -> Task<Msg> {
 fn collect_session(model: &Model) -> session::SessionPreviews {
     let mut previews = Vec::new();
     let mut sketches = Vec::new();
-    let mut sketches_v2 = Vec::new();
     for (i, w) in model.workspaces.iter().enumerate() {
         match w {
             Workspace::Preview(p) => previews.push(p.to_session(i)),
             Workspace::Sketch(s) => sketches.push(s.to_session(i)),
-            Workspace::SketchV2(s) => sketches_v2.push(s.to_session(i)),
         }
     }
-    session::SessionPreviews {
-        previews,
-        sketches,
-        sketches_v2,
-    }
+    session::SessionPreviews { previews, sketches }
 }
 
 /// 各 preview について現在の target binding の signature を引き、未登録 param
@@ -453,16 +407,15 @@ fn refresh_workspace_candidates(model: &mut Model) {
     for w in &mut model.workspaces {
         match w {
             Workspace::Preview(p) => p.refresh_candidates(&model.candidate_names),
-            Workspace::Sketch(s) => s.refresh_candidates(&model.shape2d_candidate_names),
-            Workspace::SketchV2(s) => s.refresh_candidates(&model.sketch_binding_names),
+            Workspace::Sketch(s) => s.refresh_candidates(&model.sketch_binding_names),
         }
     }
 }
 
-/// SketchV2 workspace の model を現在のエディタ本文から再計算する。
-fn refresh_sketch2_model(model: &mut Model, id: u64) {
+/// Sketch workspace の model を現在のエディタ本文から再計算する。
+fn refresh_sketch_model(model: &mut Model, id: u64) {
     let src = model.editor.text();
-    let Some(s2) = sketch2_mut(model, id) else {
+    let Some(s2) = sketch_mut(model, id) else {
         return;
     };
     if s2.binding.is_empty() {
@@ -478,16 +431,35 @@ fn refresh_sketch2_model(model: &mut Model, id: u64) {
     }
 }
 
-fn sketch2_ids(model: &Model) -> Vec<u64> {
+/// undo 履歴に積むための現在のエディタ状態。
+fn editor_snapshot(model: &Model) -> history::Snapshot {
+    history::Snapshot {
+        text: model.editor.text(),
+        cursor: model.editor.cursor(),
+    }
+}
+
+/// undo / redo で取り出したスナップショットをエディタへ反映する。
+fn apply_snapshot(model: &mut Model, snap: history::Snapshot) -> Task<Msg> {
+    model.editor = text_editor::Content::with_text(&snap.text);
+    model.editor.move_to(snap.cursor);
+    model.unsaved = true;
+    for wid in sketch_ids(model) {
+        refresh_sketch_model(model, wid);
+    }
+    request_compile(model)
+}
+
+fn sketch_ids(model: &Model) -> Vec<u64> {
     model
         .workspaces
         .iter()
-        .filter(|w| matches!(w, Workspace::SketchV2(_)))
+        .filter(|w| matches!(w, Workspace::Sketch(_)))
         .map(Workspace::id)
         .collect()
 }
 
-/// SketchV2 のテキスト編集結果をエディタへ反映して recompile を要求する。
+/// Sketch のテキスト編集結果をエディタへ反映して recompile を要求する。
 fn apply_sketch_text_edit(
     model: &mut Model,
     id: u64,
@@ -495,16 +467,19 @@ fn apply_sketch_text_edit(
 ) -> Task<Msg> {
     match result {
         Ok(new_src) => {
+            model
+                .history
+                .record(editor_snapshot(model), history::EditKind::Oneshot);
             model.editor = text_editor::Content::with_text(&new_src);
-            if let Some(s2) = sketch2_mut(model, id) {
+            if let Some(s2) = sketch_mut(model, id) {
                 s2.set_status(String::new());
             }
-            refresh_sketch2_model(model, id);
+            refresh_sketch_model(model, id);
             model.unsaved = true;
             request_compile(model)
         }
         Err(e) => {
-            if let Some(s2) = sketch2_mut(model, id) {
+            if let Some(s2) = sketch_mut(model, id) {
                 s2.set_status(e);
             }
             Task::none()
@@ -512,29 +487,36 @@ fn apply_sketch_text_edit(
     }
 }
 
-/// SketchV2 workspace からのコード書き換え要求を適用する。
+/// Sketch workspace からのコード書き換え要求を適用する。
 fn handle_sketch_edit(model: &mut Model, id: u64, edit: SketchEdit) -> Task<Msg> {
     use cadhr_lang::sketch as sk;
-    let Some(binding) = sketch2_mut(model, id).map(|s| s.binding.clone()) else {
+    let Some(binding) = sketch_mut(model, id).map(|s| s.binding.clone()) else {
         return Task::none();
     };
     let src = model.editor.text();
     match edit {
         SketchEdit::Refresh => {
-            refresh_sketch2_model(model, id);
+            refresh_sketch_model(model, id);
             model.unsaved = true;
             Task::none()
         }
+        SketchEdit::DragEnd => {
+            model.history.break_group();
+            Task::none()
+        }
         _ if binding.is_empty() => {
-            if let Some(s2) = sketch2_mut(model, id) {
+            if let Some(s2) = sketch_mut(model, id) {
                 s2.set_status("sketch binding を選択してください".to_string());
             }
             Task::none()
         }
         SketchEdit::Drag { target, value } => match sk::drag(&src, &binding, target, value) {
             Ok(out) => {
+                model
+                    .history
+                    .record(editor_snapshot(model), history::EditKind::Drag);
                 model.editor = text_editor::Content::with_text(&out.source);
-                if let Some(s2) = sketch2_mut(model, id) {
+                if let Some(s2) = sketch_mut(model, id) {
                     s2.set_model(Some(out.model));
                     s2.set_status(out.pinned.join(" / "));
                 }
@@ -542,7 +524,7 @@ fn handle_sketch_edit(model: &mut Model, id: u64, edit: SketchEdit) -> Task<Msg>
                 request_compile(model)
             }
             Err(rej) => {
-                if let Some(s2) = sketch2_mut(model, id) {
+                if let Some(s2) = sketch_mut(model, id) {
                     s2.set_status(rej.message().to_string());
                 }
                 Task::none()
@@ -571,7 +553,7 @@ fn handle_sketch_edit(model: &mut Model, id: u64, edit: SketchEdit) -> Task<Msg>
             None => match sk::add_polygon(&src, &binding, &[a, b]) {
                 Ok((new_src, name)) => {
                     let task = apply_sketch_text_edit(model, id, Ok(new_src));
-                    if let Some(s2) = sketch2_mut(model, id) {
+                    if let Some(s2) = sketch_mut(model, id) {
                         s2.active_poly = Some(name);
                     }
                     task
@@ -589,12 +571,34 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
     match message {
         Msg::EditorAction(action) => {
             let is_edit = action.is_edit();
+            if is_edit {
+                model
+                    .history
+                    .record(editor_snapshot(model), history::EditKind::Typing);
+            } else {
+                // カーソル移動やクリックでタイピングの undo グループを区切る
+                model.history.break_group();
+            }
             model.editor.perform(action);
             if is_edit {
                 model.unsaved = true;
                 return request_compile(model);
             }
             Task::none()
+        }
+        Msg::Undo => {
+            let current = editor_snapshot(model);
+            match model.history.undo(current) {
+                Some(snap) => apply_snapshot(model, snap),
+                None => Task::none(),
+            }
+        }
+        Msg::Redo => {
+            let current = editor_snapshot(model);
+            match model.history.redo(current) {
+                Some(snap) => apply_snapshot(model, snap),
+                None => Task::none(),
+            }
         }
         Msg::UpdatePreviews => request_compile(model),
         Msg::CompileDone(result) => {
@@ -613,11 +617,6 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                     model.candidates = program.previewable_bindings();
                     model.candidate_names =
                         model.candidates.iter().map(|b| b.name.clone()).collect();
-                    model.shape2d_candidate_names = program
-                        .shape2d_bindings()
-                        .into_iter()
-                        .map(|b| b.name)
-                        .collect();
                     model.sketch_binding_names = program.sketch_block_bindings();
                     model.program = Some(program);
                     model.error_message.clear();
@@ -625,8 +624,8 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                     model.diagnostics = diagnostics;
                     refresh_workspace_candidates(model);
                     apply_signature_defaults(model);
-                    for wid in sketch2_ids(model) {
-                        refresh_sketch2_model(model, wid);
+                    for wid in sketch_ids(model) {
+                        refresh_sketch_model(model, wid);
                     }
                     spawn_eval_all(model)
                 }
@@ -649,12 +648,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             }
             Task::none()
         }
-        Msg::Eval2DDone(id, result) => {
-            if let Some(s) = sketch_mut(model, id) {
-                s.apply_eval2d_result(result);
-            }
-            Task::none()
-        }
+
         Msg::Workspace(id, wm) => {
             let Some(w) = model.workspaces.iter_mut().find(|w| w.id() == id) else {
                 return Task::none();
@@ -684,7 +678,6 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                     let suggested = format!("{}_{id}.3mf", base_name(model));
                     model.dialogs.export_3mf(suggested, data)
                 }
-                WorkspaceEvent::CopyRequested(code) => iced::clipboard::write(code),
                 WorkspaceEvent::SketchEdit(edit) => handle_sketch_edit(model, id, edit),
                 WorkspaceEvent::Close => {
                     model.workspaces.retain(|w| w.id() != id);
@@ -726,22 +719,14 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
             let id = model.next_workspace_id;
             model.next_workspace_id += 1;
             let mut s = Sketch::new(id);
-            s.refresh_candidates(&model.shape2d_candidate_names);
-            model.workspaces.push(Workspace::Sketch(s));
-            model.unsaved = true;
-            Task::none()
-        }
-        Msg::AddSketchV2 => {
-            let id = model.next_workspace_id;
-            model.next_workspace_id += 1;
-            let mut s = SketchV2::new(id);
             s.refresh_candidates(&model.sketch_binding_names);
-            model.workspaces.push(Workspace::SketchV2(s));
+            model.workspaces.push(Workspace::Sketch(s));
             model.unsaved = true;
             Task::none()
         }
 
         Msg::NewSession => {
+            model.history.clear();
             model.editor = text_editor::Content::with_text(DEFAULT_EDITOR_TEXT);
             model.current_file_path = None;
             model.error_message.clear();
@@ -755,6 +740,7 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
         Msg::OpenSession => model.dialogs.open_session(),
         Msg::SessionOpened(result) => {
             if let Some((path, db_content, previews)) = result {
+                model.history.clear();
                 model.editor = text_editor::Content::with_text(&db_content);
                 model.current_file_path = Some(path.clone());
                 model.error_message.clear();
@@ -856,6 +842,9 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                         if model.last_modified.is_none_or(|prev| modified > prev) {
                             model.last_modified = Some(modified);
                             if let Ok(content) = std::fs::read_to_string(&db_path) {
+                                model
+                                    .history
+                                    .record(editor_snapshot(model), history::EditKind::Oneshot);
                                 model.editor = text_editor::Content::with_text(&content);
                                 return request_compile(model);
                             }
@@ -869,11 +858,29 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
 }
 
 fn subscription(model: &Model) -> Subscription<Msg> {
-    if model.auto_reload {
+    // エディタ非フォーカス時 (sketch キャンバス操作後など) の undo / redo。
+    // フォーカス時は key_binding 側が処理するため、Ignored なイベントのみ届く
+    // listen_with で二重発火しない。
+    let undo_keys = iced::event::listen_with(|event, status, _window| match (event, status) {
+        (
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }),
+            iced::event::Status::Ignored,
+        ) if modifiers.command() || modifiers.control() => match key.as_ref() {
+            iced::keyboard::Key::Character("z") => Some(if modifiers.shift() {
+                Msg::Redo
+            } else {
+                Msg::Undo
+            }),
+            _ => None,
+        },
+        _ => None,
+    });
+    let reload = if model.auto_reload {
         iced::time::every(std::time::Duration::from_secs(1)).map(|_| Msg::CheckFileChanged)
     } else {
         Subscription::none()
-    }
+    };
+    Subscription::batch([undo_keys, reload])
 }
 
 fn view(model: &Model) -> Element<'_, Msg> {
@@ -890,11 +897,12 @@ fn view(model: &Model) -> Element<'_, Msg> {
         parts::dark_button("Open").on_press(Msg::OpenSession),
         parts::dark_button("Save").on_press(Msg::SaveSession),
         parts::dark_button("Save As").on_press(Msg::SaveSessionAs),
+        parts::dark_button("Undo").on_press(Msg::Undo),
+        parts::dark_button("Redo").on_press(Msg::Redo),
         pick_list(&AddKind::ALL[..], None::<AddKind>, |kind| match kind {
             AddKind::Preview => Msg::AddPreview,
             AddKind::Collision => Msg::AddCollisionCheck,
             AddKind::Sketch => Msg::AddSketch,
-            AddKind::SketchV2 => Msg::AddSketchV2,
         })
         .placeholder("+ Add Workspace"),
         parts::dark_button("Update").on_press(Msg::UpdatePreviews),
@@ -921,7 +929,7 @@ fn view(model: &Model) -> Element<'_, Msg> {
                 };
                 let editor = text_editor(&model.editor)
                     .on_action(Msg::EditorAction)
-                    .key_binding(parts::emacs_key_binding)
+                    .key_binding(|kp| parts::emacs_key_binding(kp, Msg::Undo, Msg::Redo))
                     .highlight_with::<highlight::SpanHighlighter>(hl_settings, highlight::format)
                     .height(Fill);
                 pane_grid::Content::new(editor)

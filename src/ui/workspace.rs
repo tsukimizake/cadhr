@@ -7,13 +7,11 @@ use iced::widget::{column, scrollable, text};
 use iced::{Element, Fill};
 
 use crate::ui::preview::{self, Preview, PreviewMsg};
-use crate::ui::sketch::{self, Sketch, SketchMsg};
-use crate::ui::sketch2::{self, SketchEdit, SketchV2, SketchV2Msg};
+use crate::ui::sketch::{self, Sketch, SketchEdit, SketchMsg};
 
 pub enum Workspace {
     Preview(Preview),
     Sketch(Sketch),
-    SketchV2(SketchV2),
 }
 
 impl Workspace {
@@ -21,7 +19,6 @@ impl Workspace {
         match self {
             Workspace::Preview(p) => p.id,
             Workspace::Sketch(s) => s.id,
-            Workspace::SketchV2(s) => s.id,
         }
     }
 
@@ -37,7 +34,6 @@ impl Workspace {
 pub enum WorkspaceMsg {
     Preview(PreviewMsg),
     Sketch(SketchMsg),
-    SketchV2(SketchV2Msg),
 }
 
 /// workspace 単体では完結しない、Model レベルの後処理要求。
@@ -53,9 +49,7 @@ pub enum WorkspaceEvent {
     TargetChanged,
     /// 3MF export 要求。None はエクスポート対象なし。
     ExportRequested(Option<Vec<u8>>),
-    /// 生成コードをクリップボードへ。
-    CopyRequested(String),
-    /// SketchV2: エディタ本文の書き換えを要する操作 (main.rs が適用する)。
+    /// Sketch: エディタ本文の書き換えを要する操作 (main.rs が適用する)。
     SketchEdit(SketchEdit),
     Close,
     MoveUp,
@@ -67,7 +61,6 @@ impl Workspace {
         match (self, msg) {
             (Workspace::Preview(p), WorkspaceMsg::Preview(m)) => p.update(m),
             (Workspace::Sketch(s), WorkspaceMsg::Sketch(m)) => s.update(m),
-            (Workspace::SketchV2(s), WorkspaceMsg::SketchV2(m)) => s.update(m),
             // id は型をまたいで再利用されないため、型違いの配送は起きない
             (w, m) => unreachable!("workspace #{} received mismatched message {m:?}", w.id()),
         }
@@ -92,9 +85,6 @@ pub fn list_view<'a>(
                     .map(move |m| (id, WorkspaceMsg::Preview(m))),
                 Workspace::Sketch(s) => {
                     sketch::view(s, i, total).map(move |m| (id, WorkspaceMsg::Sketch(m)))
-                }
-                Workspace::SketchV2(s) => {
-                    sketch2::view(s, i, total).map(move |m| (id, WorkspaceMsg::SketchV2(m)))
                 }
             }
         })

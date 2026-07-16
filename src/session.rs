@@ -42,29 +42,10 @@ fn default_zoom() -> f32 {
     20.0
 }
 
-/// 2D sketch workspace の永続化。座標はすべて格子交点スナップ済みの整数
-/// (grid 単位)。
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct SessionSketch {
-    pub sketch_id: u64,
-    #[serde(default)]
-    pub order: usize,
-    #[serde(default)]
-    pub minimized: bool,
-    /// 1 grid 単位あたりのピクセル数。
-    #[serde(default = "default_zoom")]
-    pub zoom: f32,
-    /// 参照表示する Shape2D binding の名前。空なら紐付けなし。
-    #[serde(default)]
-    pub target: String,
-    #[serde(default)]
-    pub shapes: Vec<crate::ui::sketch::SketchShape>,
-}
-
-/// SketchV2 workspace (sketch DSL binding との双方向編集) の永続化。
+/// Sketch workspace (sketch DSL binding との双方向編集) の永続化。
 /// 図形はコード側が真なので、紐付け先 binding 名とビュー状態だけ持つ。
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct SessionSketchV2 {
+pub struct SessionSketch {
     pub sketch_id: u64,
     #[serde(default)]
     pub order: usize,
@@ -81,10 +62,9 @@ pub struct SessionSketchV2 {
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SessionPreviews {
     pub previews: Vec<SessionPreview>,
-    #[serde(default)]
+    /// JSON キーは既存セッションファイルとの互換のため `sketches_v2` のまま。
+    #[serde(default, rename = "sketches_v2")]
     pub sketches: Vec<SessionSketch>,
-    #[serde(default)]
-    pub sketches_v2: Vec<SessionSketchV2>,
 }
 
 pub fn save_session(

@@ -56,8 +56,9 @@ pub fn dark_button<'a, Msg: Clone + 'a>(label: &'a str) -> iced::widget::Button<
     iced::widget::button(label).style(dark_button_style)
 }
 
-// TODO undo/redo
-pub fn emacs_key_binding<Msg>(key_press: KeyPress) -> Option<Binding<Msg>> {
+/// エディタのキーバインド。emacs 風の移動 / 編集に加えて、
+/// Cmd/Ctrl+Z (Shift で redo) と C-/ を undo / redo に割り当てる。
+pub fn emacs_key_binding<Msg>(key_press: KeyPress, undo: Msg, redo: Msg) -> Option<Binding<Msg>> {
     let KeyPress {
         key,
         modifiers,
@@ -67,6 +68,13 @@ pub fn emacs_key_binding<Msg>(key_press: KeyPress) -> Option<Binding<Msg>> {
 
     if !matches!(status, iced::widget::text_editor::Status::Focused { .. }) {
         return None;
+    }
+
+    // KeyPress::key は修飾なしのキーなので shift 有無に関わらず "z" で判定できる
+    if (modifiers.command() || modifiers.control()) && !modifiers.alt() {
+        if let keyboard::Key::Character("z") = key.as_ref() {
+            return Some(Binding::Custom(if modifiers.shift() { redo } else { undo }));
+        }
     }
 
     if !modifiers.control() || modifiers.shift() || modifiers.alt() || modifiers.command() {
@@ -104,6 +112,7 @@ pub fn emacs_key_binding<Msg>(key_press: KeyPress) -> Option<Binding<Msg>> {
             Binding::Copy,
             Binding::Delete,
         ])),
+        keyboard::Key::Character("/") => Some(Binding::Custom(undo)),
         _ => Binding::from_key_press(key_press),
     }
 }
