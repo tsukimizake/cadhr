@@ -80,6 +80,8 @@ pub struct Sketch {
     pub minimized: bool,
     /// 1 grid 単位あたりのピクセル数。
     pub zoom: f32,
+    /// キャンバス中央に表示する world 座標。ホイール / トラックパッドでパンする。
+    pub center: [f32; 2],
     /// 紐付けている sketch binding の名前。空なら未選択。
     pub binding: String,
     pub binding_state: combo_box::State<String>,
@@ -99,6 +101,7 @@ impl Sketch {
             id,
             minimized: false,
             zoom: 20.0,
+            center: [0.0, 0.0],
             binding: String::new(),
             binding_state: combo_box::State::new(Vec::new()),
             model: None,
@@ -113,6 +116,7 @@ impl Sketch {
         let mut s = Self::new(ss.sketch_id);
         s.minimized = ss.minimized;
         s.zoom = ss.zoom;
+        s.center = ss.center;
         s.binding = ss.binding.clone();
         s
     }
@@ -123,7 +127,16 @@ impl Sketch {
             order,
             minimized: self.minimized,
             zoom: self.zoom,
+            center: self.center,
             binding: self.binding.clone(),
+        }
+    }
+
+    /// キャンバス描画・座標変換に使う視点。
+    fn view(&self) -> View {
+        View {
+            zoom: self.zoom,
+            center: self.center,
         }
     }
 
@@ -161,6 +174,17 @@ impl Sketch {
             }
             SketchMsg::ZoomChanged(zoom) => {
                 self.zoom = zoom;
+                self.cache.clear();
+                WorkspaceEvent::Edited
+            }
+            SketchMsg::Panned(delta) => {
+                self.center[0] += delta[0];
+                self.center[1] += delta[1];
+                self.cache.clear();
+                WorkspaceEvent::Edited
+            }
+            SketchMsg::ResetView => {
+                self.center = [0.0, 0.0];
                 self.cache.clear();
                 WorkspaceEvent::Edited
             }
@@ -218,6 +242,10 @@ pub enum SketchMsg {
     MoveDown,
     Minimize,
     ZoomChanged(f32),
+    /// スクロールによるパン (world 座標での中心移動量)。
+    Panned([f32; 2]),
+    /// パンを原点に戻す。
+    ResetView,
     SetTool(Tool),
     BindingChanged(String),
     SelectGeom(String),
@@ -246,19 +274,26 @@ const SNAP_INDICATOR: Color = Color::from_rgba(0.95, 0.85, 0.4, 0.8);
 /// hover / ドラッグ中のハンドルと、それに連動して動くハンドルの強調色。
 const LINKED_HANDLE: Color = Color::from_rgb(0.25, 0.95, 0.35);
 
-/// キャンバスの中心が world 原点。y は上向き。
-fn to_screen(zoom: f32, size: Size, p: [f64; 2]) -> Point {
+/// キャンバス描画の視点。`center` の world 座標がキャンバス中央に来る。
+#[derive(Clone, Copy)]
+struct View {
+    zoom: f32,
+    center: [f32; 2],
+}
+
+/// world 座標 → スクリーン座標。y は上向き。
+fn to_screen(view: View, size: Size, p: [f64; 2]) -> Point {
     Point::new(
-        size.width / 2.0 + p[0] as f32 * zoom,
-        size.height / 2.0 - p[1] as f32 * zoom,
+        size.width / 2.0 + (p[0] as f32 - view.center[0]) * view.zoom,
+        size.height / 2.0 - (p[1] as f32 - view.center[1]) * view.zoom,
     )
 }
 
 /// 最寄りの格子交点にスナップした world 座標。
-fn snap(zoom: f32, size: Size, local: Point) -> [f64; 2] {
+fn snap(view: View, size: Size, local: Point) -> [f64; 2] {
     [
-        ((local.x - size.width / 2.0) / zoom).round() as f64,
-        ((size.height / 2.0 - local.y) / zoom).round() as f64,
+        ((local.x - size.width / 2.0) / view.zoom + view.center[0]).round() as f64,
+        ((size.height / 2.0 - local.y) / view.zoom + view.center[1]).round() as f64,
     ]
 }
 
@@ -300,8 +335,8 @@ impl SketchCanvas<'_> {
     /// カーソル位置のハンドルを探す。頂点系を円周 (半径ドラッグ) より優先する。
     fn hit_test(&self, size: Size, cursor: Point) -> Option<DragTarget> {
         let model = self.sketch.model.as_ref()?;
-        let zoom = self.sketch.zoom;
-        let near = |p: [f64; 2]| -> bool { to_screen(zoom, size, p).distance(cursor) <= HIT_PX };
+        let view = self.sketch.view();
+        let near = |p: [f64; 2]| -> bool { to_screen(view, size, p).distance(cursor) <= HIT_PX };
         for (gi, geom) in model.geoms.iter().enumerate() {
             match geom {
                 SketchGeom::Point { pos, .. } => {
@@ -333,8 +368,8 @@ impl SketchCanvas<'_> {
         }
         for (gi, geom) in model.geoms.iter().enumerate() {
             if let SketchGeom::Circle { center, radius, .. } = geom {
-                let d = to_screen(zoom, size, *center).distance(cursor);
-                if (d - *radius as f32 * zoom).abs() <= HIT_PX {
+                let d = to_screen(view, size, *center).distance(cursor);
+                if (d - *radius as f32 * view.zoom).abs() <= HIT_PX {
                     return Some(DragTarget::CircleRadius { geom: gi });
                 }
             }
@@ -414,7 +449,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
         let canvas::Event::Mouse(mouse_event) = event else {
             return None;
         };
-        let zoom = self.sketch.zoom;
+        let view = self.sketch.view();
         match mouse_event {
             mouse::Event::ButtonPressed(mouse::Button::Left) => {
                 let pos = cursor.position_in(bounds)?;
@@ -425,22 +460,34 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                         Some(canvas::Action::request_redraw().and_capture())
                     }
                     Tool::Point => {
-                        let p = snap(zoom, bounds.size(), pos);
+                        let p = snap(view, bounds.size(), pos);
                         Some(canvas::Action::publish(SketchMsg::PointAdded(p)).and_capture())
                     }
                     Tool::Line | Tool::Circle => {
-                        let p = snap(zoom, bounds.size(), pos);
+                        let p = snap(view, bounds.size(), pos);
                         *state = DragState::Draw { start: p, hover: p };
                         Some(canvas::Action::request_redraw().and_capture())
                     }
                 }
+            }
+            mouse::Event::WheelScrolled { delta } => {
+                // カーソルがキャンバス上にあるときだけパンし、イベントを消費して
+                // 外側の workspace リストのスクロールに渡さない
+                cursor.position_in(bounds)?;
+                let (dx, dy) = match delta {
+                    mouse::ScrollDelta::Lines { x, y } => (x * 40.0, y * 40.0),
+                    mouse::ScrollDelta::Pixels { x, y } => (*x, *y),
+                };
+                // scrollable と同じ向き: スクロールでシート (描画内容) が動く
+                let world = [-dx / view.zoom, dy / view.zoom];
+                Some(canvas::Action::publish(SketchMsg::Panned(world)).and_capture())
             }
             mouse::Event::CursorMoved { .. } => {
                 let pos = cursor.position_in(bounds);
                 match state {
                     DragState::Handle { target, last } => {
                         let pos = pos?;
-                        let world = snap(zoom, bounds.size(), pos);
+                        let world = snap(view, bounds.size(), pos);
                         let value = self.drag_value(*target, world)?;
                         if *last == Some(value) {
                             return None;
@@ -455,7 +502,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                     }
                     DragState::Draw { hover, .. } => {
                         let pos = pos?;
-                        let p = snap(zoom, bounds.size(), pos);
+                        let p = snap(view, bounds.size(), pos);
                         if *hover == p {
                             return None;
                         }
@@ -464,7 +511,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                     }
                     _ => {
                         match pos {
-                            Some(p) => *state = DragState::Hover(snap(zoom, bounds.size(), p)),
+                            Some(p) => *state = DragState::Hover(snap(view, bounds.size(), p)),
                             None => *state = DragState::Idle,
                         }
                         Some(canvas::Action::request_redraw())
@@ -480,7 +527,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                     DragState::Draw { start, .. } => {
                         // キャンバス外で離した場合はキャンセル
                         let pos = cursor.position_in(bounds)?;
-                        let end = snap(zoom, bounds.size(), pos);
+                        let end = snap(view, bounds.size(), pos);
                         match self.sketch.tool {
                             Tool::Line if start != end => Some(
                                 canvas::Action::publish(SketchMsg::LineAdded(start, end))
@@ -514,7 +561,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let zoom = self.sketch.zoom;
+        let view = self.sketch.view();
         let base = self.sketch.cache.draw(renderer, bounds.size(), |frame| {
             let size = frame.size();
             frame.fill_rectangle(Point::ORIGIN, size, parts::CANVAS_BACKGROUND);
@@ -522,20 +569,24 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
             // 低ズーム時はグリッド線を間引く (スナップ自体は常に 1 grid 単位)
             let step = [1, 5, 10, 50]
                 .into_iter()
-                .find(|s| *s as f32 * zoom >= 4.0)
+                .find(|s| *s as f32 * view.zoom >= 4.0)
                 .unwrap_or(100);
-            let nx = (size.width / (2.0 * zoom)).ceil() as i32;
-            let ny = (size.height / (2.0 * zoom)).ceil() as i32;
-            for i in (-nx..=nx).filter(|i| i % step == 0) {
-                let x = size.width / 2.0 + i as f32 * zoom;
+            let half_w = size.width / (2.0 * view.zoom);
+            let half_h = size.height / (2.0 * view.zoom);
+            let x_min = (view.center[0] - half_w).floor() as i32;
+            let x_max = (view.center[0] + half_w).ceil() as i32;
+            for i in (x_min..=x_max).filter(|i| i % step == 0) {
+                let x = to_screen(view, size, [i as f64, 0.0]).x;
                 let color = if i == 0 { AXIS } else { GRID };
                 frame.stroke(
                     &Path::line(Point::new(x, 0.0), Point::new(x, size.height)),
                     Stroke::default().with_width(1.0).with_color(color),
                 );
             }
-            for j in (-ny..=ny).filter(|j| j % step == 0) {
-                let y = size.height / 2.0 + j as f32 * zoom;
+            let y_min = (view.center[1] - half_h).floor() as i32;
+            let y_max = (view.center[1] + half_h).ceil() as i32;
+            for j in (y_min..=y_max).filter(|j| j % step == 0) {
+                let y = to_screen(view, size, [0.0, j as f64]).y;
                 let color = if j == 0 { AXIS } else { GRID };
                 frame.stroke(
                     &Path::line(Point::new(0.0, y), Point::new(size.width, y)),
@@ -549,7 +600,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
             for geom in &model.geoms {
                 match geom {
                     SketchGeom::Point { pos, .. } => {
-                        let c = to_screen(zoom, size, *pos);
+                        let c = to_screen(view, size, *pos);
                         let cross = Stroke::default().with_width(2.0).with_color(POINT_COLOR);
                         frame.stroke(
                             &Path::line(
@@ -567,8 +618,8 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                         );
                     }
                     SketchGeom::Segment { a, b, .. } => {
-                        let pa = to_screen(zoom, size, *a);
-                        let pb = to_screen(zoom, size, *b);
+                        let pa = to_screen(view, size, *a);
+                        let pb = to_screen(view, size, *b);
                         frame.stroke(
                             &Path::line(pa, pb),
                             Stroke::default().with_width(2.0).with_color(SEGMENT_COLOR),
@@ -586,21 +637,21 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                             LINE
                         };
                         let path = Path::new(|b| {
-                            b.move_to(to_screen(zoom, size, verts[0]));
+                            b.move_to(to_screen(view, size, verts[0]));
                             for v in &verts[1..] {
-                                b.line_to(to_screen(zoom, size, *v));
+                                b.line_to(to_screen(view, size, *v));
                             }
                             b.close();
                         });
                         frame.stroke(&path, Stroke::default().with_width(2.0).with_color(color));
                         for v in verts {
-                            frame.fill(&Path::circle(to_screen(zoom, size, *v), 3.5), HANDLE);
+                            frame.fill(&Path::circle(to_screen(view, size, *v), 3.5), HANDLE);
                         }
                     }
                     SketchGeom::Circle { center, radius, .. } => {
-                        let c = to_screen(zoom, size, *center);
+                        let c = to_screen(view, size, *center);
                         frame.stroke(
-                            &Path::circle(c, *radius as f32 * zoom),
+                            &Path::circle(c, *radius as f32 * view.zoom),
                             Stroke::default().with_width(2.0).with_color(LINE),
                         );
                         frame.fill(&Path::circle(c, 3.5), HANDLE);
@@ -626,26 +677,29 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                     if let Some(SketchGeom::Circle { center, radius, .. }) = model.geoms.get(geom)
                     {
                         overlay.stroke(
-                            &Path::circle(to_screen(zoom, osize, *center), *radius as f32 * zoom),
+                            &Path::circle(
+                                to_screen(view, osize, *center),
+                                *radius as f32 * view.zoom,
+                            ),
                             Stroke::default().with_width(3.0).with_color(LINKED_HANDLE),
                         );
                     }
                 } else if let Some(pos) = target_pos(model, t) {
-                    overlay.fill(&Path::circle(to_screen(zoom, osize, pos), 5.0), LINKED_HANDLE);
+                    overlay.fill(&Path::circle(to_screen(view, osize, pos), 5.0), LINKED_HANDLE);
                 }
             }
         }
 
         match state {
             DragState::Draw { start, hover } => {
-                let ps = to_screen(zoom, osize, *start);
-                let ph = to_screen(zoom, osize, *hover);
+                let ps = to_screen(view, osize, *start);
+                let ph = to_screen(view, osize, *hover);
                 match self.sketch.tool {
                     Tool::Circle => {
                         let r = grid_distance(*start, *hover);
                         if r > 0.0 {
                             overlay.stroke(
-                                &Path::circle(ps, r as f32 * zoom),
+                                &Path::circle(ps, r as f32 * view.zoom),
                                 Stroke::default().with_width(2.0).with_color(DRAG_PREVIEW),
                             );
                         }
@@ -665,7 +719,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
             }
             DragState::Hover(p) => {
                 if self.sketch.tool != Tool::Select {
-                    overlay.fill(&Path::circle(to_screen(zoom, osize, *p), 4.0), SNAP_INDICATOR);
+                    overlay.fill(&Path::circle(to_screen(view, osize, *p), 4.0), SNAP_INDICATOR);
                 }
             }
             _ => {}
@@ -766,6 +820,8 @@ pub fn view<'a>(s: &'a Sketch, index: usize, total: usize) -> Element<'a, Sketch
     let zoom_row = row![
         text(format!("zoom: {:.0}px/grid", s.zoom)).size(13),
         slider(1.0..=25.0, s.zoom, SketchMsg::ZoomChanged),
+        text(format!("center: ({:.0}, {:.0})", s.center[0], s.center[1])).size(13),
+        parts::dark_button("origin").on_press(SketchMsg::ResetView),
     ]
     .spacing(8);
 

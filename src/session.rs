@@ -54,6 +54,9 @@ pub struct SessionSketch {
     /// 1 grid 単位あたりのピクセル数。
     #[serde(default = "default_zoom")]
     pub zoom: f32,
+    /// キャンバス中央に表示する world 座標 (パン位置)。
+    #[serde(default)]
+    pub center: [f32; 2],
     /// 紐付ける sketch binding の名前。空なら未選択。
     #[serde(default)]
     pub binding: String,
