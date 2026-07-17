@@ -204,12 +204,18 @@ impl Sketch {
                 WorkspaceEvent::SketchEdit(SketchEdit::Refresh)
             }
             SketchMsg::SelectGeom(name) => {
-                let is_poly = self.model.as_ref().is_some_and(|m| {
-                    m.geoms
-                        .iter()
-                        .any(|g| g.name() == name && matches!(g, SketchGeom::Polygon { .. }))
-                });
-                self.active_poly = if is_poly { Some(name) } else { None };
+                // 選択中の polygon をもう一度クリックしたら解除 (トグル)
+                if self.active_poly.as_deref() == Some(&name) {
+                    self.active_poly = None;
+                } else {
+                    let is_poly = self.model.as_ref().is_some_and(|m| {
+                        m.geoms
+                            .iter()
+                            .any(|g| g.name() == name && matches!(g, SketchGeom::Polygon { .. }))
+                    });
+                    self.active_poly = if is_poly { Some(name) } else { None };
+                }
+                self.cache.clear();
                 WorkspaceEvent::None
             }
             SketchMsg::RemoveGeom(name) => {
