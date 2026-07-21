@@ -98,6 +98,40 @@ fn as_shape3d(v: &Value) -> Result<Model3D, String> {
     }
 }
 
+/// Edge 値 (opaque) から (p1, p2, n1, n2) を取り出す。
+/// Edge の内部表現は `Value::Opaque("Edge", [Point3D p1, Point3D p2, Point3D n1, Point3D n2])`。
+fn as_edge(
+    v: &Value,
+) -> Result<((f64, f64, f64), (f64, f64, f64), (f64, f64, f64), (f64, f64, f64)), String> {
+    match v {
+        Value::Opaque(tag, args) if tag == "Edge" && args.len() == 4 => {
+            let p1 = as_point3d(&args[0])?;
+            let p2 = as_point3d(&args[1])?;
+            let n1 = as_point3d(&args[2])?;
+            let n2 = as_point3d(&args[3])?;
+            Ok((p1, p2, n1, n2))
+        }
+        _ => Err(format!("Edge が期待されましたが {v} でした")),
+    }
+}
+
+fn edge_value(
+    p1: (f64, f64, f64),
+    p2: (f64, f64, f64),
+    n1: (f64, f64, f64),
+    n2: (f64, f64, f64),
+) -> Value {
+    Value::Opaque(
+        "Edge".to_string(),
+        vec![
+            point3d_value(p1.0, p1.1, p1.2),
+            point3d_value(p2.0, p2.1, p2.2),
+            point3d_value(n1.0, n1.1, n1.2),
+            point3d_value(n2.0, n2.1, n2.2),
+        ],
+    )
+}
+
 /// Point2D / Point3D は record 値 (`{ x, y }` / `{ x, y, z }`) として表現する。
 fn point2d_value(x: f64, y: f64) -> Value {
     Value::Record(vec![
@@ -493,6 +527,36 @@ pub fn registry() -> BuiltinEvalRegistry {
             RECORDED_CONTROLS.with(|r| r.borrow_mut().push((name, current)));
             Ok(point2d_value(current[0], current[1]))
         })
+    // -- edgeNearPoint: hit_point に一番近い shape の sharp edge を Edge 値で返す。
+    //    Shape3D を実際に manifold 評価し、隣接 2 面の法線を含めて返す。
+    .add("edgeNearPoint", 2, |args| {
+        let hit = as_point3d(&args[0])?;
+        let model = as_shape3d(&args[1])?;
+        let paths = INCLUDE_PATHS.with(|p| p.borrow().clone());
+        // preview の sharp-edge 抽出と同じ 25° を採用。
+        let edge = crate::runtime::manifold_bridge::find_edge_near_point(
+            &model, &paths, hit, 25.0,
+        )
+        .map_err(|e| format!("edgeNearPoint: {e}"))?
+        .ok_or_else(|| {
+            "edgeNearPoint: shape に sharp edge が見つかりませんでした".to_string()
+        })?;
+        Ok(edge_value(edge.p1, edge.p2, edge.n1, edge.n2))
+    })
+    // -- chamfer: 指定 Edge を 45° の cutting prism で削って shape を返す。
+    .add("chamfer", 3, |args| {
+        let size = as_f64(&args[0])?;
+        let (p1, p2, n1, n2) = as_edge(&args[1])?;
+        let shape = as_shape3d(&args[2])?;
+        Ok(Value::Shape3D(Model3D::Chamfer {
+            shape: Box::new(shape),
+            p1,
+            p2,
+            n1,
+            n2,
+            size,
+        }))
+    })
     // -- Debug.log : String -> a -> a (Elm 互換。stderr に出力して値をそのまま返す)
     .add("Debug.log", 2, |args| {
         let tag = as_string(&args[0]).unwrap_or_else(|_| format!("{}", args[0]));

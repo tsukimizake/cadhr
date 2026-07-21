@@ -289,6 +289,73 @@ pub fn generate_ray_from_uv(
     )
 }
 
+/// Ray-triangle intersection (Möller-Trumbore)。
+/// 前方 (t > 0) の hit 距離を返す。
+#[allow(dead_code)]
+pub fn ray_triangle_intersect(
+    origin: &[f64; 3],
+    dir: &[f64; 3],
+    v0: &[f64; 3],
+    v1: &[f64; 3],
+    v2: &[f64; 3],
+) -> Option<f64> {
+    let eps = 1e-9;
+    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+    let p = [
+        dir[1] * e2[2] - dir[2] * e2[1],
+        dir[2] * e2[0] - dir[0] * e2[2],
+        dir[0] * e2[1] - dir[1] * e2[0],
+    ];
+    let det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+    if det.abs() < eps {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let s = [origin[0] - v0[0], origin[1] - v0[1], origin[2] - v0[2]];
+    let u = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) * inv_det;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = [
+        s[1] * e1[2] - s[2] * e1[1],
+        s[2] * e1[0] - s[0] * e1[2],
+        s[0] * e1[1] - s[1] * e1[0],
+    ];
+    let v = (dir[0] * q[0] + dir[1] * q[1] + dir[2] * q[2]) * inv_det;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv_det;
+    if t > eps { Some(t) } else { None }
+}
+
+/// mesh 全体に対して ray-triangle intersection を回し、最も近い hit point (world 座標) を返す。
+/// `vertices` は Vertex 配列、`indices` は 3n 個の u32 (三角形リスト)。
+#[allow(dead_code)]
+pub fn ray_mesh_intersect(
+    origin: &[f64; 3],
+    dir: &[f64; 3],
+    vertices: &[pipeline::Vertex],
+    indices: &[u32],
+) -> Option<[f64; 3]> {
+    let mut best_t: Option<f64> = None;
+    for tri in indices.chunks_exact(3) {
+        let v0p = &vertices[tri[0] as usize].position;
+        let v1p = &vertices[tri[1] as usize].position;
+        let v2p = &vertices[tri[2] as usize].position;
+        let v0 = [v0p[0] as f64, v0p[1] as f64, v0p[2] as f64];
+        let v1 = [v1p[0] as f64, v1p[1] as f64, v1p[2] as f64];
+        let v2 = [v2p[0] as f64, v2p[1] as f64, v2p[2] as f64];
+        if let Some(t) = ray_triangle_intersect(origin, dir, &v0, &v1, &v2) {
+            if best_t.is_none_or(|b| t < b) {
+                best_t = Some(t);
+            }
+        }
+    }
+    best_t.map(|t| [origin[0] + t * dir[0], origin[1] + t * dir[1], origin[2] + t * dir[2]])
+}
+
 /// Ray-sphere intersection, returns distance t or None.
 #[allow(dead_code)]
 pub fn ray_sphere_intersect(

@@ -95,7 +95,294 @@ pub fn evaluate_with_paths(
             plane,
             path,
         } => sweep_polygon(profile, *plane, path),
+        Model3D::Chamfer {
+            shape,
+            p1,
+            p2,
+            n1,
+            n2,
+            size,
+        } => {
+            let base = evaluate_with_paths(shape, include_paths)?;
+            let cutter = chamfer_cutter_manifold(*p1, *p2, *n1, *n2, *size)?;
+            Ok(base.difference(&cutter))
+        }
     }
+}
+
+/// Chamfer 用の三角柱 (cutter) を Manifold として組み立てる。
+///
+/// 断面の 3 頂点 (edge 直交平面上):
+///   - P (edge 点そのもの)
+///   - P - size * n2  (face1 に沿って edge から遠ざかる方向)
+///   - P - size * n1  (face2 に沿って edge から遠ざかる方向)
+///
+/// 上記断面を p1 から p2 へ +axial に伸ばした三角柱に、両端 cap を付けて閉じたメッシュとする。
+/// n1, n2 は shape の外向き法線 (2 隣接面の face normal) を想定。
+fn chamfer_cutter_manifold(
+    p1: (f64, f64, f64),
+    p2: (f64, f64, f64),
+    n1: (f64, f64, f64),
+    n2: (f64, f64, f64),
+    size: f64,
+) -> Result<Manifold, BridgeError> {
+    if size <= 0.0 {
+        return Err(BridgeError::InvalidShape(format!(
+            "chamfer: size は正の値を要求 (実際: {size})"
+        )));
+    }
+    let n1a = normalize3([n1.0, n1.1, n1.2]);
+    let n2a = normalize3([n2.0, n2.1, n2.2]);
+    // edge に沿った単位ベクトル。両端で prism を size 分だけ延長し、隣接面と
+    // 接する corner をきれいに切り抜けるようにする。
+    let raw_delta = [p2.0 - p1.0, p2.1 - p1.1, p2.2 - p1.2];
+    let raw_len = norm3(raw_delta);
+    if raw_len < 1e-9 {
+        return Err(BridgeError::InvalidShape(
+            "chamfer: edge の 2 端点が縮退しています".to_string(),
+        ));
+    }
+    let axis = [
+        raw_delta[0] / raw_len,
+        raw_delta[1] / raw_len,
+        raw_delta[2] / raw_len,
+    ];
+    let overshoot = size;
+    let p1_ext = (
+        p1.0 - axis[0] * overshoot,
+        p1.1 - axis[1] * overshoot,
+        p1.2 - axis[2] * overshoot,
+    );
+    let p2_ext = (
+        p2.0 + axis[0] * overshoot,
+        p2.1 + axis[1] * overshoot,
+        p2.2 + axis[2] * overshoot,
+    );
+    // n1 と n2 は edge 周りの 2 面の外向き法線。三角断面のインセット方向は
+    // それぞれ face1 に沿う (-n2) / face2 に沿う (-n1) だが、実際は「edge から
+    // 面上を離れる方向 = 相手側 face の外向き法線を反転したもの」なので上記でよい。
+    // 断面の 3 頂点 (p1_ext に対して展開):
+    let apex = [p1_ext.0, p1_ext.1, p1_ext.2];
+    let corner_a = [
+        p1_ext.0 - size * n2a[0],
+        p1_ext.1 - size * n2a[1],
+        p1_ext.2 - size * n2a[2],
+    ];
+    let corner_b = [
+        p1_ext.0 - size * n1a[0],
+        p1_ext.1 - size * n1a[1],
+        p1_ext.2 - size * n1a[2],
+    ];
+    // p1_ext → p2_ext への並進 delta。
+    let delta = [
+        p2_ext.0 - p1_ext.0,
+        p2_ext.1 - p1_ext.1,
+        p2_ext.2 - p1_ext.2,
+    ];
+    let apex_far = [apex[0] + delta[0], apex[1] + delta[1], apex[2] + delta[2]];
+    let ca_far = [
+        corner_a[0] + delta[0],
+        corner_a[1] + delta[1],
+        corner_a[2] + delta[2],
+    ];
+    let cb_far = [
+        corner_b[0] + delta[0],
+        corner_b[1] + delta[1],
+        corner_b[2] + delta[2],
+    ];
+
+    // 頂点順: 0..=2 が near cap, 3..=5 が far cap。
+    //   0: apex,     1: corner_a, 2: corner_b
+    //   3: apex_far, 4: ca_far,   5: cb_far
+    let verts: [[f64; 3]; 6] = [apex, corner_a, corner_b, apex_far, ca_far, cb_far];
+    // 三角柱を outward CCW でメッシュ化する。
+    //   near cap  (delta 反対側, 法線 -delta 側): [0, 1, 2]
+    //   far cap   (delta 側,     法線 +delta 側): [3, 5, 4]
+    //   wall1 (face1 側): [0, 3, 4], [0, 4, 1]
+    //   wall2 (hypotenuse): [1, 4, 5], [1, 5, 2]
+    //   wall3 (face2 側): [2, 5, 3], [2, 3, 0]
+    //
+    // corner_a / corner_b は n1 / n2 の関係で入れ替わりうるので、signed volume 判定で
+    // winding が inward だったら全体を反転させて outward CCW を保証する。
+    let mut tris: Vec<[u32; 3]> = vec![
+        [0, 1, 2],
+        [3, 5, 4],
+        [0, 3, 4],
+        [0, 4, 1],
+        [1, 4, 5],
+        [1, 5, 2],
+        [2, 5, 3],
+        [2, 3, 0],
+    ];
+
+    // 6 頂点の重心を internal point とみなす。全 tri の signed volume 合計が
+    // 負なら winding が inward、正なら outward。inward なら反転する。
+    let mut centroid = [0.0f64; 3];
+    for v in &verts {
+        centroid[0] += v[0];
+        centroid[1] += v[1];
+        centroid[2] += v[2];
+    }
+    centroid[0] /= verts.len() as f64;
+    centroid[1] /= verts.len() as f64;
+    centroid[2] /= verts.len() as f64;
+    let mut signed_vol = 0.0f64;
+    for t in &tris {
+        let a = verts[t[0] as usize];
+        let b = verts[t[1] as usize];
+        let c = verts[t[2] as usize];
+        let ap = [a[0] - centroid[0], a[1] - centroid[1], a[2] - centroid[2]];
+        let bp = [b[0] - centroid[0], b[1] - centroid[1], b[2] - centroid[2]];
+        let cp = [c[0] - centroid[0], c[1] - centroid[1], c[2] - centroid[2]];
+        let cross = cross3(bp, cp);
+        signed_vol += ap[0] * cross[0] + ap[1] * cross[1] + ap[2] * cross[2];
+    }
+    if signed_vol < 0.0 {
+        for t in &mut tris {
+            t.swap(1, 2);
+        }
+    }
+
+    let mut flat_verts: Vec<f32> = Vec::with_capacity(verts.len() * 3);
+    for v in &verts {
+        flat_verts.push(v[0] as f32);
+        flat_verts.push(v[1] as f32);
+        flat_verts.push(v[2] as f32);
+    }
+    let mut flat_indices: Vec<u32> = Vec::with_capacity(tris.len() * 3);
+    for t in &tris {
+        flat_indices.push(t[0]);
+        flat_indices.push(t[1]);
+        flat_indices.push(t[2]);
+    }
+    Manifold::from_mesh_f32(&flat_verts, 3, &flat_indices).map_err(|e| {
+        BridgeError::InvalidShape(format!("chamfer cutter の manifold 化失敗: {e}"))
+    })
+}
+
+/// 与えられた `Model3D` を manifold 化し、hit_point に一番近い sharp edge を
+/// (p1, p2, n1, n2) の 4 点で返す。sharp edge = 隣接 2 面の法線が閾値以上開いている辺。
+///
+/// `angle_thresh_deg` を超える隣接三角形しか候補にしない。
+/// 見つからなければ `None`。
+pub fn find_edge_near_point(
+    model: &Model3D,
+    include_paths: &[PathBuf],
+    hit_point: (f64, f64, f64),
+    angle_thresh_deg: f64,
+) -> Result<Option<EdgeHit>, BridgeError> {
+    let manifold = evaluate_with_paths(model, include_paths)?;
+    let (vert_props, num_props, indices) = manifold.to_mesh_f32();
+    if num_props == 0 || indices.is_empty() {
+        return Ok(None);
+    }
+    let n_verts = vert_props.len() / num_props;
+    let mut positions: Vec<[f64; 3]> = Vec::with_capacity(n_verts);
+    for i in 0..n_verts {
+        let base = i * num_props;
+        positions.push([
+            vert_props[base] as f64,
+            vert_props[base + 1] as f64,
+            vert_props[base + 2] as f64,
+        ]);
+    }
+
+    // 位置ベース canonical index (同座標の頂点をマージ)
+    use std::collections::HashMap;
+    let mut pos_map: HashMap<(u32, u32, u32), u32> = HashMap::new();
+    let mut canonical: Vec<u32> = Vec::with_capacity(n_verts);
+    let mut canon_pos: Vec<[f64; 3]> = Vec::new();
+    for i in 0..n_verts {
+        let key = (
+            (positions[i][0] as f32).to_bits(),
+            (positions[i][1] as f32).to_bits(),
+            (positions[i][2] as f32).to_bits(),
+        );
+        let next_id = pos_map.len() as u32;
+        let entry = *pos_map.entry(key).or_insert(next_id);
+        canonical.push(entry);
+        if entry as usize == canon_pos.len() {
+            canon_pos.push(positions[i]);
+        }
+    }
+
+    // 三角形ごとに face normal を計算
+    let tri_count = indices.len() / 3;
+    if tri_count == 0 {
+        return Ok(None);
+    }
+    let mut tri_normals: Vec<[f64; 3]> = Vec::with_capacity(tri_count);
+    for tri in indices.chunks_exact(3) {
+        let p0 = positions[tri[0] as usize];
+        let p1 = positions[tri[1] as usize];
+        let p2 = positions[tri[2] as usize];
+        let e01 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        let e02 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+        tri_normals.push(normalize3(cross3(e01, e02)));
+    }
+
+    // canonical edge (min, max) → 隣接 tri index
+    let mut edge_tris: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    for (ti, tri) in indices.chunks_exact(3).enumerate() {
+        let a = canonical[tri[0] as usize];
+        let b = canonical[tri[1] as usize];
+        let c = canonical[tri[2] as usize];
+        for (e0, e1) in [(a, b), (b, c), (c, a)] {
+            let key = if e0 < e1 { (e0, e1) } else { (e1, e0) };
+            edge_tris.entry(key).or_default().push(ti);
+        }
+    }
+
+    let cos_thresh = angle_thresh_deg.to_radians().cos();
+    let mut best: Option<(f64, EdgeHit)> = None;
+    for ((ea, eb), tris) in &edge_tris {
+        if tris.len() != 2 {
+            continue;
+        }
+        let n_a = tri_normals[tris[0]];
+        let n_b = tri_normals[tris[1]];
+        // 平坦すぎる (dot ≈ 1) 辺は candidate から外す
+        if dot3(n_a, n_b) >= cos_thresh {
+            continue;
+        }
+        let pa = canon_pos[*ea as usize];
+        let pb = canon_pos[*eb as usize];
+        let dist = point_segment_distance(hit_point, pa, pb);
+        if best.as_ref().is_none_or(|(bd, _)| dist < *bd) {
+            best = Some((
+                dist,
+                EdgeHit {
+                    p1: (pa[0], pa[1], pa[2]),
+                    p2: (pb[0], pb[1], pb[2]),
+                    n1: (n_a[0], n_a[1], n_a[2]),
+                    n2: (n_b[0], n_b[1], n_b[2]),
+                },
+            ));
+        }
+    }
+    Ok(best.map(|(_, h)| h))
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeHit {
+    pub p1: (f64, f64, f64),
+    pub p2: (f64, f64, f64),
+    pub n1: (f64, f64, f64),
+    pub n2: (f64, f64, f64),
+}
+
+fn point_segment_distance(p: (f64, f64, f64), a: [f64; 3], b: [f64; 3]) -> f64 {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ap = [p.0 - a[0], p.1 - a[1], p.2 - a[2]];
+    let ab_len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    let t = if ab_len2 <= 1e-24 {
+        0.0
+    } else {
+        ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / ab_len2).clamp(0.0, 1.0)
+    };
+    let closest = [a[0] + t * ab[0], a[1] + t * ab[1], a[2] + t * ab[2]];
+    let d = [p.0 - closest[0], p.1 - closest[1], p.2 - closest[2]];
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
 }
 
 /// `include_paths = &[]` で呼ぶラッパ。STL を使わない場合はこれで十分。

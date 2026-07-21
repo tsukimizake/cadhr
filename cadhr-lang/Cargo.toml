@@ -2,16 +2,13 @@
 name = "cadhr-lang"
 version = "0.1.0"
 edition = "2024"
-# cadhr-lang/examples/ はユーザー個人のユーティリティ (.gitignore 済み)。
-# 自動 example target としての取り込みを無効化する。
-autoexamples = false
 
 [lib]
 name = "cadhr_lang"
 path = "src/lib.rs"
 
 [[bin]]
-name = "main"
+name = "cadhr-lang"
 path = "src/main.rs"
 
 [features]

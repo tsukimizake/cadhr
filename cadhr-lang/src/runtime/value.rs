@@ -208,6 +208,17 @@ pub enum Model3D {
         plane: Plane3D,
         path: Vec<(f64, f64, f64)>,
     },
+    /// 指定した一辺 (p1, p2) を挟む 2 面 (法線 n1, n2) の 45° chamfer。
+    /// `manifold_bridge` が (p1,p2) を軸として `size` サイズの三角柱を構築し、
+    /// 内側 (`-n1`, `-n2` 方向) で `shape` から差し引く。
+    Chamfer {
+        shape: Box<Model3D>,
+        p1: (f64, f64, f64),
+        p2: (f64, f64, f64),
+        n1: (f64, f64, f64),
+        n2: (f64, f64, f64),
+        size: f64,
+    },
     Empty,
 }
 
