@@ -570,31 +570,46 @@ impl<'a> Block<'a> {
     }
 
     /// 座標式 `e` に目標値 `target` を流し、書き換えるリテラル葉と新値を返す。
-    fn invert(&self, e: &Expr, target: f64) -> Result<(Leaf, f64), SolveErr> {
+    fn invert(&self, e: &Expr, target: f64) -> Result<Write<'a>, SolveErr> {
         // 座標式全体が符号付きリテラル → 匿名 var として書き込み可
-        if let Some((_, leaf)) = signed_lit_leaf(e) {
-            return Ok((leaf, target));
+        if let Some((cur, leaf)) = signed_lit_leaf(e) {
+            return Ok(Write {
+                leaf,
+                value: target,
+                var: None,
+                current: cur,
+            });
         }
         self.invert_inner(e, target)
     }
 
-    fn invert_inner(&self, e: &Expr, target: f64) -> Result<(Leaf, f64), SolveErr> {
+    fn invert_inner(&self, e: &Expr, target: f64) -> Result<Write<'a>, SolveErr> {
         match e {
             Expr::Var {
                 module: None, name, ..
             } => match self.by_name.get(name.as_str()) {
                 Some(b) if b.kind == SketchBindKind::Var => {
                     // var の RHS は符号付きリテラル (validation 保証)
-                    let (_, leaf) = signed_lit_leaf(&b.body).ok_or(SolveErr::ReadOnly)?;
-                    Ok((leaf, target))
+                    let (cur, leaf) = signed_lit_leaf(&b.body).ok_or(SolveErr::ReadOnly)?;
+                    Ok(Write {
+                        leaf,
+                        value: target,
+                        var: Some(b.name.as_str()),
+                        current: cur,
+                    })
                 }
                 // let は導出値: RHS を辿って依存先の var へ押し込む。
                 Some(b) if b.kind == SketchBindKind::Let => self.invert_inner(&b.body, target),
                 Some(_) => Err(SolveErr::ReadOnly),
-                None => match self.top_vars.get(name.as_str()) {
-                    Some(body) => {
-                        let (_, leaf) = signed_lit_leaf(body).ok_or(SolveErr::ReadOnly)?;
-                        Ok((leaf, target))
+                None => match self.top_vars.get_key_value(name.as_str()) {
+                    Some((tname, body)) => {
+                        let (cur, leaf) = signed_lit_leaf(body).ok_or(SolveErr::ReadOnly)?;
+                        Ok(Write {
+                            leaf,
+                            value: target,
+                            var: Some(tname),
+                            current: cur,
+                        })
                     }
                     None => Err(SolveErr::ReadOnly),
                 },
@@ -642,7 +657,7 @@ impl<'a> Block<'a> {
         let mut leaves = Vec::new();
         for e in exprs {
             match self.invert(e, value) {
-                Ok((leaf, _)) => leaves.push(leaf.span.start),
+                Ok(w) => leaves.push(w.leaf.span.start),
                 Err(_) => return Vec::new(),
             }
         }
@@ -687,6 +702,18 @@ struct Leaf {
     span: Span,
     /// `Negate(Lit)` 全体 (span が `-` を含む) か。
     negated: bool,
+}
+
+/// 逆評価 1 式分の結果。
+#[derive(Clone, Copy, Debug)]
+struct Write<'a> {
+    leaf: Leaf,
+    /// 葉へ書き込む新値。
+    value: f64,
+    /// 書き込み先 var の名前。None は座標式そのものがリテラル (匿名)。
+    var: Option<&'a str>,
+    /// 葉の現在値 (符号込み)。
+    current: f64,
 }
 
 fn signed_lit_leaf(e: &Expr) -> Option<(f64, Leaf)> {
@@ -739,6 +766,126 @@ fn fmt_coord(v: f64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// ハンドル → 軸解決 (drag / inspect / set_var_value で共有)
+// ---------------------------------------------------------------------------
+
+/// ハンドル 1 軸分の書き込み対象。
+struct HandleAxis<'a> {
+    label: &'static str,
+    /// 書き込み対象の座標式 (junction は複数)。
+    exprs: Vec<&'a Expr>,
+    /// 幾何座標の現在値。
+    display: f64,
+    /// 幾何座標 → invert に流す値の補正 (circle 中心の dst = 中心 + src)。
+    offset: f64,
+    /// 構造的に書けない理由 (Some なら exprs は空)。
+    readonly: Option<String>,
+}
+
+fn handle_axes<'a>(
+    block: &Block<'a>,
+    bare: &[&'a SketchBinding],
+    target: DragTarget,
+) -> Result<Vec<HandleAxis<'a>>, String> {
+    let geom_of = |i: usize| -> Result<&'a SketchBinding, String> {
+        bare.get(i)
+            .copied()
+            .ok_or_else(|| format!("幾何 index {i} が範囲外です"))
+    };
+    let pos_axes = |slot: PosSlot<'a>| -> Vec<HandleAxis<'a>> {
+        vec![
+            HandleAxis {
+                label: "x",
+                exprs: slot.xs,
+                display: slot.pos[0],
+                offset: 0.0,
+                readonly: None,
+            },
+            HandleAxis {
+                label: "y",
+                exprs: slot.ys,
+                display: slot.pos[1],
+                offset: 0.0,
+                readonly: None,
+            },
+        ]
+    };
+    match target {
+        DragTarget::Point { geom } => {
+            let GeomShape::Point(slot) = block.geom_shape(geom_of(geom)?)? else {
+                return Err("対象が点ではありません".into());
+            };
+            Ok(pos_axes(slot))
+        }
+        DragTarget::SegmentEnd { geom, end } => {
+            let GeomShape::Segment(a, b) = block.geom_shape(geom_of(geom)?)? else {
+                return Err("対象が線分ではありません".into());
+            };
+            Ok(pos_axes(if end == 0 { a } else { b }))
+        }
+        DragTarget::PolyVertex { geom, vert } => {
+            let GeomShape::Polygon(slots) = block.geom_shape(geom_of(geom)?)? else {
+                return Err("対象が polygon ではありません".into());
+            };
+            let slot = slots
+                .into_iter()
+                .nth(vert)
+                .ok_or_else(|| format!("頂点 index {vert} が範囲外です"))?;
+            Ok(pos_axes(slot))
+        }
+        DragTarget::CircleCenter { geom } => {
+            let GeomShape::Circle(c) = block.geom_shape(geom_of(geom)?)? else {
+                return Err("対象が circle ではありません".into());
+            };
+            match c.dst {
+                Some(dst) => Ok(vec![
+                    HandleAxis {
+                        label: "x",
+                        exprs: dst.xs,
+                        display: c.center_pos[0],
+                        offset: c.src[0],
+                        readonly: None,
+                    },
+                    HandleAxis {
+                        label: "y",
+                        exprs: dst.ys,
+                        display: c.center_pos[1],
+                        offset: c.src[1],
+                        readonly: None,
+                    },
+                ]),
+                None => {
+                    let reason = "この circle は translate2d が無いため中心を動かせません";
+                    Ok(["x", "y"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, label)| HandleAxis {
+                            label,
+                            exprs: Vec::new(),
+                            display: c.center_pos[i],
+                            offset: 0.0,
+                            readonly: Some(reason.to_string()),
+                        })
+                        .collect())
+                }
+            }
+        }
+        DragTarget::CircleRadius { geom } => {
+            let GeomShape::Circle(c) = block.geom_shape(geom_of(geom)?)? else {
+                return Err("対象が circle ではありません".into());
+            };
+            Ok(vec![HandleAxis {
+                label: "半径",
+                exprs: c.radius.exprs,
+                display: c.radius.value,
+                offset: 0.0,
+                readonly: None,
+            }])
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // drag (逆評価)
 // ---------------------------------------------------------------------------
 
@@ -765,86 +912,41 @@ pub fn drag(
         .filter(|b| b.kind == SketchBindKind::Bare)
         .collect();
 
-    let geom_of = |i: usize| -> Result<&SketchBinding, DragReject> {
-        bare.get(i)
-            .copied()
-            .ok_or_else(|| DragReject::Invalid(format!("幾何 index {i} が範囲外です")))
-    };
-
-    // 軸ごとの (ラベル, 書き込み対象式, 目標値)
-    let mut axes: Vec<(&'static str, Vec<&Expr>, f64)> = Vec::new();
-    match (target, value) {
-        (DragTarget::Point { geom }, DragValue::Pos(p)) => {
-            let shape = block.geom_shape(geom_of(geom)?).map_err(DragReject::Invalid)?;
-            let GeomShape::Point(slot) = shape else {
-                return Err(DragReject::Invalid("対象が点ではありません".into()));
-            };
-            axes.push(("x", slot.xs, p[0]));
-            axes.push(("y", slot.ys, p[1]));
-        }
-        (DragTarget::SegmentEnd { geom, end }, DragValue::Pos(p)) => {
-            let shape = block.geom_shape(geom_of(geom)?).map_err(DragReject::Invalid)?;
-            let GeomShape::Segment(a, b) = shape else {
-                return Err(DragReject::Invalid("対象が線分ではありません".into()));
-            };
-            let slot = if end == 0 { a } else { b };
-            axes.push(("x", slot.xs, p[0]));
-            axes.push(("y", slot.ys, p[1]));
-        }
-        (DragTarget::PolyVertex { geom, vert }, DragValue::Pos(p)) => {
-            let shape = block.geom_shape(geom_of(geom)?).map_err(DragReject::Invalid)?;
-            let GeomShape::Polygon(slots) = shape else {
-                return Err(DragReject::Invalid("対象が polygon ではありません".into()));
-            };
-            let slot = slots
-                .into_iter()
-                .nth(vert)
-                .ok_or_else(|| DragReject::Invalid(format!("頂点 index {vert} が範囲外です")))?;
-            axes.push(("x", slot.xs, p[0]));
-            axes.push(("y", slot.ys, p[1]));
-        }
-        (DragTarget::CircleCenter { geom }, DragValue::Pos(p)) => {
-            let shape = block.geom_shape(geom_of(geom)?).map_err(DragReject::Invalid)?;
-            let GeomShape::Circle(c) = shape else {
-                return Err(DragReject::Invalid("対象が circle ではありません".into()));
-            };
-            let Some(dst) = c.dst else {
-                return Err(DragReject::ReadOnly(
-                    "この circle は translate2d が無いため中心を動かせません".into(),
-                ));
-            };
-            // 中心 = dst - src なので dst の目標値は 新中心 + src
-            axes.push(("x", dst.xs, p[0] + c.src[0]));
-            axes.push(("y", dst.ys, p[1] + c.src[1]));
-        }
-        (DragTarget::CircleRadius { geom }, DragValue::Radius(r)) => {
-            let shape = block.geom_shape(geom_of(geom)?).map_err(DragReject::Invalid)?;
-            let GeomShape::Circle(c) = shape else {
-                return Err(DragReject::Invalid("対象が circle ではありません".into()));
-            };
-            axes.push(("半径", c.radius.exprs, r));
-        }
+    let axes = handle_axes(&block, &bare, target).map_err(DragReject::Invalid)?;
+    // 軸ごとの目標値 (幾何座標)。
+    let goals: Vec<f64> = match value {
+        DragValue::Pos(p) if axes.len() == 2 => vec![p[0], p[1]],
+        DragValue::Radius(r) if axes.len() == 1 => vec![r],
         _ => {
             return Err(DragReject::Invalid(
                 "ドラッグ対象と値の種類が一致しません".into(),
             ));
         }
-    }
+    };
 
     // 軸ごとに独立して逆評価。軸内は全式が書けなければその軸ごと固定。
     let mut writes: Vec<(Leaf, f64)> = Vec::new();
     let mut pinned: Vec<String> = Vec::new();
     let mut first_err: Option<SolveErr> = None;
-    for (label, exprs, tval) in axes {
+    for (axis, goal) in axes.into_iter().zip(goals) {
+        if let Some(reason) = axis.readonly {
+            // 構造的理由は軸をまたいで同文なので重複させない
+            if !pinned.contains(&reason) {
+                pinned.push(reason);
+            }
+            first_err.get_or_insert(SolveErr::ReadOnly);
+            continue;
+        }
+        let tval = goal + axis.offset;
         let mut axis_writes: Vec<(Leaf, f64)> = Vec::new();
-        let mut axis_err: Option<SolveErr> = if exprs.is_empty() {
+        let mut axis_err: Option<SolveErr> = if axis.exprs.is_empty() {
             Some(SolveErr::ReadOnly)
         } else {
             None
         };
-        for e in exprs {
+        for e in axis.exprs {
             match block.invert(e, tval) {
-                Ok(w) => axis_writes.push(w),
+                Ok(w) => axis_writes.push((w.leaf, w.value)),
                 Err(err) => {
                     axis_err = Some(err);
                     break;
@@ -854,7 +956,7 @@ pub fn drag(
         match axis_err {
             None => writes.extend(axis_writes),
             Some(err) => {
-                pinned.push(format!("{label} は{}", err.reason()));
+                pinned.push(format!("{} は{}", axis.label, err.reason()));
                 if first_err.is_none() {
                     first_err = Some(err);
                 }
@@ -893,6 +995,133 @@ pub fn drag(
         source,
         model,
         pinned,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// inspect / 数値入力による var 書き込み
+// ---------------------------------------------------------------------------
+
+/// 選択したハンドルの軸ごとの編集情報 (GUI のインスペクタ表示用)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct HandleInspect {
+    pub axes: Vec<AxisInspect>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AxisInspect {
+    /// "x" / "y" / "半径"。
+    pub label: String,
+    /// 幾何座標の現在値。
+    pub value: f64,
+    /// ドラッグ / 数値編集で書き込まれる var (匿名リテラル含む)。
+    /// index は [`set_var_value`] の `write` に対応する。
+    pub writes: Vec<VarInspect>,
+    /// 書けない理由 (Some のとき writes は空)。
+    pub readonly: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VarInspect {
+    /// var 名。None は座標式そのものがリテラル (匿名)。
+    pub name: Option<String>,
+    /// 書き込み先リテラルの現在値。
+    pub value: f64,
+}
+
+/// 軸 1 つ分の書き込み先葉を inspect と同じ順序 (dedupe 済み) で集める。
+fn axis_writes<'a>(block: &Block<'a>, axis: &HandleAxis<'a>) -> Result<Vec<Write<'a>>, SolveErr> {
+    let mut out: Vec<Write<'a>> = Vec::new();
+    for e in &axis.exprs {
+        let w = block.invert(e, axis.display + axis.offset)?;
+        if !out.iter().any(|p| p.leaf.span == w.leaf.span) {
+            out.push(w);
+        }
+    }
+    Ok(out)
+}
+
+/// ハンドル 1 つ分の書き込み先 var 情報を返す。
+pub fn inspect(src: &str, binding: &str, target: DragTarget) -> Result<HandleInspect, String> {
+    let module = parse_or_msg(src)?;
+    let (bindings, _body, _span) = find_block(&module, binding)?;
+    let block = Block::build(&module, bindings)?;
+    let bare: Vec<&SketchBinding> = bindings
+        .iter()
+        .filter(|b| b.kind == SketchBindKind::Bare)
+        .collect();
+    let mut axes = Vec::new();
+    for axis in handle_axes(&block, &bare, target)? {
+        let (writes, readonly) = if let Some(reason) = axis.readonly.clone() {
+            (Vec::new(), Some(reason))
+        } else if axis.exprs.is_empty() {
+            (Vec::new(), Some(SolveErr::ReadOnly.reason().to_string()))
+        } else {
+            match axis_writes(&block, &axis) {
+                Ok(ws) => (
+                    ws.into_iter()
+                        .map(|w| VarInspect {
+                            name: w.var.map(str::to_string),
+                            value: w.current,
+                        })
+                        .collect(),
+                    None,
+                ),
+                Err(err) => (Vec::new(), Some(err.reason().to_string())),
+            }
+        };
+        axes.push(AxisInspect {
+            label: axis.label.to_string(),
+            value: axis.display,
+            writes,
+            readonly,
+        });
+    }
+    Ok(HandleInspect { axes })
+}
+
+/// [`inspect`] の `axes[axis].writes[write]` の書き込み先リテラルへ `value` を書き込む。
+pub fn set_var_value(
+    src: &str,
+    binding: &str,
+    target: DragTarget,
+    axis: usize,
+    write: usize,
+    value: f64,
+) -> Result<DragOutcome, String> {
+    if !value.is_finite() {
+        return Err("値が有限ではありません".to_string());
+    }
+    let module = parse_or_msg(src)?;
+    let (bindings, _body, _span) = find_block(&module, binding)?;
+    let block = Block::build(&module, bindings)?;
+    let bare: Vec<&SketchBinding> = bindings
+        .iter()
+        .filter(|b| b.kind == SketchBindKind::Bare)
+        .collect();
+    let ax = handle_axes(&block, &bare, target)?
+        .into_iter()
+        .nth(axis)
+        .ok_or_else(|| format!("軸 index {axis} が範囲外です"))?;
+    if let Some(reason) = ax.readonly.clone() {
+        return Err(reason);
+    }
+    let leaf = axis_writes(&block, &ax)
+        .map_err(|e| e.reason().to_string())?
+        .into_iter()
+        .nth(write)
+        .ok_or_else(|| format!("書き込み先 index {write} が範囲外です"))?
+        .leaf;
+    let edits = [TextEdit {
+        span: leaf.span,
+        replacement: fmt_leaf(value, &leaf),
+    }];
+    let source = apply_edits(src, &edits);
+    let model = model_from_source(&source, binding)?;
+    Ok(DragOutcome {
+        source,
+        model,
+        pinned: Vec::new(),
     })
 }
 
@@ -1835,6 +2064,134 @@ mod tests {
         // トップレベル x1 と衝突しない名前が生成される
         assert!(s.contains("var x2 = 5.0"), "{s}");
         model_from_source(&s, "sk").expect("parses");
+    }
+
+    #[test]
+    fn inspect_vertex_reports_var_and_literal() {
+        let info = inspect(
+            SRC_SEGMENTS,
+            "sk",
+            DragTarget::PolyVertex { geom: 0, vert: 0 },
+        )
+        .expect("inspect");
+        assert_eq!(info.axes.len(), 2);
+        // x = x1 (var)
+        assert_eq!(info.axes[0].label, "x");
+        assert_eq!(info.axes[0].value, 0.0);
+        assert_eq!(info.axes[0].writes.len(), 1);
+        assert_eq!(info.axes[0].writes[0].name.as_deref(), Some("x1"));
+        assert_eq!(info.axes[0].writes[0].value, 0.0);
+        // y = 0.0 (匿名リテラル)
+        assert_eq!(info.axes[1].writes[0].name, None);
+        assert_eq!(info.axes[1].writes[0].value, 0.0);
+        assert!(info.axes[1].readonly.is_none());
+    }
+
+    #[test]
+    fn inspect_let_axis_is_readonly() {
+        let info = inspect(
+            SRC_SEGMENTS,
+            "sk",
+            DragTarget::PolyVertex { geom: 0, vert: 2 },
+        )
+        .expect("inspect");
+        assert_eq!(info.axes[0].writes[0].name.as_deref(), Some("x2"));
+        assert!(info.axes[1].writes.is_empty());
+        assert!(info.axes[1].readonly.is_some());
+    }
+
+    #[test]
+    fn inspect_offset_expr_reports_source_var_value() {
+        // 座標は x1 + 1.0 = 3.0 だが、書き込み先 var の現在値は x1 = 2.0。
+        let src = "sk =\n    sketch\n        var x1 = 2.0\n        p = p2 (x1 + 1.0) 0.0\n    in\n    { p = p }\n    end\n";
+        let info = inspect(src, "sk", DragTarget::Point { geom: 0 }).expect("inspect");
+        assert_eq!(info.axes[0].value, 3.0);
+        assert_eq!(info.axes[0].writes[0].name.as_deref(), Some("x1"));
+        assert_eq!(info.axes[0].writes[0].value, 2.0);
+    }
+
+    #[test]
+    fn inspect_circle_center_and_radius() {
+        let src = "sk =\n    sketch\n        var r = 2.0\n        circ1 = circle r |> translate2d (p2 1.0 1.0) (p2 4.0 6.0)\n    in\n    { circ1 = circ1 }\n    end\n";
+        let info = inspect(src, "sk", DragTarget::CircleCenter { geom: 0 }).expect("inspect");
+        assert_eq!(info.axes[0].value, 3.0, "中心座標 = dst - src");
+        assert_eq!(info.axes[0].writes[0].value, 4.0, "書き込み先は dst のリテラル");
+        let ri = inspect(src, "sk", DragTarget::CircleRadius { geom: 0 }).expect("inspect");
+        assert_eq!(ri.axes.len(), 1);
+        assert_eq!(ri.axes[0].label, "半径");
+        assert_eq!(ri.axes[0].writes[0].name.as_deref(), Some("r"));
+    }
+
+    #[test]
+    fn inspect_origin_circle_center_is_readonly() {
+        let src = "sk =\n    sketch\n        circ1 = circle 2.0\n    in\n    { circ1 = circ1 }\n    end\n";
+        let info = inspect(src, "sk", DragTarget::CircleCenter { geom: 0 }).expect("inspect");
+        assert!(info.axes.iter().all(|a| a.readonly.is_some()));
+    }
+
+    #[test]
+    fn inspect_junction_dedupes_shared_leaf() {
+        // 名前付き点の junction は同じ葉に集約されるので write は 1 つ。
+        let info = inspect(
+            SRC_LINES,
+            "sk",
+            DragTarget::PolyVertex { geom: 4, vert: 1 },
+        )
+        .expect("inspect");
+        assert_eq!(info.axes[0].writes.len(), 1);
+        assert_eq!(info.axes[0].writes[0].value, 4.0);
+    }
+
+    #[test]
+    fn set_var_value_writes_var_and_linked_vertex_follows() {
+        let out = set_var_value(
+            SRC_SEGMENTS,
+            "sk",
+            DragTarget::PolyVertex { geom: 0, vert: 0 },
+            0,
+            0,
+            7.0,
+        )
+        .expect("set");
+        assert!(out.source.contains("var x1 = 7.0"), "{}", out.source);
+        let SketchGeom::Polygon { verts, .. } = &out.model.geoms[0] else {
+            panic!()
+        };
+        assert_eq!(verts[0][0], 7.0);
+        assert_eq!(verts[3][0], 7.0, "x1 共有頂点も連動する");
+    }
+
+    #[test]
+    fn set_var_value_offset_expr_writes_var_directly() {
+        // var の値そのものを書くので、座標は x1 + 1.0 = 6.0 になる。
+        let src = "sk =\n    sketch\n        var x1 = 2.0\n        p = p2 (x1 + 1.0) 0.0\n    in\n    { p = p }\n    end\n";
+        let out = set_var_value(src, "sk", DragTarget::Point { geom: 0 }, 0, 0, 5.0).expect("set");
+        assert!(out.source.contains("var x1 = 5.0"), "{}", out.source);
+        let SketchGeom::Point { pos, .. } = &out.model.geoms[0] else {
+            panic!()
+        };
+        assert_eq!(pos[0], 6.0);
+    }
+
+    #[test]
+    fn set_var_value_readonly_axis_rejected() {
+        let err = set_var_value(
+            SRC_SEGMENTS,
+            "sk",
+            DragTarget::PolyVertex { geom: 0, vert: 2 },
+            1,
+            0,
+            9.0,
+        )
+        .expect_err("reject");
+        assert!(err.contains("書き込める var がありません") || err.contains("範囲外"), "{err}");
+    }
+
+    #[test]
+    fn set_var_value_negative_literal_reparses() {
+        let src = "sk =\n    sketch\n        pt1 = p2 1.0 2.0\n    in\n    { pt1 = pt1 }\n    end\n";
+        let out = set_var_value(src, "sk", DragTarget::Point { geom: 0 }, 0, 0, -3.5).expect("set");
+        assert!(out.source.contains("p2 (-3.5) 2.0"), "{}", out.source);
     }
 
     #[test]

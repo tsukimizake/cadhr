@@ -2,8 +2,10 @@
 //!
 //! dropdown で sketch binding を選ぶと [`SketchModel`] がキャンバスに出る。
 //! ハンドル (点 / 頂点 / 円中心 / 円周) のドラッグはリアルタイムにコードへ
-//! 書き戻される (逆評価は `cadhr_lang::sketch::drag`)。Line / Circle / Point
-//! ツールでの描画は binding の挿入としてコードに反映される。
+//! 書き戻される (逆評価は `cadhr_lang::sketch::drag`)。Select ツールでの
+//! クリック (動かさず離す) はハンドルを選択し、座標を決めている var の名前と
+//! 値をインスペクタに表示して数値入力で書き戻せる (`inspect` / `set_var_value`)。
+//! Line / Circle / Point ツールでの描画は binding の挿入としてコードに反映される。
 //!
 //! エディタ本文は Model が所有するため、テキスト書き換えを要する操作は
 //! [`SketchEdit`] イベントとして main.rs に委譲する。
@@ -11,10 +13,11 @@
 use iced::widget::canvas::{self, Path, Stroke};
 use iced::widget::{
     canvas as canvas_widget, column, combo_box, container, pick_list, row, slider, text,
+    text_input,
 };
 use iced::{Color, Element, Fill, Length, Point, Rectangle, Renderer, Size, Theme, mouse};
 
-use cadhr_lang::sketch::{DragTarget, DragValue, SketchGeom, SketchModel};
+use cadhr_lang::sketch::{DragTarget, DragValue, HandleInspect, SketchGeom, SketchModel};
 
 use crate::session::SessionSketch;
 use crate::ui::parts;
@@ -73,6 +76,25 @@ pub enum SketchEdit {
     },
     /// 2 回以上現れる同値の座標リテラルを軸ごとに var へまとめる。
     FactorVars,
+    /// クリック選択。main.rs が `inspect` して選択状態を書き戻す。
+    Select {
+        target: DragTarget,
+    },
+    /// 選択中ハンドルの var への数値書き込み (`set_var_value`)。
+    SetVar {
+        target: DragTarget,
+        axis: usize,
+        write: usize,
+        value: f64,
+    },
+}
+
+/// クリックで選択されたハンドルとそのインスペクタ状態。
+pub struct Selection {
+    pub target: DragTarget,
+    pub inspect: HandleInspect,
+    /// 軸ごと・書き込み先ごとの数値入力バッファ。
+    pub inputs: Vec<Vec<String>>,
 }
 
 pub struct Sketch {
@@ -90,6 +112,8 @@ pub struct Sketch {
     pub tool: Tool,
     /// Line ツールで追記中の polygon 名 (新しい線は末尾頂点として追加される)。
     pub active_poly: Option<String>,
+    /// Select ツールのクリックで選択中のハンドル。
+    pub selection: Option<Selection>,
     /// ドラッグ拒否や編集エラーの表示。
     pub status: String,
     cache: canvas::Cache,
@@ -107,6 +131,7 @@ impl Sketch {
             model: None,
             tool: Tool::Select,
             active_poly: None,
+            selection: None,
             status: String::new(),
             cache: canvas::Cache::new(),
         }
@@ -163,6 +188,24 @@ impl Sketch {
         self.status = status;
     }
 
+    /// main.rs が `inspect` の結果を書き戻す。入力バッファは現在値で初期化する。
+    pub fn set_selection(&mut self, target: DragTarget, inspect: HandleInspect) {
+        let inputs = inspect
+            .axes
+            .iter()
+            .map(|a| a.writes.iter().map(|w| format!("{}", w.value)).collect())
+            .collect();
+        self.selection = Some(Selection {
+            target,
+            inspect,
+            inputs,
+        });
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
     pub fn update(&mut self, msg: SketchMsg) -> WorkspaceEvent {
         match msg {
             SketchMsg::Close => WorkspaceEvent::Close,
@@ -199,9 +242,50 @@ impl Sketch {
                 }
                 self.binding = name;
                 self.active_poly = None;
+                self.selection = None;
                 self.status.clear();
                 self.cache.clear();
                 WorkspaceEvent::SketchEdit(SketchEdit::Refresh)
+            }
+            SketchMsg::HandleSelected(target) => match target {
+                Some(target) => WorkspaceEvent::SketchEdit(SketchEdit::Select { target }),
+                None => {
+                    self.selection = None;
+                    WorkspaceEvent::None
+                }
+            },
+            SketchMsg::VarInput { axis, write, text } => {
+                if let Some(buf) = self
+                    .selection
+                    .as_mut()
+                    .and_then(|sel| sel.inputs.get_mut(axis))
+                    .and_then(|v| v.get_mut(write))
+                {
+                    *buf = text;
+                }
+                WorkspaceEvent::None
+            }
+            SketchMsg::VarSubmit { axis, write } => {
+                let Some(sel) = &self.selection else {
+                    return WorkspaceEvent::None;
+                };
+                let Some(buf) = sel.inputs.get(axis).and_then(|v| v.get(write)) else {
+                    return WorkspaceEvent::None;
+                };
+                match buf.trim().parse::<f64>() {
+                    Ok(value) if value.is_finite() => {
+                        WorkspaceEvent::SketchEdit(SketchEdit::SetVar {
+                            target: sel.target,
+                            axis,
+                            write,
+                            value,
+                        })
+                    }
+                    _ => {
+                        self.status = format!("数値として解釈できません: {buf}");
+                        WorkspaceEvent::None
+                    }
+                }
             }
             SketchMsg::SelectGeom(name) => {
                 // 選択中の polygon をもう一度クリックしたら解除 (トグル)
@@ -263,6 +347,19 @@ pub enum SketchMsg {
         value: DragValue,
     },
     DragEnd,
+    /// Select ツールでのクリック (None は空クリックで選択解除)。
+    HandleSelected(Option<DragTarget>),
+    /// インスペクタの数値入力バッファ更新。
+    VarInput {
+        axis: usize,
+        write: usize,
+        text: String,
+    },
+    /// インスペクタの数値入力確定 (Enter)。
+    VarSubmit {
+        axis: usize,
+        write: usize,
+    },
     LineAdded([f64; 2], [f64; 2]),
     CircleAdded([f64; 2], f64),
     PointAdded([f64; 2]),
@@ -279,6 +376,8 @@ const DRAG_PREVIEW: Color = Color::from_rgba(0.55, 0.85, 0.55, 0.5);
 const SNAP_INDICATOR: Color = Color::from_rgba(0.95, 0.85, 0.4, 0.8);
 /// hover / ドラッグ中のハンドルと、それに連動して動くハンドルの強調色。
 const LINKED_HANDLE: Color = Color::from_rgb(0.25, 0.95, 0.35);
+/// クリック選択中のハンドルのリング色。
+const SELECTED_HANDLE: Color = Color::from_rgb(0.98, 0.6, 0.25);
 
 /// キャンバス描画の視点。`center` の world 座標がキャンバス中央に来る。
 #[derive(Clone, Copy)]
@@ -428,9 +527,11 @@ impl SketchCanvas<'_> {
 enum DragState {
     #[default]
     Idle,
-    /// Select ツールでハンドルを掴んでいる。`last` は最後に送った snap 値。
+    /// Select ツールでハンドルを掴んでいる。`origin` は押した位置の snap 値、
+    /// `last` は最後に送った snap 値 (None のまま離すとクリック選択になる)。
     Handle {
         target: DragTarget,
+        origin: Option<DragValue>,
         last: Option<DragValue>,
     },
     /// Line / Circle ツールのドラッグ描画。
@@ -460,11 +561,23 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
             mouse::Event::ButtonPressed(mouse::Button::Left) => {
                 let pos = cursor.position_in(bounds)?;
                 match self.sketch.tool {
-                    Tool::Select => {
-                        let target = self.hit_test(bounds.size(), pos)?;
-                        *state = DragState::Handle { target, last: None };
-                        Some(canvas::Action::request_redraw().and_capture())
-                    }
+                    Tool::Select => match self.hit_test(bounds.size(), pos) {
+                        Some(target) => {
+                            let origin =
+                                self.drag_value(target, snap(view, bounds.size(), pos));
+                            *state = DragState::Handle {
+                                target,
+                                origin,
+                                last: None,
+                            };
+                            Some(canvas::Action::request_redraw().and_capture())
+                        }
+                        // 空クリックは選択解除
+                        None => Some(
+                            canvas::Action::publish(SketchMsg::HandleSelected(None))
+                                .and_capture(),
+                        ),
+                    },
                     Tool::Point => {
                         let p = snap(view, bounds.size(), pos);
                         Some(canvas::Action::publish(SketchMsg::PointAdded(p)).and_capture())
@@ -491,11 +604,17 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
             mouse::Event::CursorMoved { .. } => {
                 let pos = cursor.position_in(bounds);
                 match state {
-                    DragState::Handle { target, last } => {
+                    DragState::Handle {
+                        target,
+                        origin,
+                        last,
+                    } => {
                         let pos = pos?;
                         let world = snap(view, bounds.size(), pos);
                         let value = self.drag_value(*target, world)?;
-                        if *last == Some(value) {
+                        // 押した snap セルから出るまではドラッグ扱いにしない
+                        // (離せばクリック選択になる)
+                        if *last == Some(value) || (last.is_none() && *origin == Some(value)) {
                             return None;
                         }
                         let target = *target;
@@ -527,6 +646,11 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
             mouse::Event::ButtonReleased(mouse::Button::Left) => {
                 let prev = std::mem::take(state);
                 match prev {
+                    // 動かさず離した → クリック選択
+                    DragState::Handle { target, last: None, .. } => Some(
+                        canvas::Action::publish(SketchMsg::HandleSelected(Some(target)))
+                            .and_capture(),
+                    ),
                     DragState::Handle { .. } => {
                         Some(canvas::Action::publish(SketchMsg::DragEnd).and_capture())
                     }
@@ -669,6 +793,24 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
         let mut overlay = canvas::Frame::new(renderer, bounds.size());
         let osize = overlay.size();
 
+        // クリック選択中のハンドルをリングで強調する
+        if let (Some(sel), Some(model)) = (&self.sketch.selection, &self.sketch.model) {
+            let ring = Stroke::default().with_width(2.0).with_color(SELECTED_HANDLE);
+            if let DragTarget::CircleRadius { geom } = sel.target {
+                if let Some(SketchGeom::Circle { center, radius, .. }) = model.geoms.get(geom) {
+                    overlay.stroke(
+                        &Path::circle(
+                            to_screen(view, osize, *center),
+                            *radius as f32 * view.zoom + 4.0,
+                        ),
+                        ring,
+                    );
+                }
+            } else if let Some(pos) = target_pos(model, sel.target) {
+                overlay.stroke(&Path::circle(to_screen(view, osize, pos), 7.0), ring);
+            }
+        }
+
         // hover / ドラッグ中のハンドルと、それに連動して動くハンドルを緑で強調する
         let hot = match state {
             DragState::Handle { target, .. } => Some(*target),
@@ -756,6 +898,80 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
     }
 }
 
+/// 選択ハンドルの表示名 (幾何名 + 部位)。
+fn target_label(model: &SketchModel, t: DragTarget) -> String {
+    let name = |gi: usize| {
+        model
+            .geoms
+            .get(gi)
+            .map(|g| g.name().to_string())
+            .unwrap_or_else(|| format!("#{gi}"))
+    };
+    match t {
+        DragTarget::Point { geom } => name(geom),
+        DragTarget::SegmentEnd { geom, end } => {
+            format!("{} {}", name(geom), if end == 0 { "始点" } else { "終点" })
+        }
+        DragTarget::PolyVertex { geom, vert } => format!("{} 頂点{vert}", name(geom)),
+        DragTarget::CircleCenter { geom } => format!("{} 中心", name(geom)),
+        DragTarget::CircleRadius { geom } => format!("{} 半径", name(geom)),
+    }
+}
+
+/// 選択ハンドルのインスペクタ。軸ごとに書き込み先 var 名と数値入力を並べる。
+fn inspector<'a>(sel: &'a Selection, model: &SketchModel) -> Element<'a, SketchMsg> {
+    let mut panel = column![
+        text(format!("Selected: {}", target_label(model, sel.target)))
+            .size(13)
+            .color(SELECTED_HANDLE)
+    ]
+    .spacing(2);
+    for (ai, axis) in sel.inspect.axes.iter().enumerate() {
+        let mut r = row![
+            text(format!("{} = {}", axis.label, axis.value))
+                .size(13)
+                .width(Length::Fixed(90.0))
+        ]
+        .spacing(6);
+        if let Some(reason) = &axis.readonly {
+            r = r.push(
+                text(reason.as_str())
+                    .size(13)
+                    .color(Color::from_rgb(0.6, 0.6, 0.6)),
+            );
+        }
+        for (wi, w) in axis.writes.iter().enumerate() {
+            let label = match &w.name {
+                Some(n) => format!("var {n}"),
+                None => "リテラル".to_string(),
+            };
+            let buf = sel
+                .inputs
+                .get(ai)
+                .and_then(|v| v.get(wi))
+                .map(String::as_str)
+                .unwrap_or("");
+            r = r.push(text(label).size(13));
+            r = r.push(
+                text_input("", buf)
+                    .on_input(move |t| SketchMsg::VarInput {
+                        axis: ai,
+                        write: wi,
+                        text: t,
+                    })
+                    .on_submit(SketchMsg::VarSubmit {
+                        axis: ai,
+                        write: wi,
+                    })
+                    .width(Length::Fixed(80.0))
+                    .size(13),
+            );
+        }
+        panel = panel.push(r);
+    }
+    panel.into()
+}
+
 pub fn view<'a>(s: &'a Sketch, index: usize, total: usize) -> Element<'a, SketchMsg> {
     let label = format!("sketch #{} ({}/{})", s.id, index + 1, total);
     let binding_cb = combo_box(
@@ -831,7 +1047,11 @@ pub fn view<'a>(s: &'a Sketch, index: usize, total: usize) -> Element<'a, Sketch
     ]
     .spacing(8);
 
-    let mut col = column![header, canvas_el, geom_list, zoom_row].spacing(4);
+    let mut col = column![header, canvas_el, geom_list].spacing(4);
+    if let (Some(sel), Some(model)) = (&s.selection, &s.model) {
+        col = col.push(inspector(sel, model));
+    }
+    col = col.push(zoom_row);
     if s.binding.is_empty() {
         col = col.push(
             text("select a sketch binding to edit")

@@ -420,14 +420,30 @@ fn refresh_sketch_model(model: &mut Model, id: u64) {
     };
     if s2.binding.is_empty() {
         s2.set_model(None);
+        s2.clear_selection();
         return;
     }
     match cadhr_lang::sketch::model_from_source(&src, &s2.binding) {
-        Ok(m) => s2.set_model(Some(m)),
+        Ok(m) => {
+            s2.set_model(Some(m));
+            refresh_sketch_selection(s2, &src);
+        }
         Err(e) => {
             s2.set_model(None);
+            s2.clear_selection();
             s2.set_status(e);
         }
+    }
+}
+
+/// 選択中ハンドルの inspect を現在のソースで取り直す (構造が変わっていたら解除)。
+fn refresh_sketch_selection(s: &mut Sketch, src: &str) {
+    let Some(target) = s.selection.as_ref().map(|sel| sel.target) else {
+        return;
+    };
+    match cadhr_lang::sketch::inspect(src, &s.binding, target) {
+        Ok(info) => s.set_selection(target, info),
+        Err(_) => s.clear_selection(),
     }
 }
 
@@ -502,6 +518,10 @@ fn handle_sketch_edit(model: &mut Model, id: u64, edit: SketchEdit) -> Task<Msg>
         }
         SketchEdit::DragEnd => {
             model.history.break_group();
+            // ドラッグで var 値が変わっているのでインスペクタ表示を取り直す
+            if let Some(s2) = sketch_mut(model, id) {
+                refresh_sketch_selection(s2, &src);
+            }
             Task::none()
         }
         _ if binding.is_empty() => {
@@ -564,6 +584,48 @@ fn handle_sketch_edit(model: &mut Model, id: u64, edit: SketchEdit) -> Task<Msg>
         SketchEdit::RemoveGeom { name } => {
             apply_sketch_text_edit(model, id, sk::remove_geom(&src, &binding, &name))
         }
+        SketchEdit::Select { target } => {
+            let result = sk::inspect(&src, &binding, target);
+            if let Some(s2) = sketch_mut(model, id) {
+                match result {
+                    Ok(info) => {
+                        s2.set_selection(target, info);
+                        s2.set_status(String::new());
+                    }
+                    Err(e) => {
+                        s2.clear_selection();
+                        s2.set_status(e);
+                    }
+                }
+            }
+            Task::none()
+        }
+        SketchEdit::SetVar {
+            target,
+            axis,
+            write,
+            value,
+        } => match sk::set_var_value(&src, &binding, target, axis, write, value) {
+            Ok(out) => {
+                model
+                    .history
+                    .record(editor_snapshot(model), history::EditKind::Oneshot);
+                model.editor = text_editor::Content::with_text(&out.source);
+                if let Some(s2) = sketch_mut(model, id) {
+                    s2.set_model(Some(out.model));
+                    s2.set_status(String::new());
+                    refresh_sketch_selection(s2, &out.source);
+                }
+                model.unsaved = true;
+                request_compile(model)
+            }
+            Err(e) => {
+                if let Some(s2) = sketch_mut(model, id) {
+                    s2.set_status(e);
+                }
+                Task::none()
+            }
+        },
     }
 }
 
