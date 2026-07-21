@@ -675,7 +675,10 @@ fn update(model: &mut Model, message: Msg) -> Task<Msg> {
                     Task::none()
                 }
                 WorkspaceEvent::ExportRequested(Some(data)) => {
-                    let suggested = format!("{}_{id}.3mf", base_name(model));
+                    let target = preview_mut(model, id)
+                        .map(|p| p.target.clone())
+                        .expect("ExportRequested from non-preview workspace");
+                    let suggested = format!("{}_{target}.3mf", base_name(model));
                     model.dialogs.export_3mf(suggested, data)
                 }
                 WorkspaceEvent::SketchEdit(edit) => handle_sketch_edit(model, id, edit),
