@@ -364,12 +364,17 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
         // `{ field = expr, ... }` の record literal。
         // record update `{ r | field = expr }` も同じ `{}` 内に `name |` プレフィクス
         // が来る形で扱う。
+        // `{ a, b }` の糖衣構文を許容し、`{ a = a, b = b }` に展開する。
         let record_field = lower_ident()
-            .then_ignore(just(Token::Eq))
-            .then(expr.clone())
-            .map_with(|(name, value), e| RecordField {
+            .map_with(|name, e| (name, dspan(e.span())))
+            .then(just(Token::Eq).ignore_then(expr.clone()).or_not())
+            .map_with(|((name, name_span), value_opt), e| RecordField {
+                value: value_opt.unwrap_or_else(|| Expr::Var {
+                    module: None,
+                    name: name.clone(),
+                    span: name_span,
+                }),
                 name,
-                value,
                 span: dspan(e.span()),
             });
 
@@ -1222,6 +1227,45 @@ mod tests {
         let m = parse_ok("f = { r | x = 1 }");
         match &m.decls[0] {
             Decl::Value(v) => assert!(matches!(v.body, Expr::RecordUpdate { .. })),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn record_shorthand() {
+        // `{ a, b }` は `{ a = a, b = b }` に展開される
+        let m = parse_ok("f = { a, b }");
+        match &m.decls[0] {
+            Decl::Value(v) => match &v.body {
+                Expr::Record(fields, _) => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name, "a");
+                    match &fields[0].value {
+                        Expr::Var { module: None, name, .. } => assert_eq!(name, "a"),
+                        other => panic!("expected shorthand Var, got {other:?}"),
+                    }
+                }
+                _ => panic!("expected Record"),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn record_mixed_shorthand_and_explicit() {
+        // `{ a, b = 1 }` の混在
+        let m = parse_ok("f = { a, b = 1 }");
+        match &m.decls[0] {
+            Decl::Value(v) => match &v.body {
+                Expr::Record(fields, _) => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name, "a");
+                    assert!(matches!(&fields[0].value, Expr::Var { module: None, name, .. } if name == "a"));
+                    assert_eq!(fields[1].name, "b");
+                    assert!(matches!(&fields[1].value, Expr::Lit(Lit::Int(1), _)));
+                }
+                _ => panic!("expected Record"),
+            },
             _ => panic!(),
         }
     }

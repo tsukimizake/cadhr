@@ -18,6 +18,11 @@ fn push_indent(n: usize, buf: &mut String) {
     }
 }
 
+/// `RecordField` の value がフィールド名と同名の bare `Var` なら糖衣構文 `{ a }` で出力可能。
+fn is_shorthand_field(f: &RecordField) -> bool {
+    matches!(&f.value, Expr::Var { module: None, name, .. } if name == &f.name)
+}
+
 pub fn pretty_module(m: &Module) -> String {
     let mut buf = String::new();
     if let Some(h) = &m.header {
@@ -267,9 +272,13 @@ fn pretty_expr_prec(e: &Expr, prec: u8, indent: usize, buf: &mut String) {
                 if i > 0 {
                     buf.push_str(", ");
                 }
-                buf.push_str(&f.name);
-                buf.push_str(" = ");
-                pretty_expr(&f.value, indent, buf);
+                if is_shorthand_field(f) {
+                    buf.push_str(&f.name);
+                } else {
+                    buf.push_str(&f.name);
+                    buf.push_str(" = ");
+                    pretty_expr(&f.value, indent, buf);
+                }
             }
             buf.push_str(" }");
         }
@@ -281,9 +290,13 @@ fn pretty_expr_prec(e: &Expr, prec: u8, indent: usize, buf: &mut String) {
                 if i > 0 {
                     buf.push_str(", ");
                 }
-                buf.push_str(&f.name);
-                buf.push_str(" = ");
-                pretty_expr(&f.value, indent, buf);
+                if is_shorthand_field(f) {
+                    buf.push_str(&f.name);
+                } else {
+                    buf.push_str(&f.name);
+                    buf.push_str(" = ");
+                    pretty_expr(&f.value, indent, buf);
+                }
             }
             buf.push_str(" }");
         }
@@ -689,6 +702,29 @@ mod tests {
     #[test]
     fn rt_record_update() {
         round_trip("f = { r | x = 1, y = 2 }");
+    }
+
+    #[test]
+    fn rt_record_shorthand() {
+        // `{ a, b }` → pretty → parse → pretty が安定
+        let s = round_trip("f = { a, b }");
+        assert!(s.contains("{ a, b }"), "{s}");
+    }
+
+    #[test]
+    fn rt_record_mixed_shorthand() {
+        // `{ a, b = 1 }` の混在
+        let s = round_trip("f = { a, b = 1 }");
+        assert!(s.contains("{ a, b = 1 }"), "{s}");
+    }
+
+    #[test]
+    fn rt_record_shorthand_in_sketch() {
+        // sketch ブロック内の `in { poly1, poly2 }` が糖衣構文で往復する
+        let s = round_trip(
+            "sk = sketch\n    var x = 1.0\n    poly1 = p2 x x\n    poly2 = p2 x x\n    in { poly1, poly2 }\nend",
+        );
+        assert!(s.contains("{ poly1, poly2 }"), "{s}");
     }
 
     #[test]
