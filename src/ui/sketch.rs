@@ -954,6 +954,7 @@ fn inspector<'a>(sel: &'a Selection, model: &SketchModel) -> Element<'a, SketchM
             r = r.push(text(label).size(13));
             r = r.push(
                 text_input("", buf)
+                    .id(format!("sketch-var-{ai}-{wi}"))
                     .on_input(move |t| SketchMsg::VarInput {
                         axis: ai,
                         write: wi,
@@ -1067,4 +1068,206 @@ pub fn view<'a>(s: &'a Sketch, index: usize, total: usize) -> Element<'a, Sketch
         );
     }
     container(col).padding(4).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::Event;
+    use iced::keyboard;
+    use iced_test::{Simulator, selector, simulator::click};
+
+    const SRC: &str = "sk =\n    sketch\n        var x1 = 0.0\n        var x2 = 4.0\n        let y2 = 3.0\n        poly1 = polygon (segments [p2 x1 0.0, p2 x2 0.0, p2 x2 y2, p2 x1 y2])\n    in\n    { poly1 = poly1 }\n    end\n";
+
+    fn sketch_with_model() -> Sketch {
+        let mut s = Sketch::new(1);
+        s.binding = "sk".to_string();
+        s.model = Some(cadhr_lang::sketch::model_from_source(SRC, "sk").expect("model"));
+        s
+    }
+
+    const CANVAS: Size = Size::new(400.0, 320.0);
+
+    /// canvas 単体を simulator のルートに置く (原点からちょうど CANVAS サイズ)。
+    fn canvas_sim(s: &Sketch) -> Simulator<'_, SketchMsg> {
+        let el: Element<'_, SketchMsg> = canvas_widget(SketchCanvas { sketch: s })
+            .width(Length::Fixed(CANVAS.width))
+            .height(Length::Fixed(CANVAS.height))
+            .into();
+        Simulator::new(el)
+    }
+
+    /// world 座標 → simulator のウィンドウ座標 (canvas がルートなのでそのまま)。
+    fn at(s: &Sketch, world: [f64; 2]) -> Point {
+        to_screen(s.view(), CANVAS, world)
+    }
+
+    fn cursor_moved(p: Point) -> Event {
+        Event::Mouse(mouse::Event::CursorMoved { position: p })
+    }
+
+    #[test]
+    fn click_on_handle_selects_it() {
+        let s = sketch_with_model();
+        let mut ui = canvas_sim(&s);
+        ui.point_at(at(&s, [4.0, 3.0]));
+        let _ = ui.simulate(click());
+        let msgs: Vec<_> = ui.into_messages().collect();
+        assert!(
+            matches!(
+                msgs.as_slice(),
+                [SketchMsg::HandleSelected(Some(DragTarget::PolyVertex {
+                    geom: 0,
+                    vert: 2,
+                }))]
+            ),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn click_on_empty_space_deselects() {
+        let s = sketch_with_model();
+        let mut ui = canvas_sim(&s);
+        ui.point_at(at(&s, [7.0, 5.0]));
+        let _ = ui.simulate(click());
+        let msgs: Vec<_> = ui.into_messages().collect();
+        assert!(
+            matches!(msgs.as_slice(), [SketchMsg::HandleSelected(None)]),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn drag_across_cells_emits_step_and_end() {
+        let s = sketch_with_model();
+        let mut ui = canvas_sim(&s);
+        let from = at(&s, [4.0, 0.0]);
+        let to = at(&s, [5.0, 1.0]);
+        ui.point_at(from);
+        let _ = ui.simulate([Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left,
+        ))]);
+        ui.point_at(to);
+        let _ = ui.simulate([cursor_moved(to)]);
+        let _ = ui.simulate([Event::Mouse(mouse::Event::ButtonReleased(
+            mouse::Button::Left,
+        ))]);
+        let msgs: Vec<_> = ui.into_messages().collect();
+        assert!(
+            matches!(
+                msgs.as_slice(),
+                [
+                    SketchMsg::DragStep {
+                        target: DragTarget::PolyVertex { geom: 0, vert: 1 },
+                        value: DragValue::Pos([5.0, 1.0]),
+                    },
+                    SketchMsg::DragEnd,
+                ]
+            ),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn wiggle_within_snap_cell_is_still_a_click() {
+        let s = sketch_with_model();
+        let mut ui = canvas_sim(&s);
+        let from = at(&s, [4.0, 0.0]);
+        let near = Point::new(from.x + 3.0, from.y - 3.0);
+        ui.point_at(from);
+        let _ = ui.simulate([Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left,
+        ))]);
+        ui.point_at(near);
+        let _ = ui.simulate([cursor_moved(near)]);
+        let _ = ui.simulate([Event::Mouse(mouse::Event::ButtonReleased(
+            mouse::Button::Left,
+        ))]);
+        let msgs: Vec<_> = ui.into_messages().collect();
+        assert!(
+            matches!(
+                msgs.as_slice(),
+                [SketchMsg::HandleSelected(Some(DragTarget::PolyVertex {
+                    geom: 0,
+                    vert: 1,
+                }))]
+            ),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn inspector_input_typing_and_submit_publish_messages() {
+        let mut s = sketch_with_model();
+        let target = DragTarget::PolyVertex { geom: 0, vert: 0 };
+        let info = cadhr_lang::sketch::inspect(SRC, "sk", target).expect("inspect");
+        s.set_selection(target, info);
+        let mut ui = Simulator::new(view(&s, 0, 1));
+        // x 軸の書き込み先 (var x1) の入力欄にフォーカスして入力・確定する
+        ui.click(selector::id("sketch-var-0-0")).expect("input");
+        let _ = ui.typewrite("7");
+        let _ = ui.tap_key(keyboard::Key::Named(keyboard::key::Named::Enter));
+        let msgs: Vec<_> = ui.into_messages().collect();
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, SketchMsg::VarInput { axis: 0, write: 0, .. })),
+            "{msgs:?}"
+        );
+        assert!(
+            matches!(
+                msgs.last(),
+                Some(SketchMsg::VarSubmit { axis: 0, write: 0 })
+            ),
+            "{msgs:?}"
+        );
+    }
+
+    /// クリック選択 → 数値入力 → var 書き込みまでの main.rs 相当の一連の流れ。
+    #[test]
+    fn select_then_numeric_input_writes_var() {
+        let mut s = sketch_with_model();
+        let target = DragTarget::PolyVertex { geom: 0, vert: 0 };
+        let ev = s.update(SketchMsg::HandleSelected(Some(target)));
+        let WorkspaceEvent::SketchEdit(SketchEdit::Select { target }) = ev else {
+            panic!("expected Select event");
+        };
+        let info = cadhr_lang::sketch::inspect(SRC, "sk", target).expect("inspect");
+        s.set_selection(target, info);
+
+        s.update(SketchMsg::VarInput {
+            axis: 0,
+            write: 0,
+            text: "7".to_string(),
+        });
+        let ev = s.update(SketchMsg::VarSubmit { axis: 0, write: 0 });
+        let WorkspaceEvent::SketchEdit(SketchEdit::SetVar {
+            target,
+            axis,
+            write,
+            value,
+        }) = ev
+        else {
+            panic!("expected SetVar event");
+        };
+        let out = cadhr_lang::sketch::set_var_value(SRC, "sk", target, axis, write, value)
+            .expect("set_var_value");
+        assert!(out.source.contains("var x1 = 7.0"), "{}", out.source);
+    }
+
+    #[test]
+    fn non_numeric_input_sets_status_without_edit() {
+        let mut s = sketch_with_model();
+        let target = DragTarget::PolyVertex { geom: 0, vert: 0 };
+        let info = cadhr_lang::sketch::inspect(SRC, "sk", target).expect("inspect");
+        s.set_selection(target, info);
+        s.update(SketchMsg::VarInput {
+            axis: 0,
+            write: 0,
+            text: "abc".to_string(),
+        });
+        let ev = s.update(SketchMsg::VarSubmit { axis: 0, write: 0 });
+        assert!(matches!(ev, WorkspaceEvent::None));
+        assert!(!s.status.is_empty());
+    }
 }
