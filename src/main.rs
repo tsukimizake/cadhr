@@ -508,7 +508,7 @@ fn apply_sketch_text_edit(
 /// 字句規則を重複実装せずに検査する。
 fn scaffold_sketch_binding(src: &str, binding: &str) -> Result<String, String> {
     use cadhr_lang::syntax::{ast::Decl, parse};
-    let scaffold = format!("{binding} =\n    sketch\n        var x = 0.0\n    in\n    {{}}\n    end\n");
+    let scaffold = format!("{binding} =\n    sketch\n    in\n    {{}}\n    end\n");
     if parse::parse(&scaffold).is_err() {
         return Err(format!("`{binding}` は binding 名として使えません"));
     }

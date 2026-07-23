@@ -159,7 +159,13 @@ pub fn apply_layout<'src>(src: &str, tokens: Vec<Spanned<Token<'src>>>) -> Vec<S
             });
             started = true;
         } else if matches!(inner, Token::In) {
-            close_until_let(&mut stack, &mut out, vspan);
+            if pending.take().is_some() {
+                // `sketch in` のように binding が 0 個: 空ブロックとして開閉する。
+                out.push(virt(Token::BlockOpen, vspan));
+                out.push(virt(Token::BlockClose, vspan));
+            } else {
+                close_until_let(&mut stack, &mut out, vspan);
+            }
         } else if let Some(opener) = pending.take() {
             out.push(virt(Token::BlockOpen, vspan));
             stack.push(Ctx::Layout { col, opener });

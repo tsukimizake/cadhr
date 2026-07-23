@@ -461,7 +461,6 @@ pub fn expr_parser<'tokens, 'src: 'tokens>()
                 sketch_binding
                     .separated_by(just(Token::BlockSep))
                     .allow_trailing()
-                    .at_least(1)
                     .collect::<Vec<_>>(),
             )
             .then_ignore(just(Token::BlockClose))
@@ -1113,6 +1112,31 @@ mod tests {
         assert_eq!(bindings[1].kind, SketchBindKind::Let);
         assert_eq!(bindings[2].kind, SketchBindKind::Bare);
         assert!(matches!(body.as_ref(), Expr::Record(..)));
+    }
+
+    #[test]
+    fn empty_sketch_block_parses() {
+        // binding 0 個は sketch のみ許す (GUI が空 sketch を scaffold するため)。
+        // layout pass が pending 中の `in` で空ブロックを発行する。
+        for src in [
+            "sk =\n    sketch\n    in\n    {}\n    end\n",
+            "sk = sketch in {} end\n",
+        ] {
+            let m = parse_ok(src);
+            let Decl::Value(v) = &m.decls[0] else {
+                panic!("expected value decl");
+            };
+            let Expr::Sketch { bindings, body, .. } = &v.body else {
+                panic!("expected sketch: {:?}", v.body);
+            };
+            assert!(bindings.is_empty());
+            assert!(matches!(body.as_ref(), Expr::Record(..)));
+        }
+    }
+
+    #[test]
+    fn empty_let_is_still_rejected() {
+        assert!(parse("x = let in 3.0\n").is_err());
     }
 
     #[test]

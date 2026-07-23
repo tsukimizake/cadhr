@@ -1182,19 +1182,24 @@ fn insert_geom(
     rhs: &str,
 ) -> Result<(String, String), String> {
     let module = parse_or_msg(src)?;
-    let (bindings, body, _span) = find_block(&module, binding)?;
+    let (bindings, body, span) = find_block(&module, binding)?;
     let name = fresh_name(prefix, |n| bindings.iter().any(|b| b.name == n));
-    let last = bindings
-        .last()
-        .ok_or_else(|| "sketch ブロックに束縛がありません".to_string())?;
-    let indent = line_indent(src, last.span.start);
-    let edits = vec![
-        TextEdit {
+    // 挿入位置: 末尾 binding の直後。binding が 0 個なら `sketch` キーワード直後に
+    // 1 段深いインデントで入れる。
+    let insert = match bindings.last() {
+        Some(last) => TextEdit {
             span: Span::new(last.span.end, last.span.end),
-            replacement: format!("\n{indent}{name} = {rhs}"),
+            replacement: format!("\n{}{name} = {rhs}", line_indent(src, last.span.start)),
         },
-        body_add_field(body, &name)?,
-    ];
+        None => {
+            let after_kw = span.start + "sketch".len();
+            TextEdit {
+                span: Span::new(after_kw, after_kw),
+                replacement: format!("\n{}    {name} = {rhs}", line_indent(src, span.start)),
+            }
+        }
+    };
+    let edits = vec![insert, body_add_field(body, &name)?];
     Ok((apply_edits(src, &edits), name))
 }
 
@@ -1290,9 +1295,6 @@ pub fn remove_geom(src: &str, binding: &str, geom_name: &str) -> Result<String, 
         .iter()
         .find(|b| b.name == geom_name)
         .ok_or_else(|| format!("`{geom_name}` が見つかりません"))?;
-    if bindings.len() == 1 {
-        return Err("最後の要素は削除できません".to_string());
-    }
     // 他の束縛から参照されていたら削除できない (点や線分が他形状の一部の場合)。
     for other in bindings.iter().filter(|o| o.name != geom_name) {
         let mut bound = HashSet::new();
@@ -1811,6 +1813,21 @@ mod tests {
         )
         .expect_err("should reject");
         assert!(matches!(err, DragReject::ReadOnly(_)), "{err:?}");
+    }
+
+    #[test]
+    fn empty_sketch_add_and_remove_last_roundtrip() {
+        let src = "sk =\n    sketch\n    in\n    {}\n    end\n";
+        assert_eq!(model_from_source(src, "sk").expect("model").geoms.len(), 0);
+
+        let (s1, name) = add_point(src, "sk", [3.0, 2.0]).expect("add_point");
+        assert!(s1.contains("sketch\n        pt1 = p2 3.0 2.0\n    in"), "{s1}");
+        assert!(s1.contains("{ pt1 }"), "{s1}");
+        assert_eq!(model_from_source(&s1, "sk").expect("model").geoms.len(), 1);
+
+        let s2 = remove_geom(&s1, "sk", &name).expect("remove last geom");
+        assert!(s2.contains("{}"), "{s2}");
+        assert_eq!(model_from_source(&s2, "sk").expect("model").geoms.len(), 0);
     }
 
     #[test]
