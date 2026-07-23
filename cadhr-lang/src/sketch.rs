@@ -1150,24 +1150,24 @@ fn line_indent(src: &str, at: usize) -> String {
         .collect()
 }
 
-/// body record に `name = name` の field を足す編集。
+/// body record に field を足す編集。field は punning (`{ name }`) で書く。
 fn body_add_field(body: &Expr, name: &str) -> Result<TextEdit, String> {
     match body {
         Expr::Record(fields, span) => match fields.last() {
             Some(last) => Ok(TextEdit {
                 span: Span::new(last.span.end, last.span.end),
-                replacement: format!(", {name} = {name}"),
+                replacement: format!(", {name}"),
             }),
             None => Ok(TextEdit {
                 span: *span,
-                replacement: format!("{{ {name} = {name} }}"),
+                replacement: format!("{{ {name} }}"),
             }),
         },
         Expr::Var {
             name: old, span, ..
         } => Ok(TextEdit {
             span: *span,
-            replacement: format!("{{ {old} = {old}, {name} = {name} }}"),
+            replacement: format!("{{ {old}, {name} }}"),
         }),
         _ => Err("body が record か幾何名ではありません".to_string()),
     }
@@ -1817,7 +1817,7 @@ mod tests {
     fn add_point_and_remove_geom_roundtrip() {
         let (s1, _) = add_point(SRC_SEGMENTS, "sk", [3.0, -2.0]).expect("add_point");
         assert!(s1.contains("pt1 = p2 3.0 (-2.0)"), "{s1}");
-        assert!(s1.contains("{ poly1 = poly1, pt1 = pt1 }"), "{s1}");
+        assert!(s1.contains("{ poly1 = poly1, pt1 }"), "{s1}");
         let m = model_from_source(&s1, "sk").expect("model");
         assert_eq!(m.geoms.len(), 2);
 
