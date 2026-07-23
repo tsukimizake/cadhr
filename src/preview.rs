@@ -511,8 +511,11 @@ impl shader::Program<SceneMessage> for Scene {
 
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if in_bounds => {
+                // cursor.position() は scrollable 等の親に平行移動された座標で、
+                // CursorMoved の生座標 (ウィンドウ座標) と系が異なる。ここでは保存せず、
+                // 最初の CursorMoved で生座標同士がそろってから差分を取り始める
                 state.dragging = true;
-                state.last_cursor = cursor.position();
+                state.last_cursor = None;
                 Some(shader::Action::capture())
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
@@ -635,5 +638,60 @@ impl shader::Primitive for Primitive {
         clip_bounds: &Rectangle<u32>,
     ) {
         pipeline.render_instance(encoder, target, clip_bounds, self.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::widget::{Space, column, scrollable, shader};
+    use iced::{Element, Length, Settings, Size};
+    use iced_test::Simulator;
+
+    /// preview はワークスペースの scrollable 内にある。scrollable は子に渡す cursor を
+    /// スクロールオフセット分平行移動するが、CursorMoved の生座標はウィンドウ座標のまま
+    /// 届くため、両者を混ぜて差分を取ると初回移動で巨大な Orbit が飛ぶ (regression test)。
+    #[test]
+    fn drag_inside_scrolled_parent_does_not_jump_on_first_move() {
+        let scene = Scene::new();
+        let el: Element<'_, SceneMessage> = scrollable(column![
+            Space::new()
+                .width(Length::Fixed(400.0))
+                .height(Length::Fixed(300.0)),
+            shader(&scene)
+                .width(Length::Fixed(400.0))
+                .height(Length::Fixed(300.0)),
+        ])
+        .into();
+        let mut ui = Simulator::with_size(Settings::default(), Size::new(400.0, 400.0), el);
+
+        // spacer 上にカーソルを置いてホイールで下端までスクロール
+        // (content 600px / window 400px → offset 200px, shader はスクリーン y=100..400)
+        ui.point_at(Point::new(200.0, 50.0));
+        let _ = ui.simulate([Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -1000.0 },
+        })]);
+
+        ui.point_at(Point::new(200.0, 200.0));
+        let _ = ui.simulate([Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left,
+        ))]);
+        ui.point_at(Point::new(210.0, 220.0));
+        let _ = ui.simulate([Event::Mouse(mouse::Event::CursorMoved {
+            position: Point::new(210.0, 220.0),
+        })]);
+        ui.point_at(Point::new(220.0, 240.0));
+        let _ = ui.simulate([Event::Mouse(mouse::Event::CursorMoved {
+            position: Point::new(220.0, 240.0),
+        })]);
+
+        let msgs: Vec<_> = ui.into_messages().collect();
+        assert!(
+            matches!(
+                msgs.as_slice(),
+                [SceneMessage::Orbit { dx, dy }] if *dx == 10.0 && *dy == 20.0
+            ),
+            "初回移動の Orbit はスキップされ、2 回目以降は生座標同士の差分になるはず: {msgs:?}"
+        );
     }
 }
