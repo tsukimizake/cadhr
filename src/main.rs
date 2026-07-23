@@ -1074,3 +1074,130 @@ fn view(model: &Model) -> Element<'_, Msg> {
     )
     .into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::workspace::WorkspaceMsg;
+    use iced_test::Simulator;
+    use ui::sketch::SketchMsg;
+
+    struct NoDialogs;
+
+    impl DialogHandler for NoDialogs {
+        fn open_session(&self) -> Task<Msg> {
+            panic!("dialogs are not available in tests")
+        }
+        fn save_session_as(
+            &self,
+            _editor_text: String,
+            _previews: session::SessionPreviews,
+        ) -> Task<Msg> {
+            panic!("dialogs are not available in tests")
+        }
+        fn export_3mf(&self, _suggested_name: String, _data: Vec<u8>) -> Task<Msg> {
+            panic!("dialogs are not available in tests")
+        }
+    }
+
+    fn test_model(src: &str) -> Model {
+        let (panes, _) = pane_grid::State::new(PaneKind::Editor);
+        Model {
+            editor: text_editor::Content::with_text(src),
+            history: history::History::default(),
+            workspaces: Vec::new(),
+            next_workspace_id: 1,
+            program: None,
+            candidates: Vec::new(),
+            candidate_names: Vec::new(),
+            sketch_binding_names: Vec::new(),
+            error_message: String::new(),
+            error_span: None,
+            diagnostics: Vec::new(),
+            current_file_path: None,
+            auto_reload: false,
+            last_modified: None,
+            unsaved: false,
+            compile_in_flight: false,
+            compile_dirty: false,
+            dialogs: Box::new(NoDialogs),
+            panes,
+        }
+    }
+
+    fn sketch_ref(model: &Model, id: u64) -> &Sketch {
+        model
+            .workspaces
+            .iter()
+            .find_map(|w| match w {
+                Workspace::Sketch(s) if s.id == id => Some(s),
+                _ => None,
+            })
+            .expect("sketch workspace")
+    }
+
+    fn send_sketch(model: &mut Model, id: u64, msg: SketchMsg) {
+        let _ = update(model, Msg::Workspace(id, WorkspaceMsg::Sketch(msg)));
+    }
+
+    /// workspace 追加 → 未知の binding 名を入力 → view 上の作成ボタンをクリック →
+    /// scaffold がエディタに追記され model が付く、という GUI フロー全体。
+    #[test]
+    fn add_sketch_workspace_and_create_binding_from_scratch() {
+        let mut model = test_model("main = cube 10.0 10.0 10.0\n");
+        let _ = update(&mut model, Msg::AddSketch);
+        let id = 1;
+        assert!(sketch_ref(&model, id).binding.is_empty());
+
+        // sketch ブロックが 1 つも無い状態で名前を入力 (combo box の on_input と同経路)
+        send_sketch(&mut model, id, SketchMsg::BindingChanged("sketchxy".into()));
+        let s = sketch_ref(&model, id);
+        assert!(
+            s.status.contains("sketch ブロックの binding ではありません"),
+            "{}",
+            s.status
+        );
+        assert!(s.model.is_none());
+
+        // view に出ている作成ボタンをクリックし、出たメッセージを update に流す
+        let msgs: Vec<SketchMsg> = {
+            let mut ui = Simulator::new(ui::sketch::view(s, 0, 1));
+            ui.click("`sketchxy` を新規 sketch として作成").expect("create button");
+            ui.into_messages().collect()
+        };
+        assert!(
+            matches!(msgs.as_slice(), [SketchMsg::CreateBinding]),
+            "{msgs:?}"
+        );
+        for m in msgs {
+            send_sketch(&mut model, id, m);
+        }
+
+        let text = model.editor.text();
+        assert!(
+            text.contains("sketchxy =\n    sketch\n    in\n    {}\n    end"),
+            "{text}"
+        );
+        let s = sketch_ref(&model, id);
+        assert!(s.model.is_some());
+        assert!(s.status.is_empty(), "{}", s.status);
+        assert!(model.unsaved);
+    }
+
+    /// 既にトップレベルに同名 binding がある場合は追記せずエラーを表示する。
+    #[test]
+    fn create_binding_rejects_existing_top_level_name() {
+        let mut model = test_model("main = cube 10.0 10.0 10.0\n");
+        let _ = update(&mut model, Msg::AddSketch);
+        let id = 1;
+        send_sketch(&mut model, id, SketchMsg::BindingChanged("main".into()));
+        send_sketch(&mut model, id, SketchMsg::CreateBinding);
+        let s = sketch_ref(&model, id);
+        assert!(
+            s.status.contains("既にトップレベルで定義されています"),
+            "{}",
+            s.status
+        );
+        assert!(!model.editor.text().contains("main =\n    sketch"));
+    }
+}
