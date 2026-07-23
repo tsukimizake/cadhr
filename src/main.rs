@@ -503,6 +503,38 @@ fn apply_sketch_text_edit(
     }
 }
 
+/// 入力された名前で空の sketch ブロックをソース末尾に追記した新ソースを返す。
+/// scaffold 単体を試しにパースすることで、名前が binding として妥当かを
+/// 字句規則を重複実装せずに検査する。
+fn scaffold_sketch_binding(src: &str, binding: &str) -> Result<String, String> {
+    use cadhr_lang::syntax::{ast::Decl, parse};
+    let scaffold = format!("{binding} =\n    sketch\n        var x = 0.0\n    in\n    {{}}\n    end\n");
+    if parse::parse(&scaffold).is_err() {
+        return Err(format!("`{binding}` は binding 名として使えません"));
+    }
+    let module = parse::parse(src).map_err(|e| {
+        e.first()
+            .map(|d| d.message())
+            .unwrap_or_else(|| "parse error".to_string())
+    })?;
+    let taken = module.decls.iter().any(|d| match d {
+        Decl::Value(v) | Decl::Var(v) => v.name == binding,
+        _ => false,
+    });
+    if taken {
+        return Err(format!("`{binding}` は既にトップレベルで定義されています"));
+    }
+    let mut out = src.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&scaffold);
+    Ok(out)
+}
+
 /// Sketch workspace からのコード書き換え要求を適用する。
 fn handle_sketch_edit(model: &mut Model, id: u64, edit: SketchEdit) -> Task<Msg> {
     use cadhr_lang::sketch as sk;
@@ -529,6 +561,9 @@ fn handle_sketch_edit(model: &mut Model, id: u64, edit: SketchEdit) -> Task<Msg>
                 s2.set_status("sketch binding を選択してください".to_string());
             }
             Task::none()
+        }
+        SketchEdit::CreateBinding => {
+            apply_sketch_text_edit(model, id, scaffold_sketch_binding(&src, &binding))
         }
         SketchEdit::Drag { target, value } => match sk::drag(&src, &binding, target, value) {
             Ok(out) => {

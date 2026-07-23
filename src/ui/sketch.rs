@@ -12,8 +12,7 @@
 
 use iced::widget::canvas::{self, Path, Stroke};
 use iced::widget::{
-    canvas as canvas_widget, column, combo_box, container, pick_list, row, slider, text,
-    text_input,
+    canvas as canvas_widget, column, combo_box, container, pick_list, row, slider, text, text_input,
 };
 use iced::{Color, Element, Fill, Length, Point, Rectangle, Renderer, Size, Theme, mouse};
 
@@ -76,6 +75,8 @@ pub enum SketchEdit {
     },
     /// 2 回以上現れる同値の座標リテラルを軸ごとに var へまとめる。
     FactorVars,
+    /// 入力中の binding 名で空の sketch ブロックをソース末尾に追記する。
+    CreateBinding,
     /// クリック選択。main.rs が `inspect` して選択状態を書き戻す。
     Select {
         target: DragTarget,
@@ -247,6 +248,7 @@ impl Sketch {
                 self.cache.clear();
                 WorkspaceEvent::SketchEdit(SketchEdit::Refresh)
             }
+            SketchMsg::CreateBinding => WorkspaceEvent::SketchEdit(SketchEdit::CreateBinding),
             SketchMsg::HandleSelected(target) => match target {
                 Some(target) => WorkspaceEvent::SketchEdit(SketchEdit::Select { target }),
                 None => {
@@ -318,9 +320,7 @@ impl Sketch {
             SketchMsg::CircleAdded(center, radius) => {
                 WorkspaceEvent::SketchEdit(SketchEdit::AddCircle { center, radius })
             }
-            SketchMsg::PointAdded(pos) => {
-                WorkspaceEvent::SketchEdit(SketchEdit::AddPoint { pos })
-            }
+            SketchMsg::PointAdded(pos) => WorkspaceEvent::SketchEdit(SketchEdit::AddPoint { pos }),
         }
     }
 }
@@ -338,6 +338,8 @@ pub enum SketchMsg {
     ResetView,
     SetTool(Tool),
     BindingChanged(String),
+    /// 入力中の binding 名で新規 sketch ブロックを作成する。
+    CreateBinding,
     SelectGeom(String),
     RemoveGeom(String),
     FactorVars,
@@ -403,7 +405,9 @@ fn snap(view: View, size: Size, local: Point) -> [f64; 2] {
 }
 
 fn grid_distance(a: [f64; 2], b: [f64; 2]) -> f64 {
-    ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt().round()
+    ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2))
+        .sqrt()
+        .round()
 }
 
 /// ハンドルの world 座標。CircleRadius は点ではないので None (円周を別途強調する)。
@@ -535,10 +539,7 @@ enum DragState {
         last: Option<DragValue>,
     },
     /// Line / Circle ツールのドラッグ描画。
-    Draw {
-        start: [f64; 2],
-        hover: [f64; 2],
-    },
+    Draw { start: [f64; 2], hover: [f64; 2] },
     /// カーソル追従のみ (スナップ表示)。
     Hover([f64; 2]),
 }
@@ -563,8 +564,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                 match self.sketch.tool {
                     Tool::Select => match self.hit_test(bounds.size(), pos) {
                         Some(target) => {
-                            let origin =
-                                self.drag_value(target, snap(view, bounds.size(), pos));
+                            let origin = self.drag_value(target, snap(view, bounds.size(), pos));
                             *state = DragState::Handle {
                                 target,
                                 origin,
@@ -574,8 +574,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                         }
                         // 空クリックは選択解除
                         None => Some(
-                            canvas::Action::publish(SketchMsg::HandleSelected(None))
-                                .and_capture(),
+                            canvas::Action::publish(SketchMsg::HandleSelected(None)).and_capture(),
                         ),
                     },
                     Tool::Point => {
@@ -647,7 +646,9 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                 let prev = std::mem::take(state);
                 match prev {
                     // 動かさず離した → クリック選択
-                    DragState::Handle { target, last: None, .. } => Some(
+                    DragState::Handle {
+                        target, last: None, ..
+                    } => Some(
                         canvas::Action::publish(SketchMsg::HandleSelected(Some(target)))
                             .and_capture(),
                     ),
@@ -733,17 +734,11 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                         let c = to_screen(view, size, *pos);
                         let cross = Stroke::default().with_width(2.0).with_color(POINT_COLOR);
                         frame.stroke(
-                            &Path::line(
-                                Point::new(c.x - 5.0, c.y),
-                                Point::new(c.x + 5.0, c.y),
-                            ),
+                            &Path::line(Point::new(c.x - 5.0, c.y), Point::new(c.x + 5.0, c.y)),
                             cross.clone(),
                         );
                         frame.stroke(
-                            &Path::line(
-                                Point::new(c.x, c.y - 5.0),
-                                Point::new(c.x, c.y + 5.0),
-                            ),
+                            &Path::line(Point::new(c.x, c.y - 5.0), Point::new(c.x, c.y + 5.0)),
                             cross,
                         );
                     }
@@ -795,7 +790,9 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
 
         // クリック選択中のハンドルをリングで強調する
         if let (Some(sel), Some(model)) = (&self.sketch.selection, &self.sketch.model) {
-            let ring = Stroke::default().with_width(2.0).with_color(SELECTED_HANDLE);
+            let ring = Stroke::default()
+                .with_width(2.0)
+                .with_color(SELECTED_HANDLE);
             if let DragTarget::CircleRadius { geom } = sel.target {
                 if let Some(SketchGeom::Circle { center, radius, .. }) = model.geoms.get(geom) {
                     overlay.stroke(
@@ -822,8 +819,7 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
         if let (Some(hot), Some(model)) = (hot, &self.sketch.model) {
             for t in self.linked_targets(hot) {
                 if let DragTarget::CircleRadius { geom } = t {
-                    if let Some(SketchGeom::Circle { center, radius, .. }) = model.geoms.get(geom)
-                    {
+                    if let Some(SketchGeom::Circle { center, radius, .. }) = model.geoms.get(geom) {
                         overlay.stroke(
                             &Path::circle(
                                 to_screen(view, osize, *center),
@@ -833,7 +829,10 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
                         );
                     }
                 } else if let Some(pos) = target_pos(model, t) {
-                    overlay.fill(&Path::circle(to_screen(view, osize, pos), 5.0), LINKED_HANDLE);
+                    overlay.fill(
+                        &Path::circle(to_screen(view, osize, pos), 5.0),
+                        LINKED_HANDLE,
+                    );
                 }
             }
         }
@@ -867,7 +866,10 @@ impl canvas::Program<SketchMsg> for SketchCanvas<'_> {
             }
             DragState::Hover(p) => {
                 if self.sketch.tool != Tool::Select {
-                    overlay.fill(&Path::circle(to_screen(view, osize, *p), 4.0), SNAP_INDICATOR);
+                    overlay.fill(
+                        &Path::circle(to_screen(view, osize, *p), 4.0),
+                        SNAP_INDICATOR,
+                    );
                 }
             }
             _ => {}
@@ -1030,9 +1032,8 @@ pub fn view<'a>(s: &'a Sketch, index: usize, total: usize) -> Element<'a, Sketch
             };
             let mut r = row![].spacing(4);
             if selectable {
-                r = r.push(
-                    parts::dark_button(marker).on_press(SketchMsg::SelectGeom(name.clone())),
-                );
+                r = r
+                    .push(parts::dark_button(marker).on_press(SketchMsg::SelectGeom(name.clone())));
             }
             r = r.push(text(label));
             r = r.push(parts::dark_button("×").on_press(SketchMsg::RemoveGeom(name)));
@@ -1058,6 +1059,12 @@ pub fn view<'a>(s: &'a Sketch, index: usize, total: usize) -> Element<'a, Sketch
             text("select a sketch binding to edit")
                 .size(13)
                 .color(Color::from_rgb(0.6, 0.6, 0.6)),
+        );
+    } else if s.model.is_none() {
+        col = col.push(
+            iced::widget::button(text(format!("`{}` を新規 sketch として作成", s.binding)).size(13))
+                .style(parts::dark_button_style)
+                .on_press(SketchMsg::CreateBinding),
         );
     }
     if !s.status.is_empty() {
@@ -1210,8 +1217,14 @@ mod tests {
         let _ = ui.tap_key(keyboard::Key::Named(keyboard::key::Named::Enter));
         let msgs: Vec<_> = ui.into_messages().collect();
         assert!(
-            msgs.iter()
-                .any(|m| matches!(m, SketchMsg::VarInput { axis: 0, write: 0, .. })),
+            msgs.iter().any(|m| matches!(
+                m,
+                SketchMsg::VarInput {
+                    axis: 0,
+                    write: 0,
+                    ..
+                }
+            )),
             "{msgs:?}"
         );
         assert!(
