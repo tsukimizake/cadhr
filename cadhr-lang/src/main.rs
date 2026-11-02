@@ -11,12 +11,12 @@
 //! ライブラリとして compile 検査のみ)。1 つでも失敗すれば exit 1。
 //! sketch の書き戻し先が曖昧なハンドル軸は warning として表示する。
 
-mod export;
-
 use std::path::{Path, PathBuf};
 
 use cadhr_lang::syntax::ast::Decl;
-use cadhr_lang::{CompiledProgram, Inputs, Severity, compile_with_paths, run_binding, sketch};
+use cadhr_lang::{
+    CompiledProgram, Inputs, Severity, compile_with_paths, export, run_binding, sketch,
+};
 use clap::Parser;
 
 #[derive(Parser)]

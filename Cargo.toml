@@ -25,7 +25,6 @@ iced = { version = "0.14", features = ["advanced", "tokio", "canvas"] }
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.33"
 cadhr-lang = { path = "cadhr-lang" }
-threemf = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.17"

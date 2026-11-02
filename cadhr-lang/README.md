@@ -14,6 +14,14 @@ cargo run -p cadhr-lang -- export ./project/db.cadhr --binding part -o ./part.3m
 - 空のモデルは除外し、出力可能なモデルがなければエラー。BOMやコントロールポイントは出力しない。
 - コンパイル・評価・3MF変換に失敗した場合、出力ファイルは作成・変更しない。
 
+## ライブラリAPI
+
+GUIとCLIは `cadhr_lang::export` の3MF変換を共有する。
+
+- `models_to_threemf` は `Model3D` のリストと検索パスを受け取り、メッシュ生成から変換まで行う。
+- `meshes_to_threemf` は `Mesh`（`f64` の頂点座標と `u64` の三角形インデックス列）を受け取る。GUIは表示済みメッシュをこの形式に変換して渡す。
+- どちらも `Result<Vec<u8>, String>` を返す。保存先の選択とファイル書き込みは呼び出し側で行う。
+
 ## 実行検査
 
 ```nu

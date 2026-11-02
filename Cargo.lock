@@ -481,7 +481,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "threemf",
 ]
 
 [[package]]

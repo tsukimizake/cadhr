@@ -12,6 +12,7 @@
 //! 返すもの) も同じ API で評価できる。
 
 pub mod diagnostic;
+pub mod export;
 pub mod geom;
 pub mod module;
 pub mod runtime;
