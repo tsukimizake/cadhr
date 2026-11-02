@@ -3,11 +3,6 @@
 //! evaluator (`runtime::eval`) は副作用なく `Model3D` を組み立てるだけ。実際の
 //! CSG 計算 / メッシュ生成はここで manifold-csg に投げる。GUI 側はここから
 //! `Vertex` / `index` を受け取って iced shader に流す。
-//!
-//! manifold-csg 自体は cargo feature `manifold` の有無で gating する。feature OFF の
-//! ビルドではこのモジュール全体が disable される。
-
-#![cfg(feature = "manifold")]
 
 use crate::geom::{P2, P3, p2, p3};
 use crate::runtime::value::{Model2D, Model3D, Plane3D};

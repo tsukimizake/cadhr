@@ -6,7 +6,5 @@
 
 pub mod builtin;
 pub mod eval;
-pub mod value;
-
-#[cfg(feature = "manifold")]
 pub mod manifold_bridge;
+pub mod value;

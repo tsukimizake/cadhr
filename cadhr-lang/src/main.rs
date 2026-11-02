@@ -11,10 +11,12 @@
 //! ライブラリとして compile 検査のみ)。1 つでも失敗すれば exit 1。
 //! sketch の書き戻し先が曖昧なハンドル軸は warning として表示する。
 
+mod export;
+
 use std::path::{Path, PathBuf};
 
 use cadhr_lang::syntax::ast::Decl;
-use cadhr_lang::{Inputs, Severity, compile_with_paths, run_binding, sketch};
+use cadhr_lang::{CompiledProgram, Inputs, Severity, compile_with_paths, run_binding, sketch};
 use clap::Parser;
 
 #[derive(Parser)]
@@ -28,6 +30,15 @@ enum Cli {
         /// 実行する binding (複数可)。未指定なら main (無ければ compile 検査のみ)
         #[arg(long, short)]
         binding: Vec<String>,
+    },
+    #[command(about = "binding を 3MF ファイルに出力する")]
+    Export {
+        #[arg(help = "db.cadhr / プロジェクトディレクトリ")]
+        path: PathBuf,
+        #[arg(long, short, default_value = "main", help = "出力する binding")]
+        binding: String,
+        #[arg(long, short, help = "出力先の 3MF ファイル")]
+        output: PathBuf,
     },
 }
 
@@ -50,8 +61,54 @@ struct BindingResult {
 }
 
 fn main() {
-    let Cli::Check { paths, binding } = Cli::parse();
-    std::process::exit(run_check(&paths, &binding));
+    std::process::exit(match Cli::parse() {
+        Cli::Check { paths, binding } => run_check(&paths, &binding),
+        Cli::Export {
+            path,
+            binding,
+            output,
+        } => run_export(&path, &binding, &output),
+    });
+}
+
+fn run_export(path: &Path, binding: &str, output: &Path) -> i32 {
+    let db_path = if path.is_dir() {
+        path.join("db.cadhr")
+    } else {
+        path.to_path_buf()
+    };
+    if !db_path.is_file() {
+        eprintln!("not found: {}", db_path.display());
+        return 2;
+    }
+    match export_one(&db_path, binding, output) {
+        Ok(()) => {
+            println!(
+                "[ok]   {} ({binding}) -> {}",
+                db_path.display(),
+                output.display()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("[fail] {}: {e}", db_path.display());
+            1
+        }
+    }
+}
+
+fn export_one(db_path: &Path, binding: &str, output: &Path) -> Result<(), String> {
+    let search_paths = search_paths_for(db_path);
+    let (prog, _) = compile_file(db_path, &search_paths)?;
+    let inputs = Inputs {
+        search_paths,
+        ..Default::default()
+    };
+    let out = run_binding(&prog, binding, &inputs)
+        .map_err(|d| format!("run {binding}: {}", d.message()))?;
+    let data = export::models_to_threemf(&out.models, &inputs.search_paths)
+        .map_err(|e| format!("3MF ({binding}): {e}"))?;
+    std::fs::write(output, data).map_err(|e| format!("write {}: {e}", output.display()))
 }
 
 fn run_check(paths: &[PathBuf], bindings: &[String]) -> i32 {
@@ -151,11 +208,12 @@ fn line_of(src: &str, offset: usize) -> usize {
     src[..offset.min(src.len())].matches('\n').count() + 1
 }
 
-fn check_one(db_path: &Path, bindings: &[String]) -> Result<CheckOutcome, String> {
+fn compile_file(
+    db_path: &Path,
+    search_paths: &[PathBuf],
+) -> Result<(CompiledProgram, usize), String> {
     let src = std::fs::read_to_string(db_path).map_err(|e| format!("read: {e}"))?;
-    let search_paths = search_paths_for(db_path);
-
-    let prog = compile_with_paths(&src, &search_paths).map_err(|diags| {
+    let prog = compile_with_paths(&src, search_paths).map_err(|diags| {
         diags
             .iter()
             .map(|d| format!("{:?}: {} (span={:?})", d.severity(), d.message(), d.span()))
@@ -189,6 +247,14 @@ fn check_one(db_path: &Path, bindings: &[String]) -> Result<CheckOutcome, String
         warnings += 1;
     }
 
+    Ok((prog, warnings))
+}
+
+fn check_one(db_path: &Path, bindings: &[String]) -> Result<CheckOutcome, String> {
+    let search_paths = search_paths_for(db_path);
+    let (prog, warnings) = compile_file(db_path, &search_paths)?;
+    let main_module = &prog.unit.modules[prog.unit.main_index].module;
+
     // 実行する binding: 指定があればそれ、無ければ main (無ければ compile 検査のみ)。
     let run_targets: Vec<String> = if bindings.is_empty() {
         let has_main = main_module
@@ -213,7 +279,6 @@ fn check_one(db_path: &Path, bindings: &[String]) -> Result<CheckOutcome, String
             .map_err(|d| format!("run {binding}: {}", d.message()))?;
 
         let mut triangles = 0usize;
-        #[cfg(feature = "manifold")]
         for m in &out.models {
             let arr =
                 cadhr_lang::runtime::manifold_bridge::to_mesh_arrays_with_paths(m, &search_paths)

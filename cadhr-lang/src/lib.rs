@@ -7,9 +7,6 @@
 //!   - [`SliderDecl`] (引数に紐付く GUI スライダー仕様)
 //!   - [`Diagnostic`] / [`Span`]
 //!
-//! `manifold` feature を有効にした場合は `runtime::manifold_bridge` 経由で
-//! `Model3D` を実際の 3D メッシュにできる。
-//!
 //! `main` を特別扱いしない: `run_binding(prog, "main", inputs)` が旧 `run_main` の役割
 //! を果たし、それ以外の top-level binding (Shape3D / List Shape3D / `{ models, .. }` を
 //! 返すもの) も同じ API で評価できる。
@@ -316,7 +313,6 @@ pub fn run_binding(
 /// 戻り型が `Shape2D` (または Shape2D field を持つ record) の binding を評価し、
 /// 輪郭 polygon 群 (穴を含む) を返す。record は全 Shape2D field の輪郭を連結する。
 /// GUI の 2D sketch が参照表示に使う。
-#[cfg(feature = "manifold")]
 pub fn run_binding_2d(
     prog: &CompiledProgram,
     binding: &str,
@@ -615,7 +611,6 @@ main = plate
         );
     }
 
-    #[cfg(feature = "manifold")]
     #[test]
     fn run_binding_2d_returns_contours() {
         let src = "\
@@ -629,7 +624,6 @@ main = extrude_xy 1.0 profile
         assert_eq!(contours[0].len(), 3);
     }
 
-    #[cfg(feature = "manifold")]
     #[test]
     fn run_binding_2d_concatenates_record_fields() {
         let src = "\
@@ -641,7 +635,6 @@ main = extrude_xy 1.0 sk1.poly1
         assert_eq!(contours.len(), 2);
     }
 
-    #[cfg(feature = "manifold")]
     #[test]
     fn sketch_block_compiles_and_evaluates() {
         let src = "sk =\n    sketch\n        var x1 = 0.0\n        let y1 = 3.0\n        poly1 = polygon (segments [p2 x1 y1, p2 4.0 y1, p2 x1 7.0])\n        circ1 = circle 2.0 |> translate2d (p2 0.0 0.0) (p2 4.0 5.0)\n    in\n    { poly1 = poly1, circ1 = circ1 }\n    end\n\nmain = extrude_xy 1.0 sk.poly1\n";
@@ -650,7 +643,6 @@ main = extrude_xy 1.0 sk1.poly1
         assert_eq!(contours.len(), 2);
     }
 
-    #[cfg(feature = "manifold")]
     #[test]
     fn sketch_export_shared_between_sketches() {
         // skxz の export (var z1 / let zc) を別 sketch と通常の binding から参照できる。
@@ -680,7 +672,6 @@ main = extrude_xy skxz.z1 skxz.poly1
         assert_eq!(contours.len(), 1);
     }
 
-    #[cfg(feature = "manifold")]
     #[test]
     fn sketch_point_export_axis_shared_between_sketches() {
         // export された点の座標を別 sketch から `.x` / `.y` で参照できる。
