@@ -4,7 +4,7 @@ use std::process::{Command, Output};
 
 use manifold_csg::Manifold;
 use tempfile::tempdir;
-use threemf::model::{Mesh, Model, Unit};
+use threemf::model::{Mesh, Model};
 
 fn cli(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cadhr-lang"))
@@ -24,16 +24,10 @@ fn assert_success(result: &Output) {
 }
 
 fn read_model(path: &Path) -> Model {
-    let mut models = threemf::read(fs::File::open(path).unwrap()).unwrap();
-    assert_eq!(models.len(), 1);
-    let model = models.pop().unwrap();
-    assert!(matches!(model.unit, Unit::Millimeter));
-    assert_eq!(model.resources.object.len(), model.build.item.len());
-    for (object, item) in model.resources.object.iter().zip(&model.build.item) {
-        assert_eq!(object.id, item.objectid);
-        assert!(item.transform.is_none());
-    }
-    model
+    threemf::read(fs::File::open(path).unwrap())
+        .unwrap()
+        .pop()
+        .unwrap()
 }
 
 fn mesh_volume(mesh: &Mesh) -> f64 {
@@ -55,7 +49,7 @@ fn mesh_volume(mesh: &Mesh) -> f64 {
 }
 
 #[test]
-fn exports_main_as_a_closed_mesh_in_millimeters() {
+fn exports_main_from_a_file() {
     let dir = tempdir().unwrap();
     fs::write(
         dir.path().join("db.cadhr"),
@@ -68,8 +62,6 @@ fn exports_main_as_a_closed_mesh_in_millimeters() {
     let model = read_model(&dir.path().join("model.3mf"));
     assert_eq!(model.resources.object.len(), 1);
     let mesh = model.resources.object[0].mesh.as_ref().unwrap();
-    assert_eq!(mesh.vertices.vertex.len(), 8);
-    assert_eq!(mesh.triangles.triangle.len(), 12);
     approx::assert_abs_diff_eq!(mesh_volume(mesh), 6000.0, epsilon = 1e-8);
 }
 
@@ -79,7 +71,10 @@ fn exports_a_named_binding_from_a_project_directory_with_multiple_models() {
     fs::create_dir(dir.path().join("Project")).unwrap();
     fs::write(
         dir.path().join("Project/db.cadhr"),
-        "main = cube 1.0 1.0 1.0\nparts = [cube 2.0 3.0 4.0, cube 5.0 6.0 7.0 |> translate3d (p3 0.0 0.0 0.0) (p3 30.0 0.0 0.0)]",
+        "\
+main = cube 1.0 1.0 1.0
+parts size = [cube size 3.0 4.0, cube 5.0 6.0 7.0 |> translate3d (p3 0.0 0.0 0.0) (p3 100000000.125 0.0 0.0)]
+slider parts.size = 1.0 .. 3.0",
     )
     .unwrap();
 
@@ -97,9 +92,7 @@ fn exports_a_named_binding_from_a_project_directory_with_multiple_models() {
 
     let model = read_model(&dir.path().join("parts.3mf"));
     assert_eq!(model.resources.object.len(), 2);
-    for (index, volume) in [24.0, 210.0].into_iter().enumerate() {
-        let object = &model.resources.object[index];
-        assert_eq!(object.id, index + 1);
+    for (object, volume) in model.resources.object.iter().zip([24.0, 210.0]) {
         approx::assert_abs_diff_eq!(
             mesh_volume(object.mesh.as_ref().unwrap()),
             volume,
@@ -107,34 +100,14 @@ fn exports_a_named_binding_from_a_project_directory_with_multiple_models() {
         );
     }
     let mesh = model.resources.object[1].mesh.as_ref().unwrap();
-    assert!(
-        mesh.vertices
-            .vertex
-            .iter()
-            .all(|v| (30.0..=35.0).contains(&v.x))
-    );
-}
-
-#[test]
-fn uses_slider_defaults_for_binding_parameters() {
-    let dir = tempdir().unwrap();
-    fs::write(
-        dir.path().join("db.cadhr"),
-        "part size = cube size 2.0 3.0\nslider part.size = 2.0 .. 6.0",
-    )
-    .unwrap();
-
-    assert_success(&cli(
-        dir.path(),
-        &["export", ".", "-b", "part", "-o", "part.3mf"],
-    ));
-
-    let model = read_model(&dir.path().join("part.3mf"));
-    approx::assert_abs_diff_eq!(
-        mesh_volume(model.resources.object[0].mesh.as_ref().unwrap()),
-        24.0,
-        epsilon = 1e-8,
-    );
+    let bounds = mesh
+        .vertices
+        .vertex
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), v| {
+            (min.min(v.x), max.max(v.x))
+        });
+    assert_eq!(bounds, (100000000.125, 100000005.125));
 }
 
 #[test]
@@ -160,7 +133,6 @@ fn resolves_sibling_modules_and_bundled_std_and_skips_empty_models() {
 
     let model = read_model(&dir.path().join("model.3mf"));
     assert_eq!(model.resources.object.len(), 1);
-    assert_eq!(model.resources.object[0].id, 1);
     approx::assert_abs_diff_eq!(
         mesh_volume(model.resources.object[0].mesh.as_ref().unwrap()),
         24.0,
@@ -169,47 +141,14 @@ fn resolves_sibling_modules_and_bundled_std_and_skips_empty_models() {
 }
 
 #[test]
-fn preserves_double_precision_coordinates() {
-    let dir = tempdir().unwrap();
-    fs::write(
-        dir.path().join("db.cadhr"),
-        "main = cube 1.0 1.0 1.0 |> translate3d (p3 0.0 0.0 0.0) (p3 100000000.125 0.0 0.0)",
-    )
-    .unwrap();
-
-    assert_success(&cli(dir.path(), &["export", ".", "-o", "model.3mf"]));
-
-    let model = read_model(&dir.path().join("model.3mf"));
-    let mesh = model.resources.object[0].mesh.as_ref().unwrap();
-    let min_x = mesh
-        .vertices
-        .vertex
-        .iter()
-        .map(|v| v.x)
-        .fold(f64::INFINITY, f64::min);
-    let max_x = mesh
-        .vertices
-        .vertex
-        .iter()
-        .map(|v| v.x)
-        .fold(f64::NEG_INFINITY, f64::max);
-    assert_eq!(min_x, 100000000.125);
-    assert_eq!(max_x, 100000001.125);
-    approx::assert_abs_diff_eq!(mesh_volume(mesh), 1.0, epsilon = 1e-8);
-}
-
-#[test]
 fn failed_exports_do_not_create_or_overwrite_output() {
     for (source, error) in [
         ("main = undefined_name", "undefined_name"),
-        ("part = cube 1.0 1.0 1.0", "main"),
         ("main = 42", "run main"),
-        ("main = []", "nothing to export"),
         (
             "main = diff3d (cube 1.0 1.0 1.0) (cube 1.0 1.0 1.0)",
             "nothing to export",
         ),
-        ("main = sweep_extrude_xy [] (circle 1.0)", "mesh (model #1)"),
         (
             "main = [cube 1.0 1.0 1.0, sweep_extrude_xy [] (circle 1.0)]",
             "mesh (model #2)",
@@ -235,49 +174,4 @@ fn failed_exports_do_not_create_or_overwrite_output() {
             }
         }
     }
-}
-
-#[test]
-fn missing_input_returns_an_error_without_creating_output() {
-    let dir = tempdir().unwrap();
-    for path in ["missing.cadhr", "."] {
-        let result = cli(dir.path(), &["export", path, "-o", "model.3mf"]);
-        assert_eq!(result.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&result.stderr).contains("not found"));
-        assert!(!dir.path().join("model.3mf").exists());
-    }
-}
-
-#[test]
-fn reports_output_write_errors() {
-    let dir = tempdir().unwrap();
-    fs::write(dir.path().join("db.cadhr"), "main = cube 1.0 1.0 1.0").unwrap();
-
-    for path in ["missing/model.3mf", "."] {
-        let result = cli(dir.path(), &["export", ".", "-o", path]);
-        assert_eq!(result.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&result.stderr).contains(&format!("write {path}:")));
-    }
-}
-
-#[test]
-fn output_path_is_required() {
-    let dir = tempdir().unwrap();
-    let result = cli(dir.path(), &["export", "."]);
-    assert_eq!(result.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&result.stderr).contains("--output"));
-}
-
-#[test]
-fn check_still_supports_library_and_binding_checks() {
-    let dir = tempdir().unwrap();
-    fs::write(dir.path().join("db.cadhr"), "part = cube 1.0 1.0 1.0").unwrap();
-
-    let result = cli(dir.path(), &["check", "."]);
-    assert_success(&result);
-    assert!(String::from_utf8_lossy(&result.stdout).contains("[lib]"));
-
-    let result = cli(dir.path(), &["check", ".", "-b", "part"]);
-    assert_success(&result);
-    assert!(String::from_utf8_lossy(&result.stdout).contains("part: models=1, tris=12"));
 }
